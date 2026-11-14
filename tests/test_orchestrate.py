@@ -39,6 +39,7 @@ FAKE = textwrap.dedent(r'''
     if prompt.startswith("ORCHESTRATE_REVIEW"):
         n = sum(1 for l in calls.read_text().splitlines() if '"review"' in l) if calls.exists() else 0
         note("review")
+        pathlib.Path(str(calls) + ".review_prompt").write_text(prompt)
         reviews = cfg.get("reviews", [{"verdict": "pass", "summary": "ok", "findings": []}])
         out(json.dumps(reviews[min(n, len(reviews) - 1)]))
     if prompt.startswith("ORCHESTRATE_MERGE"):
@@ -230,6 +231,9 @@ class OrchestrateTest(unittest.TestCase):
         cyc["tasks"][0]["depends_on"] = ["api"]
         self.assertTrue(any("cycle" in e for e in self.o.validate(cyc)[0]))
 
+        self.assertTrue(any("decisions must be a list of strings" in e
+                            for e in self.o.validate(base_plan(self.repo, decisions="use jwt"))[0]))
+
         missing = base_plan(self.repo)
         del missing["tasks"][1]["verify"]
         missing["tasks"][0]["type"] = "stuff:contract"
@@ -250,7 +254,9 @@ class OrchestrateTest(unittest.TestCase):
         self.assertIn("mem_available_gb", live)
 
     def test_brief_is_a_complete_handoff(self):
-        plan = base_plan(self.repo)
+        (self.repo / "CONTEXT.md").write_text("# Glossary\n**Share link**: a read-only URL\n")
+        plan = base_plan(self.repo, decisions=["Tokens are opaque random strings (docs/adr/0007.md)"],
+                         non_goals=["No expiry UI"])
         upstream = {"contract": {"title": "types", "files": ["packages/contract/src/share/types.ts"],
                                  "report": {"summary": "added S", "interfaces": "type S",
                                             "notes_for_dependents": "import S from contract"}}}
@@ -258,8 +264,11 @@ class OrchestrateTest(unittest.TestCase):
         for needle in ("## Your goal", "share endpoints", "`apps/api/share/`", "`AGENTS.md`",
                        "`apps/api/AGENTS.md`", "added S", "import S from contract",
                        "## Done looks like", "endpoint exists", "`test -f apps/api/share/handler.go`",
-                       "Do not commit", "```json"):
+                       "Do not commit", "```json",
+                       "Decisions already made with the user", "Tokens are opaque random strings",
+                       "Out of scope for this whole job", "No expiry UI", "`CONTEXT.md`"):
             self.assertIn(needle, b)
+        self.assertLess(b.index("`CONTEXT.md`"), b.index("`apps/api/AGENTS.md`"), "glossary read first")
 
     def test_scope_check_handles_modified_tracked_files(self):
         # regression: ` M path` as the FIRST porcelain line used to lose its leading space
@@ -357,6 +366,18 @@ class OrchestrateTest(unittest.TestCase):
         self.assertEqual(len([c for c in self.calls_of("worker") if c["tid"] == "contract"]), n_contract,
                          "done tasks are not re-run")
         self.assertIn("apps/api/share/handler.go", self.branch_files())
+
+    def test_reviewer_gets_decisions_and_non_goals(self):
+        plan = base_plan(self.repo, decisions=["Use opaque tokens"], non_goals=["No expiry UI"])
+        code, _, err = self.cli("run", str(self.write_plan(plan)), cfg={"tasks": WRITES})
+        self.assertEqual(code, 0, err[-2000:])
+        heads = [c for c in self.calls_of("review")]
+        self.assertEqual(len(heads), 1)
+        review_prompt = Path(str(self.calls) + ".review_prompt").read_text()
+        self.assertIn("Use opaque tokens", review_prompt)
+        self.assertIn("No expiry UI", review_prompt)
+        brief = (self.state / "jobs/share/briefs/api.md").read_text()
+        self.assertIn("Use opaque tokens", brief)
 
     def test_review_changes_requested_triggers_fix_round(self):
         cfg = {"tasks": WRITES,

@@ -1,11 +1,11 @@
 ---
 name: orchestrate
-description: "Use when a coding task should be routed, planned, split across parallel subagents, merged and reviewed. Triages first; small tasks run as one routed task, big ones as a job."
+description: "Use when a coding task should be routed, planned, split across parallel subagents, merged and reviewed. Grills the user first, then triages; small tasks run as one routed task, big ones as a job."
 ---
 
 # Orchestrate
 
-You are the **parent**. You decide *what* to do: triage, plan and split. The scripts do the mechanical work: capacity caps, worktrees, handoffs, retries, model escalation, merging, review and reports. Follow the steps below in order.
+You are the **parent**. You decide *what* to do: grill the user, then triage, plan and split. The scripts do the mechanical work: capacity caps, worktrees, handoffs, retries, model escalation, merging, review and reports. Follow the steps below in order.
 
 Scripts are in `scripts/` next to this file (Python 3.9+, stdlib only, macOS/Linux, `git` and `claude` CLIs on PATH). Set `S` once:
 
@@ -15,16 +15,23 @@ S=$(ls -d ~/.agents/skills/orchestrate/scripts ~/.claude/skills/orchestrate/scri
 ```
 
 Support skills, which you load when you reach that step:
+- **orchestrate-grill**: the interview that comes before any plan (Matt Pocock's grill-with-docs).
 - **orchestrate-plan**: how to plan, split, tier, assign file ownership and write `plan.json`.
 - **orchestrate-review**: what the integrator and reviewer subagents check. Load it if you need to judge a review.
 
-## Step 1: Triage (always)
+## Step 1: Grill (always, first)
 
-Get facts before you judge:
-```bash
-python3 $S/orchestrate.py scan --repo <repo>     # packages/areas, verify commands, hotspots, setup
-```
-Then classify the whole request:
+Load the **orchestrate-grill** skill and follow it before any planning:
+
+1. Gather facts. Run `python3 $S/orchestrate.py scan --repo <repo>` (packages/areas, verify commands, hotspots, setup), read the glossary, ADRs and AGENTS.md, and skim the relevant code.
+2. Grill the user round by round. Each round asks the whole frontier as numbered questions, each with your recommended answer. Write glossary terms and ADRs as they settle.
+3. Post the closing summary (goal, acceptance, non-goals, decisions, terms, proposed route) and **wait for the user to confirm it**.
+
+Size the session to the request: one short round for a trivial change, as many as the design tree needs for a feature. Skip it only if the user says *skip grilling*. Never plan or edit code before the user confirms.
+
+## Step 2: Triage
+
+Classify the confirmed request:
 
 | Tier | Signals | Route |
 |---|---|---|
@@ -35,19 +42,18 @@ Then classify the whole request:
 
 Also make it a **job** whenever the work crosses package boundaries in a monorepo (for example API, web and mobile), even if each part is small.
 
-If the request has unresolved product decisions (names, UX, data model, auth rules), ask the user up to 3 questions **before** planning. That is the cheapest place to fix a misunderstanding.
-
-## Step 2a: Single task (T0/T1)
+## Step 3a: Single task (T0/T1)
 
 ```bash
 python3 $S/run_task.py --repo <repo> --type <category>:<area> --tier T1 \
-  --verify "<command that proves it works>" "<precise task description>"
+  --verify "<command that proves it works>" "<precise task description, including the confirmed decisions and non-goals>"
 ```
 It picks the model and effort, retries, escalates and records the outcome. Exit codes: 0 ok, 3 environment broken, 4 gave up. Report the result. Use `--baseline "<cmd>"` when `--verify` includes a test that is supposed to fail right now.
 
-## Step 2b: Job (T2/T3)
+## Step 3b: Job (T2/T3)
 
-1. **Plan.** Load the **orchestrate-plan** skill and write `plan.json` (for example `~/.local/share/orchestrate/plans/<job>.json`). If you lack the repo context to plan well, let a planner subagent draft it: `python3 $S/orchestrate.py plan --repo <repo> --goal "<goal>"`. Then review and adjust what it wrote.
+1. **Plan.** Load the **orchestrate-plan** skill and write `plan.json` (for example `~/.local/share/orchestrate/plans/<job>.json`) from the confirmed grilling summary: copy its goal, acceptance, `non_goals` and `decisions` into the plan. If you lack the repo context to plan well, let a planner subagent draft it with `python3 $S/orchestrate.py plan --repo <repo> --goal "<goal + decisions>"`. Then review and adjust what it wrote.
+   - **Commit the docs.** If grilling changed the glossary or ADRs, ask the user to commit those files before running (jobs start from the last commit). Subagents read the glossary automatically.
 2. **Validate** until clean:
    ```bash
    python3 $S/orchestrate.py validate plan.json

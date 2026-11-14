@@ -453,9 +453,9 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
         return errs, warns, []
     if plan.get("base") and not git(repo, "rev-parse", "--verify", "--quiet", plan["base"], check=False):
         errs.append(f"plan.base {plan['base']!r} does not exist")
-    for k in ("verify", "setup", "acceptance"):
-        if k in plan and not isinstance(plan[k], list):
-            errs.append(f"plan.{k} must be a list")
+    for k in ("verify", "setup", "acceptance", "non_goals", "decisions"):
+        if k in plan and not (isinstance(plan[k], list) and all(isinstance(x, str) for x in plan[k])):
+            errs.append(f"plan.{k} must be a list of strings")
     tasks = {}
     for i, t in enumerate(plan["tasks"]):
         tid = t.get("id", f"#{i}")
@@ -535,13 +535,16 @@ def scan_hotspots(repo: Path, files: list[str]) -> list[str]:
 
 
 # =================================================================== brief ===
+GLOSSARY_NAMES = ("GLOSSARY-MAP.md", "GLOSSARY.md", "CONTEXT-MAP.md", "CONTEXT.md")
+
+
 def agents_docs_for(repo: Path, owns: list[str]) -> list[str]:
-    found = []
+    found = [g for g in GLOSSARY_NAMES if (repo / g).is_file()]
     for p in owns:
         d = Path(_static_prefix(p))
         chain = [d, *d.parents] if str(d) not in ("", ".") else [Path(".")]
         for c in chain:
-            for name in ("AGENTS.md", "CLAUDE.md"):
+            for name in ("AGENTS.md", "CLAUDE.md", "GLOSSARY.md", "CONTEXT.md"):
                 f = (Path(c) / name)
                 if (repo / f).is_file() and str(f) not in found:
                     found.append(str(f))
@@ -554,8 +557,14 @@ def build_brief(plan: dict, task: dict, repo: Path, upstream: dict) -> str:
     L = [f"# Subtask {task['id']}: {task['title']}",
          f"Task id: {task['id']}",
          f"Part of job \"{plan['job']}\": {plan['goal']}", "",
-         "## Your goal", task["goal"].strip(), "",
-         "## You own (the ONLY paths you may create, edit or delete)",
+         "## Your goal", task["goal"].strip(), ""]
+    if plan.get("decisions"):
+        L += ["## Decisions already made with the user (follow them; do not revisit)",
+              *[f"- {d}" for d in plan["decisions"]], ""]
+    if plan.get("non_goals"):
+        L += ["## Out of scope for this whole job (do not build these)",
+              *[f"- {n}" for n in plan["non_goals"]], ""]
+    L += ["## You own (the ONLY paths you may create, edit or delete)",
          *[f"- `{p}`" for p in task["owns"]], ""]
     if docs or reads:
         L += ["## Read first (context, do not edit)", *[f"- `{p}`" for p in docs + reads], ""]
@@ -859,6 +868,12 @@ commands: the job's verify commands already ran and passed (output below). Judge
 
 Job acceptance criteria:
 {chr(10).join('- ' + a for a in plan.get('acceptance', [])) or '- (none given: judge against the goal)'}
+
+Decisions settled with the user (flag violations as major; do not re-litigate them):
+{chr(10).join('- ' + d for d in plan.get('decisions', [])) or '- (none recorded)'}
+
+Non-goals (anything built for these is scope creep):
+{chr(10).join('- ' + n for n in plan.get('non_goals', [])) or '- (none recorded)'}
 
 Subtasks (what each was asked to do):
 {json.dumps(tasks, indent=2)[:8000]}

@@ -9,7 +9,7 @@ A good plan makes subagents independent. Each one gets a clear goal, its own fil
 
 ## Process
 
-1. **Understand the goal.** Write the acceptance criteria for the whole job (3–7 testable bullets). Ask the user if a product decision is missing; don't guess one.
+1. **Start from the confirmed grilling summary** (the **orchestrate-grill** skill). Its goal, acceptance criteria, non-goals and decisions go into `goal`, `acceptance`, `non_goals` and `decisions`, word for word. If a product decision turns up missing while you plan, go back and ask; don't guess one.
 2. **Map the repo:** `orchestrate.py scan --repo <repo>`. It lists packages and their areas, suggested verify commands, hotspots (lockfiles and root configs), AGENTS.md files and the setup command. Read the root AGENTS.md and the AGENTS.md of every package you'll touch. Skim the code you'll change (entry points, an existing similar feature) so the plan follows existing patterns.
 3. **Split by ownership, not by step.** Each task owns a set of paths that nobody running at the same time owns:
    - **Contract first.** Shared types, API schemas or a contract package come first (wave 1). Consumers depend on them.
@@ -65,7 +65,10 @@ Be as narrow as practical but include everything the task must create, including
   "goal": "Users can share a schedule via a public read-only link",
   "repo": "/abs/path/to/repo",
   "base": "main",                             // optional, default: current branch
-  "acceptance": ["...", "..."],               // whole-job, testable
+  "acceptance": ["...", "..."],               // whole-job, testable (from grilling)
+  "non_goals": ["no expiry UI in this job"],  // optional, from grilling: subagents must not build these
+  "decisions": ["Tokens are opaque random strings, not JWTs (docs/adr/0007-share-tokens.md)"],
+                                              // optional, from grilling: settled, not to be revisited
   "setup": ["pnpm install --frozen-lockfile --prefer-offline"],   // per worktree
   "verify": ["make lint", "make typecheck", "make test-api"],     // final; also the baseline
   "baseline": ["make lint"],                  // optional override of the pre-check
@@ -108,6 +111,8 @@ Be as narrow as practical but include everything the task must create, including
   ]
 }
 ```
+
+Every subagent's brief includes `non_goals`, `decisions` and the repo glossary (`GLOSSARY.md` or `CONTEXT.md`), and so does the reviewer's prompt. Write decisions so a subagent can act on them alone.
 
 Comments above are for explanation only. Real `plan.json` must be plain JSON. Required per task: `id, title, goal, type, tier, owns, done, verify`. Optional: `reads, depends_on, interfaces, gate, baseline`.
 

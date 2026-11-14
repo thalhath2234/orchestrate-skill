@@ -1,6 +1,6 @@
 # orchestrate
 
-A multi-agent coding orchestrator for Claude Code, for single repos and monorepos. The parent agent triages the request. Small tasks run as one routed task. Big ones become a **job**:
+A multi-agent coding orchestrator for Claude Code, for single repos and monorepos. It starts by **grilling you about what you actually want** (Matt Pocock's grill-with-docs), and writes the glossary and ADRs as decisions settle. Then the parent agent triages the request. Small tasks run as one routed task. Big ones become a **job**:
 
 1. Plan the job.
 2. Split it into subtasks, each with its own files.
@@ -11,7 +11,9 @@ A multi-agent coding orchestrator for Claude Code, for single repos and monorepo
 Every subagent starts on the cheapest model likely to work and escalates on failure. Routing learns per task type, but only through proposals that you approve.
 
 ```
-request ─► triage ─┬─ T0/T1 ─► run_task (route → attempt ×2 → classify → escalate) ─► done
+request ─► grill (rounds of questions → glossary/ADRs → you confirm) ─► triage
+                   ┌──────────┘
+                   ├─ T0/T1 ─► run_task (route → attempt ×2 → classify → escalate) ─► done
                    └─ T2/T3 ─► plan.json ─► validate (DAG + file ownership) ─► run
                                  ┌──────────── waves, ≤ cap in parallel ────────────┐
                                  │ worktree + setup ─► brief ─► run_task ─► scope ✓ │ per task
@@ -30,11 +32,12 @@ npx skills add thalhath2234/orchestrate-skill -g
 claude plugin install orchestrate --marketplace thalhath2234/orchestrate-skill
 ```
 
-This installs three skills:
+This installs four skills:
 
 | Skill | For |
 |---|---|
-| `orchestrate` | The parent's playbook: triage, single task or job, run, wait, handle outcomes |
+| `orchestrate` | The parent's playbook: grill, triage, single task or job, run, wait, handle outcomes |
+| `orchestrate-grill` | The interview before any plan: design-tree rounds with recommended answers, glossary and ADRs written as terms and decisions settle, and a closing summary you confirm. Matt Pocock's `grilling` + `domain-modeling`, vendored (see Credits) |
 | `orchestrate-plan` | How to plan: split by file ownership, contract first, tier each subtask, done criteria, monorepo rules, `plan.json` schema |
 | `orchestrate-review` | What the integrator and reviewer subagents check, severities, and output format |
 
@@ -48,7 +51,7 @@ In Claude Code, T3 Code and similar tools, type `/orchestrate` followed by what 
 /orchestrate add shareable read-only schedule links across api, web and mobile
 ```
 
-The parent scans the repo, decides between a single task and a job, writes and validates a plan, shows it to you, runs it detached and reports back. The result is a branch `orchestrate/<job>`. **It never merges into your branch.**
+The parent scans the repo and **grills you** round by round until nothing is assumed. You can answer "all recommended", or say *skip grilling* for trivial changes. Once you confirm the summary, it decides between a single task and a job, writes and validates a plan (your decisions and non-goals go into every subagent's brief and the reviewer's prompt), shows it to you, runs it detached and reports back. The result is a branch `orchestrate/<job>`. **It never merges into your branch.**
 
 To run the scripts by hand (`S=skills/orchestrate/scripts`):
 
@@ -126,5 +129,9 @@ python3 tests/test_orchestrate.py -v   # e2e on a pnpm/Go monorepo with a fake `
 python3 tests/test_routing.py -v
 claude plugin validate .
 ```
+
+## Credits
+
+`skills/orchestrate-grill` vendors Matt Pocock's [`grilling`](https://github.com/mattpocock/skills/tree/main/skills/productivity/grilling) and [`domain-modeling`](https://github.com/mattpocock/skills/tree/main/skills/engineering/domain-modeling) skills (together, `grill-with-docs`) from [mattpocock/skills](https://github.com/mattpocock/skills) at commit `5863806`, under the MIT License, © 2026 Matt Pocock. See `skills/orchestrate-grill/LICENSE-mattpocock`. They're renamed so installing this repo never overwrites your own copies of his skills.
 
 MIT licensed.
