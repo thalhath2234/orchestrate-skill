@@ -71,9 +71,11 @@ def verify(cmds: list[str], cwd: Path, timeout: int) -> tuple[bool, str]:
 
 
 def claude(prompt: str, model: str, effort: str, cwd: Path, *, perm: str,
-           tools: list[str], resume: str | None, timeout: int) -> dict:
+           tools: list[str], resume: str | None, timeout: int, settings: dict | None = None) -> dict:
     cmd = [CLAUDE, "-p", prompt, "--model", model, "--effort", effort,
            "--output-format", "json", "--permission-mode", perm]
+    if settings:
+        cmd += ["--settings", json.dumps(settings)]
     if tools:
         cmd += ["--allowedTools", *tools]
     if resume:
@@ -163,9 +165,21 @@ def main(argv=None) -> int:
     ap.add_argument("--max-escalations", type=int, default=2)
     ap.add_argument("--permission-mode", default="acceptEdits")
     ap.add_argument("--allowed-tools", nargs="*",
-                    default=["Read", "Edit", "Write", "Glob", "Grep",
-                             "Bash(make *)", "Bash(go *)", "Bash(pnpm *)", "Bash(git diff*)",
-                             "Bash(git status*)", "Bash(rg *)", "Bash(ls *)"])
+                    # No bare Edit/Write: that would allow edits ANYWHERE. acceptEdits already
+                    # auto-approves edits inside the repo/worktree and nothing else.
+                    default=["Read", "Glob", "Grep", "Bash(make *)",
+                             "Bash(go *)", "Bash(cargo *)", "Bash(pnpm *)", "Bash(npm *)",
+                             "Bash(npx *)", "Bash(yarn *)", "Bash(bun *)", "Bash(node *)",
+                             "Bash(python3 *)", "Bash(pytest *)", "Bash(uv *)",
+                             "Bash(git diff*)", "Bash(git status*)", "Bash(git log*)",
+                             "Bash(git show*)", "Bash(rg *)", "Bash(ls *)", "Bash(cat *)",
+                             "Bash(head *)", "Bash(tail *)", "Bash(wc *)", "Bash(find *)",
+                             "Bash(mkdir *)", "Bash(cd *)", "Bash(test *)"])
+    ap.add_argument("--sandbox", action="store_true",
+                    help="OS-level sandbox for the worker's shell commands (writes limited to the "
+                         "repo; may break tools that write caches elsewhere, e.g. Go)")
+    ap.add_argument("--extra-tools", nargs="*", default=[],
+                    help="additional --allowedTools entries, e.g. 'Bash(docker compose *)'")
     ap.add_argument("--baseline", action="append",
                     help="pre-task health check (repeatable; default: the --verify commands). "
                          "Use when --verify includes a test that is SUPPOSED to fail now")
@@ -177,7 +191,7 @@ def main(argv=None) -> int:
     repo = a.repo.expanduser().resolve()
     router.validate_type(a.type)
     # the worker is told to run the verify commands itself, so it must be allowed to
-    a.allowed_tools += [f"Bash({c})" for c in a.verify]
+    a.allowed_tools += a.extra_tools + [f"Bash({c})" for c in a.verify]
     task_id = uuid.uuid4().hex[:10]
 
     decision = router.route(a.type, a.tier)
@@ -195,6 +209,9 @@ def main(argv=None) -> int:
     if git(repo, "status", "--porcelain").strip():
         log("warning: repo has uncommitted changes; consider running in a worktree")
 
+    settings = {"permissions": {"blockWritesOutsideWorkingDirectories": True}}
+    if a.sandbox:
+        settings["sandbox"] = {"enabled": True, "autoAllowBashIfSandboxed": True}
     rung, probe, hint = decision["rung"], decision["probe"], ""
     summary = {"task_id": task_id, "type": a.type, "tier": a.tier, "steps": [], "proposals": []}
     escalations = 0
@@ -206,7 +223,8 @@ def main(argv=None) -> int:
                 "Verification still fails. Fix it. Output:\n" + vout[-5000:])
             log(f"attempt {attempt}/{a.attempts} at {model}/{effort}")
             worker = claude(prompt, model, effort, repo, perm=a.permission_mode,
-                            tools=a.allowed_tools, resume=session, timeout=a.claude_timeout)
+                            tools=a.allowed_tools, resume=session, timeout=a.claude_timeout,
+                            settings=settings)
             session = worker.get("session_id") or session
             if worker.get("is_error"):
                 vout = str(worker.get("result"))
@@ -261,6 +279,7 @@ def main(argv=None) -> int:
         rung, probe = new, False
 
     summary.setdefault("result", "ok")
+    summary["final_message"] = str(worker.get("result", ""))[-6000:]
     summary["proposals"] = [{"id": p["id"], "kind": p["kind"], "reason": p["reason"]}
                             for p in summary["proposals"]]
     print(json.dumps(summary, indent=2))

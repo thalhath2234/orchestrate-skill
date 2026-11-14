@@ -1,10 +1,10 @@
 {
   "name": "orchestrate",
-  "version": "0.1.0",
-  "description": "Pick the right Claude model and effort per coding task: start cheap, escalate on failure, and learn per task type. Policy changes are proposals you approve.",
+  "version": "0.2.0",
+  "description": "Multi-agent coding orchestrator for repos and monorepos: triage, plan, split into owned subtasks, run parallel Claude subagents capped by machine capacity, merge, review. Routes each task to the right model and learns per task type.",
   "author": { "name": "thalhath2234" },
   "homepage": "https://github.com/thalhath2234/orchestrate-skill",
   "repository": "https://github.com/thalhath2234/orchestrate-skill",
   "license": "MIT",
-  "keywords": ["model-selection", "orchestrator", "routing", "effort", "skills"]
+  "keywords": ["orchestrator", "multi-agent", "subagents", "monorepo", "model-selection", "routing", "code-review"]
 }
