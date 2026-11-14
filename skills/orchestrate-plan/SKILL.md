@@ -1,6 +1,6 @@
 ---
 name: orchestrate-plan
-description: Use when writing an orchestrate plan.json: splitting a coding goal into subtasks with file ownership, tiers, dependencies and done criteria.
+description: "Use when writing an orchestrate plan.json. Splits a coding goal into subtasks with file ownership, tiers, dependencies and done criteria."
 ---
 
 # Planning an orchestrate job

@@ -1,6 +1,6 @@
 ---
 name: orchestrate-review
-description: Use when acting as the integrator or reviewer of an orchestrate job: resolving merge conflicts between subagent branches and reviewing the merged result.
+description: "Use when acting as the integrator or reviewer of an orchestrate job. Resolves merge conflicts between subagent branches and reviews the merged result."
 ---
 
 # Integrating and reviewing an orchestrate job

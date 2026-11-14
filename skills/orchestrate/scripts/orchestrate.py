@@ -73,6 +73,13 @@ HOTSPOT_ROOT = {"package.json", "pnpm-workspace.yaml", "turbo.json", "nx.json", 
                 "tsconfig.base.json", "tsconfig.json", "Makefile", ".env.example",
                 "docker-compose.yml", "Cargo.toml", "go.mod"}
 MANIFESTS = {"package.json": "node", "go.mod": "go", "Cargo.toml": "rust", "pyproject.toml": "python"}
+SKIP_DIRS = {"node_modules", "vendor", "third_party", "third-party", "fixtures", "testdata",
+             "__fixtures__", "examples", "dist", "build"}
+
+
+def _skipped(path: str) -> bool:
+    """Vendored, hidden or fixture paths are not packages/hotspots of this repo."""
+    return any(seg.startswith(".") or seg in SKIP_DIRS for seg in Path(path).parts[:-1])
 
 
 # =============================================================== utilities ===
@@ -251,12 +258,13 @@ def _slug(s: str) -> str:
 
 def scan(repo: Path) -> dict:
     repo = repo.resolve()
-    files = git(repo, "ls-files").splitlines()
+    all_files = git(repo, "ls-files").splitlines()
+    files = [f for f in all_files if not _skipped(f)]
     fileset = set(files)
     pkgs = []
     for f in files:
         name = Path(f).name
-        if name in MANIFESTS and "node_modules/" not in f:
+        if name in MANIFESTS:
             d = str(Path(f).parent)
             pkgs.append({"dir": "" if d == "." else d, "kind": MANIFESTS[name], "manifest": f})
     nested = [p for p in pkgs if p["dir"]]
@@ -298,7 +306,7 @@ def scan(repo: Path) -> dict:
         p["kind"] == "node" for p in pkgs) else None, "packages": packages,
         "agents_docs": agents_docs, "hotspots": hotspots, "suggested_setup": setup,
         "suggested_final_verify": root_verify,
-        "make_targets": sorted(make_targets)[:120], "tracked_files": len(files)}
+        "make_targets": sorted(make_targets)[:120], "tracked_files": len(all_files)}
 
 
 def _make_targets(makefile: Path) -> dict:
@@ -522,7 +530,8 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
 
 
 def scan_hotspots(repo: Path, files: list[str]) -> list[str]:
-    return [f for f in files if Path(f).name in HOTSPOT_ANYWHERE or ("/" not in f and f in HOTSPOT_ROOT)]
+    return [f for f in files if not _skipped(f) and (
+        Path(f).name in HOTSPOT_ANYWHERE or ("/" not in f and f in HOTSPOT_ROOT))]
 
 
 # =================================================================== brief ===

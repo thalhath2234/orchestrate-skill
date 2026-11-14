@@ -91,6 +91,9 @@ def make_monorepo(root: Path) -> None:
         "apps/web/src/index.ts": "export {}\n",
         "packages/contract/package.json": json.dumps({"name": "@app/contract", "scripts": {"test": "vitest"}}),
         "packages/contract/src/index.ts": "export const v = 1\n",
+        ".agents/vendored/tool/package.json": json.dumps({"name": "vendored"}),
+        ".agents/vendored/tool/bun.lock": "{}",
+        "apps/web/fixtures/demo/package.json": json.dumps({"name": "fixture"}),
     }
     for p, c in files.items():
         f = root / p
@@ -191,6 +194,7 @@ class OrchestrateTest(unittest.TestCase):
         for h in ("pnpm-lock.yaml", "package.json", "Makefile", "pnpm-workspace.yaml"):
             self.assertIn(h, info["hotspots"])
         self.assertIn("apps/api/AGENTS.md", info["agents_docs"])
+        self.assertNotIn(".agents/vendored/tool/bun.lock", info["hotspots"])  # vendored/hidden skipped
 
     def test_ownership_overlap_rules(self):
         ov = lambda a, b: self.o.patterns_overlap(a, b, ["apps/api/main.go", "apps/web/src/index.ts"])

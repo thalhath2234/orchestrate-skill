@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: Use when a coding task should be routed, planned, split across parallel subagents, merged and reviewed. Triage first; small tasks run as one routed task, big ones as a job.
+description: "Use when a coding task should be routed, planned, split across parallel subagents, merged and reviewed. Triages first; small tasks run as one routed task, big ones as a job."
 ---
 
 # Orchestrate
