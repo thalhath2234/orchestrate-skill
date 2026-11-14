@@ -1,0 +1,12 @@
+{
+  "name": "orchestrate-skill",
+  "description": "Model/effort routing for Claude Code coding tasks",
+  "owner": { "name": "thalhath2234" },
+  "plugins": [
+    {
+      "name": "orchestrate",
+      "source": "./",
+      "description": "Pick the right Claude model and effort per coding task: start cheap, escalate on failure, learn per task type."
+    }
+  ]
+}

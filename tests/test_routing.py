@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""End-to-end tests for router.py + run_task.py with a fake `claude` binary.
+
+Run from the repo root: python3 tests/test_routing.py -v
+"""
+import importlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrate" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+FAKE_CLAUDE = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    import json, os, pathlib, sys
+    a = sys.argv[1:]
+    prompt, model, effort = a[a.index("-p") + 1], a[a.index("--model") + 1], a[a.index("--effort") + 1]
+    cfg = json.loads(pathlib.Path(os.environ["FAKE_CFG"]).read_text())
+    with open(os.environ["FAKE_CALLS"], "a") as fh:
+        fh.write(json.dumps({"model": model, "effort": effort,
+                             "classifier": prompt.startswith("FAILURE_CLASSIFIER"),
+                             "resume": "--resume" in a, "hint": "Note from a previous" in prompt}) + "\\n")
+    if prompt.startswith("FAILURE_CLASSIFIER"):
+        res = json.dumps({"cause": cfg.get("cause", "capability"), "evidence": "fake evidence",
+                          "agents_md": cfg.get("agents_md")})
+    else:
+        if f"{model}/{effort}" in cfg.get("pass", []):
+            pathlib.Path("target.txt").write_text("fixed")
+        res = "done"
+    ver = cfg.get("ver", "5-5")
+    print(json.dumps({"result": res, "session_id": "sess-1", "total_cost_usd": 0.01, "is_error": False,
+                      "modelUsage": {f"claude-{model}-{ver}": {}}}))
+''')
+
+
+class RoutingTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="routing-test-"))
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        (self.repo / "target.txt").write_text("broken")
+        subprocess.run("git init -q && git add . && git -c user.email=t@t -c user.name=t commit -qm init",
+                       shell=True, cwd=self.repo, check=True)
+        fake = self.tmp / "claude"
+        fake.write_text(FAKE_CLAUDE)
+        fake.chmod(0o755)
+        self.cfg = self.tmp / "cfg.json"
+        self.calls = self.tmp / "calls.jsonl"
+        self.env = {**os.environ, "ORCHESTRATE_DIR": str(self.state), "ROUTER_CLAUDE_BIN": str(fake),
+                    "FAKE_CFG": str(self.cfg), "FAKE_CALLS": str(self.calls), "ROUTER_PROBE_RATE": "0"}
+        os.environ.update({k: self.env[k] for k in ("ORCHESTRATE_DIR", "ROUTER_PROBE_RATE")})
+        import router
+        self.router = importlib.reload(router)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def run_task(self, ttype, tier, cfg, verify="grep -q fixed target.txt", probe_rate="0"):
+        self.cfg.write_text(json.dumps(cfg))
+        (self.repo / "target.txt").write_text("broken")
+        self.calls.write_text("")
+        env = {**self.env, "ROUTER_PROBE_RATE": probe_rate}
+        p = subprocess.run([sys.executable, str(SCRIPTS / "run_task.py"), "--repo", str(self.repo),
+                            "--type", ttype, "--tier", tier, "--verify", verify,
+                            "--baseline", "test -f target.txt", "do the thing"],
+                           env=env, capture_output=True, text=True)
+        summary = json.loads(p.stdout) if p.stdout.strip() else {}
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        return p.returncode, summary, calls, p.stderr
+
+    def ledger(self):
+        return [json.loads(line) for line in (self.state / "ledger.jsonl").read_text().splitlines()]
+
+    # -------------------------------------------------------------------
+    def test_pass_at_default_records_success_and_no_proposal(self):
+        code, s, calls, _ = self.run_task("rename:web", "T0", {"pass": ["haiku/low"]})
+        self.assertEqual(code, 0)
+        self.assertEqual([c["model"] for c in calls], ["haiku"])
+        self.assertEqual(s["proposals"], [])
+        self.assertTrue(self.ledger()[0]["ok"])
+
+    def test_two_attempts_then_capability_escalation_and_raise_proposal(self):
+        cfg = {"pass": ["opus/high"], "cause": "capability"}
+        code, s, calls, err = self.run_task("bugfix:api", "T1", cfg)
+        self.assertEqual(code, 0, err)
+        workers = [c for c in calls if not c["classifier"]]
+        self.assertEqual([(c["model"], c["effort"], c["resume"]) for c in workers],
+                         [("sonnet", "medium", False), ("sonnet", "medium", True), ("opus", "high", False)])
+        self.assertEqual(s["proposals"], [], "one failed task is not enough evidence")
+
+        code, s, *_ = self.run_task("bugfix:api", "T1", cfg)
+        self.assertEqual(len(s["proposals"]), 1)
+        self.assertEqual(s["proposals"][0]["kind"], "raise_floor")
+        # proposal only: routing unchanged until approved
+        self.assertEqual(self.router.route("bugfix:api", "T1")["model"], "sonnet")
+        self.assertEqual([p["kind"] for p in self.router.pending()], ["raise_floor"])
+
+        self.router.approve(s["proposals"][0]["id"])
+        d = self.router.route("bugfix:api", "T1")
+        self.assertEqual((d["model"], d["effort"], d["source"]), ("opus", "high", "learned"))
+        self.assertEqual(self.router.pending(), [])
+
+        # next task starts at the approved floor
+        code, s, calls, _ = self.run_task("bugfix:api", "T1", cfg)
+        self.assertEqual(calls[0]["model"], "opus")
+
+    def test_effort_failure_keeps_model_raises_effort(self):
+        code, s, calls, _ = self.run_task("feature:web", "T1", {"pass": ["sonnet/high"], "cause": "effort"})
+        self.assertEqual(code, 0)
+        workers = [(c["model"], c["effort"]) for c in calls if not c["classifier"]]
+        self.assertEqual(workers[-1], ("sonnet", "high"))
+
+    def test_environment_failure_stops_and_never_proposes(self):
+        verify = "grep -q fixed target.txt || (echo 'dial tcp 127.0.0.1:5432: connect: connection refused'; false)"
+        for _ in range(3):
+            code, s, calls, _ = self.run_task("bugfix:api", "T1", {"pass": []}, verify=verify)
+            self.assertEqual(code, 3)
+            self.assertFalse(any(c["classifier"] for c in calls), "env detected by regex, no LLM call")
+        self.assertEqual(self.router.pending(), [])
+        self.assertTrue(all(e["cause"] == "environment" for e in self.ledger()))
+
+    def test_baseline_failure_spends_no_tokens(self):
+        self.cfg.write_text("{}")
+        self.calls.write_text("")
+        p = subprocess.run([sys.executable, str(SCRIPTS / "run_task.py"), "--repo", str(self.repo),
+                            "--type", "bugfix:api", "--tier", "T1", "--verify", "false", "x"],
+                           env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 3)
+        self.assertEqual(self.calls.read_text(), "")
+
+    def test_context_failure_proposes_agents_md_and_retries_same_model(self):
+        cfg = {"pass": [], "cause": "context",
+               "agents_md": {"file": "AGENTS.md", "text": "Handlers live in internal/http, not handlers/"}}
+        code, s, calls, _ = self.run_task("feature:api", "T1", cfg)
+        self.assertEqual(code, 4)
+        workers = [c for c in calls if not c["classifier"]]
+        self.assertTrue(all(c["model"] == "sonnet" for c in workers), "context never escalates the model")
+        self.assertTrue(any(c["hint"] for c in workers))
+        props = self.router.pending()
+        self.assertEqual([p["kind"] for p in props], ["agents_md"])
+        self.assertTrue(all(e["cause"] == "context" for e in self.ledger()))
+        self.router.approve(props[0]["id"])
+        self.assertIn("Handlers live in internal/http", (self.repo / "AGENTS.md").read_text())
+
+    def test_top_of_ladder_gives_up_and_proposes_needs_human(self):
+        for _ in range(2):
+            code, s, calls, _ = self.run_task("migration:api", "T3", {"pass": [], "cause": "capability"})
+            self.assertEqual(code, 4)
+        workers = [(c["model"], c["effort"]) for c in calls if not c["classifier"]]
+        self.assertEqual(sorted(set(workers)), [("opus", "high"), ("opus", "xhigh")])
+        kinds = {p["kind"] for p in self.router.pending()}
+        self.assertIn("raise_floor", kinds)  # opus/high -> opus/xhigh
+
+    def test_rule_expires_when_model_version_changes(self):
+        cfg = {"pass": ["opus/high"], "cause": "capability"}
+        self.run_task("bugfix:mobile", "T1", cfg)
+        _, s, *_ = self.run_task("bugfix:mobile", "T1", cfg)
+        self.router.approve(s["proposals"][0]["id"])
+        self.assertEqual(self.router.route("bugfix:mobile", "T1")["source"], "learned")
+        self.router.note_alias("sonnet", "claude-sonnet-5-6")  # new Sonnet ships
+        d = self.router.route("bugfix:mobile", "T1")
+        self.assertEqual((d["model"], d["source"]), ("sonnet", "tier-default"))
+        self.assertIn("expired", d["rule"])
+
+    def test_probe_wins_propose_lowering_the_floor(self):
+        cfg = {"pass": ["opus/high"], "cause": "capability"}
+        self.run_task("refactor:web", "T1", cfg)
+        _, s, *_ = self.run_task("refactor:web", "T1", cfg)
+        self.router.approve(s["proposals"][0]["id"])           # floor = opus/high (rung 4)
+        props = []
+        for _ in range(3):  # probe at sonnet/high (rung 3), which now passes
+            code, s, calls, _ = self.run_task("refactor:web", "T1", {"pass": ["sonnet/high"]}, probe_rate="1")
+            self.assertEqual(code, 0)
+            self.assertEqual((calls[0]["model"], calls[0]["effort"]), ("sonnet", "high"))
+            props += s["proposals"]
+        self.assertEqual(len(props), 1)
+        self.assertEqual(props[0]["kind"], "lower_floor")
+        self.router.approve(props[0]["id"])
+        self.assertEqual(self.router.route("refactor:web", "T1")["rung"], 3)
+
+    def test_failed_probe_returns_to_floor(self):
+        cfg = {"pass": ["opus/high"], "cause": "capability"}
+        self.run_task("test:api", "T1", cfg)
+        _, s, *_ = self.run_task("test:api", "T1", cfg)
+        self.router.approve(s["proposals"][0]["id"])
+        code, s, calls, _ = self.run_task("test:api", "T1", cfg, probe_rate="1")
+        workers = [(c["model"], c["effort"]) for c in calls if not c["classifier"]]
+        self.assertEqual(workers[0], ("sonnet", "high"))
+        self.assertEqual(workers[-1], ("opus", "high"))
+        self.assertEqual(code, 0)
+
+    def test_bad_task_type_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.router.route("stuff:api", "T1")
+        with self.assertRaises(SystemExit):
+            self.router.route("bugfix:Not A Slug", "T1")
+        self.assertEqual(self.router.route("bugfix:billing-service", "T1")["model"], "sonnet")
+
+    def test_default_state_dir_is_outside_the_skill(self):
+        env = {k: v for k, v in os.environ.items() if k not in ("ORCHESTRATE_DIR", "XDG_DATA_HOME")}
+        env["HOME"] = str(self.tmp / "home")
+        out = subprocess.run([sys.executable, "-c", "import router; print(router.DIR)"],
+                             cwd=SCRIPTS, env=env, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(out, str(self.tmp / "home/.local/share/orchestrate"))
+
+
+if __name__ == "__main__":
+    unittest.main()
