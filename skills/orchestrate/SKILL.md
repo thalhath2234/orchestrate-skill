@@ -7,7 +7,7 @@ description: Use when choosing a Claude model/effort for a coding task or subage
 
 Pick the **starting** model and effort for a coding task from its tier, raised by any learned floor the user has **approved** for its task type. Escalate within a task when it fails. Never change routing for future tasks yourself: the orchestrator files proposals and the user approves them.
 
-Scripts live in `scripts/` next to this file (Python 3.9+, stdlib only, macOS/Linux). Below, `$S` means `<this skill's base directory>/scripts`.
+Scripts live in `scripts/` next to this file (Python 3.9+, stdlib only, macOS/Linux). Below, `$S` means `<this skill's base directory>/scripts`. If you don't know the base directory, find it with `ls -d ~/.agents/skills/orchestrate/scripts ~/.claude/skills/orchestrate/scripts ~/.claude/plugins/cache/*/orchestrate/*/skills/orchestrate/scripts 2>/dev/null | head -1`.
 
 ## Task type and tier
 
