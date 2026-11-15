@@ -83,6 +83,22 @@ python3 $S/run_task.py --repo . --type bugfix:api --tier T1 --verify "make test"
 python3 $S/router.py proposals | approve <id> | reject <id> | status                       # routing (you)
 ```
 
+## Watch a job
+
+```bash
+python3 $S/dashboard.py <job> --open        # http://127.0.0.1:8765, read-only, safe while a job runs
+```
+
+It's a live web dashboard:
+- **Task graph:** tasks grouped by wave, with dependency edges, live status, model path, timer and cost. Manager-added tasks and retries are badged.
+- **Timeline** of when each task ran.
+- **Activity feed:** tasks starting and finishing, the manager's decisions with its reasoning, and review rounds.
+- **Header tiles:** progress, elapsed time, cost against the budget, parallel slots and what's capping them, manager interventions, models used.
+- **Banners** with copyable commands, for gated tasks waiting on you and for manager questions.
+- **Task drawer:** click any task for its goal, owned paths, done criteria, verify commands, the model path with failure causes, its report and open issues, the live log, and the exact brief it received.
+
+It uses only the Python standard library and refreshes every 2 seconds. A dropdown switches between jobs.
+
 ## What each subagent gets
 
 A generated brief containing:

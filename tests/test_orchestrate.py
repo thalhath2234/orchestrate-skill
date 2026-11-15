@@ -554,6 +554,41 @@ class OrchestrateTest(unittest.TestCase):
         res = self.o.apply_actions(job, plan, {"actions": [{"action": "accept", "reason": "meh"}]}, review)
         self.assertTrue(any("blocker" in e for e in res["errors"]))
 
+    def test_dashboard_serves_live_job_read_only(self):
+        import threading
+        import urllib.error
+        import urllib.request
+        import dashboard
+        dash = importlib.reload(dashboard)
+        code, _, err = self.cli("run", str(self.write_plan(base_plan(self.repo, decisions=["Opaque tokens"]))),
+                                cfg={"tasks": WRITES})
+        self.assertEqual(code, 0, err[-2000:])
+        before = (self.state / "jobs/share/job.json").read_text()
+        srv = dash.ThreadingHTTPServer(("127.0.0.1", 0), dash.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        get = lambda p: urllib.request.urlopen(base + p, timeout=10).read().decode()
+        try:
+            jobs = json.loads(get("/api/jobs"))
+            self.assertEqual([(j["job"], j["status"], j["done"], j["total"]) for j in jobs], [("share", "done", 3, 3)])
+            d = json.loads(get("/api/job/share"))
+            self.assertEqual([t["id"] for t in d["tasks"]], ["contract", "api", "web"])
+            self.assertEqual(d["tasks"][1]["depends_on"], ["contract"])
+            self.assertEqual(d["tasks"][1]["state"]["status"], "done")
+            self.assertEqual(d["decisions"], ["Opaque tokens"])
+            self.assertIn("PASS", get("/api/job/share/log/api"))
+            self.assertIn("## Your goal", get("/api/job/share/brief/api"))
+            html = get("/")
+            self.assertIn('id="cols"', html)
+            self.assertIn("const DEFAULT_JOB = null", html)
+            for bad in ("/api/job/share/log/..%2F..%2Fjob", "/api/job/..%2Fx", "/api/job/nope", "/etc/passwd"):
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    get(bad)
+                self.assertEqual(cm.exception.code, 404, bad)
+        finally:
+            srv.shutdown()
+        self.assertEqual(before, (self.state / "jobs/share/job.json").read_text(), "dashboard never writes")
+
     def test_review_changes_requested_triggers_fix_round(self):
         cfg = {"tasks": WRITES,
                "reviews": [{"verdict": "changes_requested", "summary": "missing wiring",

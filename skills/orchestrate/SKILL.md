@@ -77,6 +77,13 @@ It picks the model and effort, retries, escalates and records the outcome. Exit 
    python3 $S/orchestrate.py wait <job> --timeout 540     # repeat while exit code is 75
    ```
    Use `status <job>` for a progress table. Preview a subagent's handoff with `brief plan.json <task-id>`.
+   **Offer the user the live dashboard.** Start it in the background: `python3 $S/dashboard.py <job> --port 8765`, then open http://127.0.0.1:8765. It shows:
+   - the task graph by wave, with live status, model paths, timers and costs
+   - a timeline and an activity feed, including the manager's reasoning
+   - per-task detail: goal, owned files, done criteria, the report, the live log and the brief
+   - banners for approvals and manager questions
+
+   It is read-only and safe while a job runs.
 5. **Handle the outcome** (exit code of `wait`):
 
 | Code | Status | What you do |
