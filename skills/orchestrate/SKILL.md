@@ -157,5 +157,6 @@ How learning works:
 - Never approve routing proposals. Tell the user they exist: `router.py proposals | approve <id> | reject <id> | status` are for the user.
 - Never merge `orchestrate/<job>` into the user's branch, push, or delete their branches.
 - Don't edit files in job worktrees while a job is running.
+- Don't update or reinstall the orchestrate skills while a job is running. The job fingerprints them and stops with a SECURITY failure if they change. Update after the job finishes (`status` shows it), or run new tools from the source repo.
 - The job starts from the last **commit**. Tell the user if they have uncommitted work it won't see.
 - State (learned routing, jobs, logs) lives in `~/.local/share/orchestrate`, or `$ORCHESTRATE_DIR`.
