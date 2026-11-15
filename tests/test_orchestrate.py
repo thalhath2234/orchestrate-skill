@@ -617,6 +617,8 @@ class OrchestrateTest(unittest.TestCase):
             d = json.loads(get("/api/job/share"))
             self.assertEqual([t["id"] for t in d["tasks"]], ["contract", "api", "web"])
             self.assertEqual(d["tasks"][1]["depends_on"], ["contract"])
+            self.assertEqual(d["metrics"]["tasks_done"], 3)
+            self.assertIn("subagent", d["metrics"]["cost_by_role"])
             self.assertEqual(d["tasks"][1]["state"]["status"], "done")
             self.assertEqual(d["decisions"], ["Opaque tokens"])
             self.assertIn("PASS", get("/api/job/share/log/api"))
@@ -856,6 +858,23 @@ class OrchestrateTest(unittest.TestCase):
         self.assertTrue(b2.startswith(prefix + "\n---\n"), "the job block is identical and first")
         self.assertIn("# root rules", prefix, "small root AGENTS.md is inlined")
         self.assertIn("needs_file | needs_decision | fyi", prefix)
+
+    def test_approval_commands_need_the_human(self):
+        gate = SCRIPTS / "approval_gate.py"
+        def ask(cmd, tool="Bash"):
+            p = subprocess.run([sys.executable, str(gate)], input=json.dumps(
+                {"tool_name": tool, "tool_input": {"command": cmd}}), capture_output=True, text=True)
+            return json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"] if p.stdout.strip() else None
+        S = "python3 ~/.agents/skills/orchestrate/scripts"
+        self.assertEqual(ask(f"{S}/orchestrate.py resume share --approve api --detach"), "ask")
+        self.assertEqual(ask(f"{S}/router.py approve ab12cd34"), "ask")
+        self.assertEqual(ask(f'{S}/orchestrate.py resume share --answer "yes, opaque tokens" --detach'), "ask")
+        for ok in (f"{S}/orchestrate.py status share", f"{S}/router.py proposals",
+                   f"{S}/orchestrate.py resume share --detach", "echo approve"):
+            self.assertIsNone(ask(ok), ok)
+        self.assertIsNone(ask("router.py approve x", tool="Read"))
+        hooks = json.loads((SCRIPTS.parents[2] / "hooks" / "hooks.json").read_text())
+        self.assertIn("approval_gate.py", hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
 
 if __name__ == "__main__":
     unittest.main()

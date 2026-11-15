@@ -1,0 +1,19 @@
+{
+ "id": "db-down-is-environment",
+ "core": true,
+ "pair": null,
+ "about": "",
+ "task": "Add GET /share/:token",
+ "final_message": "Implemented and ran tests.",
+ "verify_output": "$ make test-api\n--- FAIL: TestGet (0.01s)\n    db_test.go:12: dial tcp 127.0.0.1:5432: connect: connection refused\nFAIL",
+ "files": {
+  "Makefile": "test:\n\tgo test ./...\ntest-api:\n\tgo test ./...\n"
+ },
+ "diff_files": {},
+ "verify": [
+  "make test-api"
+ ],
+ "expect": {
+  "cause": "environment"
+ }
+}

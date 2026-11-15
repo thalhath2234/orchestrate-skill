@@ -1,0 +1,19 @@
+{
+ "id": "missing-make-target-is-environment",
+ "core": false,
+ "pair": null,
+ "about": "",
+ "task": "Add GET /share/:token",
+ "final_message": "Done.",
+ "verify_output": "$ make test-share\nmake: *** No rule to make target 'test-share'.  Stop.",
+ "files": {
+  "Makefile": "test:\n\tgo test ./...\ntest-api:\n\tgo test ./...\n"
+ },
+ "diff_files": {},
+ "verify": [
+  "make test-share"
+ ],
+ "expect": {
+  "cause": "environment"
+ }
+}

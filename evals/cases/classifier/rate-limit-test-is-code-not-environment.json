@@ -1,0 +1,21 @@
+{
+ "id": "rate-limit-test-is-code-not-environment",
+ "core": true,
+ "pair": null,
+ "about": "D2: a test about 429s is code under test; regex used to call this environment",
+ "task": "Add a per-user rate limit (5 req/min) to POST /schedules/:id/share",
+ "final_message": "I added a token-bucket middleware and ran `go test ./internal/share/...` several times. TestRateLimit still fails: the 6th request gets 200. I tried refilling per request and per second; I think the bucket refill math is wrong but couldn't find it.",
+ "verify_output": "$ make test-api\n--- FAIL: TestRateLimit (0.00s)\n    ratelimit_test.go:41: expected status 429, got 200\nFAIL\tapi/internal/share",
+ "files": {
+  "Makefile": "test:\n\tgo test ./...\ntest-api:\n\tgo test ./...\n"
+ },
+ "diff_files": {
+  "apps/api/internal/share/ratelimit.go": "package share\n// token bucket\nfunc allow(u string) bool { b := buckets[u]; b.tokens += elapsed() * rate; return b.take() }\n"
+ },
+ "verify": [
+  "make test-api"
+ ],
+ "expect": {
+  "cause": "capability"
+ }
+}

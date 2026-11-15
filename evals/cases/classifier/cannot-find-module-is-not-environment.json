@@ -1,0 +1,20 @@
+{
+ "id": "cannot-find-module-is-not-environment",
+ "core": false,
+ "pair": null,
+ "about": "D2: was classified environment by regex. The agent was misled about how deps reach web (contract re-exports zod as `z`): missing repo knowledge.",
+ "task": "Add zod validation for the share form using the existing zod dependency in packages/contract",
+ "final_message": "I imported zod in apps/web/src/share/form.ts as the task said. packages/contract imports zod too, so I assumed the workspace hoists it to web; nothing in AGENTS.md says otherwise.",
+ "verify_output": "$ pnpm --filter web test\nError: Cannot find module 'zod' from 'apps/web/src/share/form.ts'\n  apps/web has no zod dependency; zod is a dependency of @app/contract, which re-exports it as `z`.",
+ "files": {
+  "packages/contract/src/index.ts": "export { z } from 'zod'\n",
+  "apps/web/package.json": "{\"name\": \"web\", \"dependencies\": {\"@app/contract\": \"workspace:*\"}}"
+ },
+ "diff_files": {},
+ "verify": [
+  "pnpm --filter web test"
+ ],
+ "expect": {
+  "cause": "context"
+ }
+}

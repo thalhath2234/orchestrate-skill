@@ -19,7 +19,7 @@ A good plan makes subagents independent. Each one gets a clear goal, its own fil
 4. **Size each task** at roughly 15–45 minutes of agent work and 1–10 files. Merge trivial tasks into a neighbor. Split anything that would be T3. Aim for 2–8 tasks. More than 12 is a smell.
 5. **Tier each task** on its own merits (see below). A T3 job is usually made of T1/T2 tasks.
 6. **Write `done` and `verify`** for each task. Then the job-level `verify`, `setup` and gates.
-7. **Validate:** `orchestrate.py validate plan.json`. Fix every ERROR and read every warning.
+7. **Validate:** `orchestrate.py validate plan.json`. Fix every ERROR and read every warning. Drive **ownership gap** warnings to zero: each names an unowned file in the same Go package as, or imported by, a file a task owns. Give it to the task that will need it. In a real 18-task job, gaps like these produced an open issue from 8 of 9 finished tasks and most of the manager's cost.
 
 ## Tier rubric (per subtask)
 
@@ -35,7 +35,7 @@ Type is `<category>:<area>`. Categories: `rename docs config bugfix feature refa
 ## Monorepo rules
 
 - **Hotspots** (lockfiles, root `package.json`, `go.work`, root Makefile/tsconfig/CI): at most **one** task owns each. If several tasks need new dependencies, create a small first task (`config:infra`, T0/T1) that adds them all and owns the lockfile, and make the others depend on it. Otherwise, forbid new dependencies.
-- **Migrations:** one task owns the migrations folder pattern for the job. Add a `gate`, because migrations need human approval. Use the repo's migration tool and naming from its docs.
+- **Migrations:** one task owns the migrations folder pattern for the job, with a `gate` (validation rejects a task that owns migrations without one). Use the repo's migration tool and naming from its docs.
 - **Generated code** (codegen, OpenAPI clients) is owned by the task that runs the generator.
 - **Verify per package:** use the package's own commands from `scan.packages[].verify_suggestions` (for example `make test-api`, `pnpm --filter web run typecheck`). Use the repo-wide suite only in job-level `verify`.
 - **Setup:** set `setup` from `scan.suggested_setup` (for example `pnpm install --frozen-lockfile --prefer-offline`). It runs in every worktree.
@@ -81,6 +81,13 @@ Be as narrow as practical but include everything the task must create, including
   "max_escalations": 2,                       // optional; model escalations per task before the manager steps in
   "area": "cross",                            // area used for review-fix routing
   "extra_tools": ["Bash(docker compose *)"],  // optional extra allowed tools for subagents
+  "auto_claim": true,                         // optional (default true): a subagent may edit a file no
+                                              //   task owns; the scope check assigns it to that task
+  "review_diff_chars": 120000,                // optional: above this, review per area + integration
+  "reviewer": {"model": "opus", "effort": "high"},  // optional
+  "lessons": {"enabled": true, "model": "sonnet", "effort": "low"},  // optional: after the job,
+                                              //   propose AGENTS.md notes from what agents learned
+  "exclude_dynamic_prompt": false,            // optional experiment: cache-friendlier subagent prompts
   "sandbox": false,                           // optional OS sandbox for subagents' shell (bwrap/
                                               //   seatbelt); safest, but tools that write caches
                                               //   outside the repo (Go, Gradle) may break
@@ -116,6 +123,8 @@ Be as narrow as practical but include everything the task must create, including
 ```
 
 Every subagent's brief includes `non_goals`, `decisions` and the repo glossary (`GLOSSARY.md` or `CONTEXT.md`), and so does the reviewer's prompt. Write decisions so a subagent can act on them alone.
+
+Each subagent reports `open_issues` as `{issue, kind: needs_file | needs_decision | fyi, blocks_acceptance, files}`. `fyi` issues and `needs_file` issues whose files belong to one not-started task are handled by rule; only the rest wake the manager.
 
 Comments above are for explanation only. Real `plan.json` must be plain JSON. Required per task: `id, title, goal, type, tier, owns, done, verify`. Optional: `reads, depends_on, interfaces, gate, baseline`.
 

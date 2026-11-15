@@ -99,9 +99,18 @@ def job_payload(jid: str) -> dict | None:
         "manager": {"enabled": (p.get("manager") or {}).get("enabled", True),
                     "interventions": m.get("interventions", 0), "log": m.get("log", [])},
         "review": (s.get("review") or {}).get("rounds", []),
+        "metrics": _metrics(s),
         "tasks": tasks, "extra": extra, "pending_proposals": proposals,
         "report": (jd / "report.md").read_text() if (jd / "report.md").exists() else None,
     }
+
+
+def _metrics(state: dict) -> dict:
+    try:
+        import orchestrate
+        return orchestrate.job_metrics(state)
+    except Exception:  # noqa: BLE001  (old or partial state: the dashboard must still render)
+        return {}
 
 
 def tail(path: Path, n: int) -> str:
@@ -331,7 +340,7 @@ function render(){
   $('#banners').innerHTML = b;
   // tiles
   const cap = D.capacity || {}, el = (D.finished && D.status!=='running' ? D.finished : nowS()) - (D.created||nowS());
-  const budget = D.budget_usd, cost = D.cost_usd || 0;
+  const budget = D.budget_usd, cost = D.cost_usd || 0, M = D.metrics || {};
   const seg = st => `<i style="width:${100*by(st)/Math.max(total,1)}%;background:${col(st)}"></i>`;
   const models = {}; ts.forEach(t=>(t.state.steps||[]).forEach(s=>{const m=(s.config||'').split('/')[0]; if(m) models[m]=(models[m]||0)+1;}));
   $('#tiles').innerHTML = [
@@ -339,7 +348,9 @@ function render(){
     tile('Elapsed', `<span id="elapsed">${dur(el)}</span>`, D.created ? 'started ' + clock(D.created) : ''),
     tile('Cost', money(cost), budget ? `of ${money(budget)} budget` : 'no budget set', budget ? `<div class="bar"><i style="width:${Math.min(100,100*cost/budget)}%;background:${cost>budget*.85?'var(--failed)':'var(--accent)'}"></i></div>` : ''),
     tile('Parallel', `${running}<span class="dim" style="font-size:15px"> / ${cap.cap ?? '–'}</span>`, cap.limited_by ? `capped by ${esc(cap.limited_by)}` + (cap.mem_available_gb!=null ? ` · ${cap.mem_available_gb} GB free` : '') : ''),
-    tile('Manager', D.manager.enabled ? String(D.manager.interventions) : 'off', D.manager.enabled ? 'interventions' : 'manager disabled'),
+    tile('Manager', D.manager.enabled ? String(D.manager.interventions) : 'off', D.manager.enabled ? `interventions${M.auto_triaged ? ` · ${M.auto_triaged} settled by rule` : ''}` : 'manager disabled'),
+    tile('Cost split', M.cost_by_role ? Object.entries(M.cost_by_role).slice(0,3).map(([k,v])=>`<span style="font-size:15px">${esc(k)} <span class="dim">${money(v)}</span></span>`).join('<br>') : '–',
+         [M.manager_share!=null ? `manager ${Math.round(100*M.manager_share)}% of spend` : '', M.cache_read_share!=null ? `cache reads ${Math.round(100*M.cache_read_share)}%` : ''].filter(Boolean).join(' · ')),
     tile('Models used', Object.keys(models).length ? Object.entries(models).map(([m,n])=>`<span style="font-size:15px">${esc(m)}<span class="dim">×${n}</span></span>`).join(' ') : '–', D.pending_proposals ? `${D.pending_proposals} routing proposal(s) pending` : 'routing: no proposals'),
   ].join('');
   // legend

@@ -1,0 +1,21 @@
+{
+ "id": "tried-hard-still-wrong-is-capability",
+ "core": true,
+ "pair": "never-ran-tests-is-effort",
+ "about": "",
+ "task": "Make the expiry sweeper delete links whose expiresAt is in the past, in the user's time zone",
+ "final_message": "I read sweeper.go, the tz helpers and the tests, ran them after each change, and tried three approaches (UTC compare, converting with time.LoadLocation, truncating to day). TestSweepAcrossDST still fails by one hour around the DST switch.",
+ "verify_output": "$ make test-api\n--- FAIL: TestSweepAcrossDST (0.00s)\n    sweeper_test.go:58: link expiring 2026-03-29T02:30 Europe/Berlin was deleted one hour early\nFAIL",
+ "files": {
+  "Makefile": "test:\n\tgo test ./...\ntest-api:\n\tgo test ./...\n"
+ },
+ "diff_files": {
+  "apps/api/internal/share/sweeper.go": "package share\n// three attempts at tz-aware compare\n"
+ },
+ "verify": [
+  "make test-api"
+ ],
+ "expect": {
+  "cause": "capability"
+ }
+}

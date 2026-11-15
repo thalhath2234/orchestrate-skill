@@ -1,0 +1,16 @@
+{
+  "description": "orchestrate: approvals and answers to the manager go through Claude Code's permission prompt, never the agent alone",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/orchestrate/scripts/approval_gate.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

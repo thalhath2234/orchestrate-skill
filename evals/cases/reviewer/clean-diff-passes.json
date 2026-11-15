@@ -1,0 +1,87 @@
+{
+ "id": "clean-diff-passes",
+ "core": true,
+ "pair": "producer-consumer-mismatch",
+ "about": "false-positive check",
+ "base_files": {
+  "Makefile": "lint:\n\ttrue\ntest:\n\ttrue\n",
+  "packages/contract/src/share.ts": "export type ShareLink = { token: string; scheduleId: string; expiresAt: string }\n",
+  "apps/api/internal/http/routes.go": "package http\n\nimport \"example.com/api/internal/schedules\"\n\nfunc Register(r Router) {\n\tschedules.Register(r)\n}\n",
+  "apps/api/internal/schedules/handler.go": "package schedules\n\nfunc Register(r Router) {\n\tr.GET(\"/schedules/:id\", Get)\n}\n",
+  "apps/web/src/share/.keep": ""
+ },
+ "head_files": {
+  "apps/api/internal/share/handler.go": "package share\n\nimport (\n\t\"crypto/rand\"\n\t\"encoding/hex\"\n\t\"net/http\"\n)\n\nfunc Register(r Router) {\n\tr.POST(\"/schedules/:id/share\", Create)\n\tr.GET(\"/share/:token\", Get)\n}\n\n// Create makes an opaque token for a schedule the caller owns.\nfunc Create(c Ctx) error {\n\ts, err := c.Schedules().Get(c.Param(\"id\"))\n\tif err != nil {\n\t\treturn c.NoContent(http.StatusNotFound)\n\t}\n\tif s.OwnerID != c.UserID() {\n\t\treturn c.NoContent(http.StatusForbidden)\n\t}\n\tb := make([]byte, 16)\n\t_, _ = rand.Read(b)\n\ttok := hex.EncodeToString(b)\n\tc.Links().Save(tok, s.ID)\n\treturn c.JSON(http.StatusCreated, map[string]string{\"token\": tok})\n}\n\n// Get returns the schedule read-only; unknown or expired tokens are 404.\nfunc Get(c Ctx) error {\n\tl, ok := c.Links().Find(c.Param(\"token\"))\n\tif !ok || l.Expired() {\n\t\treturn c.NoContent(http.StatusNotFound)\n\t}\n\treturn c.JSON(http.StatusOK, c.Schedules().ReadOnly(l.ScheduleID))\n}\n",
+  "apps/api/internal/share/handler_test.go": "package share\n\nimport \"testing\"\n\nfunc TestCreateReturnsToken(t *testing.T)        { assertStatus(t, post(\"/schedules/s1/share\", owner), 201) }\nfunc TestCreateRejectsNonOwner(t *testing.T)     { assertStatus(t, post(\"/schedules/s1/share\", stranger), 403) }\nfunc TestGetReturnsReadOnlySchedule(t *testing.T) { assertStatus(t, get(\"/share/\"+tok), 200) }\nfunc TestGetUnknownTokenIs404(t *testing.T)       { assertStatus(t, get(\"/share/nope\"), 404) }\n",
+  "apps/api/internal/http/routes.go": "package http\n\nimport (\n\t\"example.com/api/internal/schedules\"\n\t\"example.com/api/internal/share\"\n)\n\nfunc Register(r Router) {\n\tschedules.Register(r)\n\tshare.Register(r)\n}\n",
+  "apps/web/src/share/Button.tsx": "import type { ShareLink } from '@app/contract'\n\nexport function ShareButton({ link }: { link: ShareLink }) {\n  const url = `${location.origin}/share/${link.token}`\n  return <button onClick={() => navigator.clipboard.writeText(url)}>Copy link (valid until {link.expiresAt})</button>\n}\n",
+  "apps/web/src/share/Button.test.tsx": "import { ShareButton } from './Button'\ntest('copies the share link', async () => {\n  render(<ShareButton link={{ token: 't1', scheduleId: 's1', expiresAt: '2026-12-01' }} />)\n  await click(screen.getByRole('button'))\n  expect(navigator.clipboard.writeText).toHaveBeenCalledWith(expect.stringContaining('/share/t1'))\n})\n"
+ },
+ "plan": {
+  "goal": "Users can share a schedule via a public read-only link",
+  "acceptance": [
+   "POST /schedules/:id/share returns a token (test)",
+   "GET /share/:token returns the schedule read-only; unknown tokens are 404 (test)",
+   "Only the owner can create links (test)",
+   "The web share button copies the link (test)"
+  ],
+  "decisions": [
+   "Tokens are opaque random strings, not JWTs (docs/adr/0007-share-tokens.md)"
+  ],
+  "non_goals": [
+   "No expiry UI in this job (no picker or editing of expiry)"
+  ],
+  "verify": [
+   "make lint",
+   "make test"
+  ],
+  "tasks": [
+   {
+    "id": "api",
+    "title": "Share endpoints",
+    "goal": "create/get endpoints",
+    "type": "feature:api",
+    "tier": "T2",
+    "owns": [
+     "apps/api/internal/share/**",
+     "apps/api/internal/http/routes.go"
+    ],
+    "done": [
+     "endpoints with tests"
+    ],
+    "verify": [
+     "make test"
+    ]
+   },
+   {
+    "id": "web",
+    "title": "Share button",
+    "goal": "copy-link button",
+    "type": "feature:web",
+    "tier": "T1",
+    "owns": [
+     "apps/web/src/share/**"
+    ],
+    "done": [
+     "button copies link (test)"
+    ],
+    "verify": [
+     "make test"
+    ]
+   }
+  ]
+ },
+ "reports": {
+  "api": {
+   "summary": "Added POST /schedules/:id/share and GET /share/:token with tests; registered routes.",
+   "interfaces": "share.Register(r)"
+  },
+  "web": {
+   "summary": "Added ShareButton that copies the link.",
+   "interfaces": "ShareButton({link})"
+  }
+ },
+ "expect": {
+  "verdict": "pass"
+ }
+}

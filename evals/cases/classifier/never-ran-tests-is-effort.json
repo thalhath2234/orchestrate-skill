@@ -1,0 +1,21 @@
+{
+ "id": "never-ran-tests-is-effort",
+ "core": true,
+ "pair": "tried-hard-still-wrong-is-capability",
+ "about": "",
+ "task": "Add GET /share/:token returning 404 for unknown tokens (with tests)",
+ "final_message": "Done! Added the Get handler.",
+ "verify_output": "$ make test-api\n--- FAIL: TestGetUnknownTokenIs404 (0.00s)\n    handler_test.go:22: expected 404, got 500 (nil pointer dereference)\nFAIL",
+ "files": {
+  "Makefile": "test:\n\tgo test ./...\ntest-api:\n\tgo test ./...\n"
+ },
+ "diff_files": {
+  "apps/api/internal/share/handler.go": "package share\nfunc Get(c Ctx) error { l, _ := c.Links().Find(c.Param(\"token\")); return c.JSON(200, l.Schedule()) }\n"
+ },
+ "verify": [
+  "make test-api"
+ ],
+ "expect": {
+  "cause": "effort"
+ }
+}

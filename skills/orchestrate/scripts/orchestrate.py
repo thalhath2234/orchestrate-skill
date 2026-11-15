@@ -14,6 +14,7 @@ orchestrate-plan skill. This script does everything mechanical and deterministic
   status   JOB             progress table (JOB may be omitted: latest job)
   wait     JOB [--timeout S]   block until the job finishes or S seconds pass
   clean    JOB [--branches]    remove worktrees (and task branches)
+  guard-hook               print the Claude Code hook that routes approvals to the user
   metrics  JOB [--json]     cost split by role, cache use, turns, first-pass rate, manager load
   scope-check --owns P ... [--job J --task T]   (a verify step) fail if changes leave owned
                            paths; with --job/--task, files no task owns are claimed instead
@@ -2436,6 +2437,7 @@ def main(argv=None) -> int:
     cl = sub.add_parser("clean"); cl.add_argument("job"); cl.add_argument("--branches", action="store_true")
     sc = sub.add_parser("scope-check"); sc.add_argument("--owns", action="append", required=True)
     sc.add_argument("--job"); sc.add_argument("--task")
+    sub.add_parser("guard-hook", help="print the settings.json hook that routes approvals to the user")
     me = sub.add_parser("metrics"); me.add_argument("job", nargs="?"); me.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
 
@@ -2463,6 +2465,12 @@ def main(argv=None) -> int:
         return cmd_wait(a)
     elif a.cmd == "clean":
         return cmd_clean(a)
+    elif a.cmd == "guard-hook":
+        cmd = f"python3 {shlex.quote(str(HERE / 'approval_gate.py'))}"
+        print("# Add to ~/.claude/settings.json (merge into an existing \"hooks\" object). The plugin\n"
+              "# install does this for you; `npx skills` installs need it by hand.")
+        print(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": cmd}]}]}}, indent=2))
     elif a.cmd == "metrics":
         job = Job(a.job or latest_job())
         if not job.state:

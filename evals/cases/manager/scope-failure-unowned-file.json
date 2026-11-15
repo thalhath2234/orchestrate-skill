@@ -1,0 +1,184 @@
+{
+ "id": "scope-failure-unowned-file",
+ "core": true,
+ "pair": "scope-failure-file-owned-by-pending-task",
+ "about": "needed file nobody owns -> retry with widened owns",
+ "files": {
+  "Makefile": "lint:\n\ttrue\ntest-api:\n\tcd apps/api && go test ./...\ntest-web:\n\tpnpm --filter web test\ntest:\n\ttrue\n",
+  "pnpm-workspace.yaml": "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+  "packages/contract/package.json": "{\"name\": \"@app/contract\", \"exports\": {\".\": \"./src/index.ts\"}}",
+  "packages/contract/src/index.ts": "export * from './share'\n",
+  "packages/contract/src/share.ts": "export type ShareLink = { token: string; scheduleId: string; expiresAt: string }\n",
+  "apps/api/go.mod": "module example.com/api\n\ngo 1.22\n",
+  "apps/api/internal/http/routes.go": "package http\n\nfunc Register() {\n\t// schedules.Register(r)\n}\n",
+  "apps/api/internal/share/handler.go": "package share\n\n// Create handles POST /schedules/:id/share\nfunc Create() {}\n",
+  "apps/api/internal/share/store.go": "package share\n\ntype Store struct{}\n",
+  "apps/web/package.json": "{\"name\": \"web\", \"scripts\": {\"test\": \"vitest\"}}",
+  "apps/web/src/share/Button.tsx": "export function ShareButton() { return null }\n"
+ },
+ "plan": {
+  "goal": "Users can share a schedule via a public read-only link",
+  "acceptance": [
+   "POST /schedules/:id/share returns a token (test)",
+   "GET /share/:token returns the schedule read-only (test)",
+   "Only the owner can create links (test)",
+   "The web share button copies the link"
+  ],
+  "decisions": [
+   "Tokens are opaque random strings, not JWTs (docs/adr/0007-share-tokens.md)",
+   "Expired or unknown tokens return 404"
+  ],
+  "non_goals": [
+   "No expiry UI in this job"
+  ],
+  "verify": [
+   "make lint",
+   "make test"
+  ],
+  "tasks": [
+   {
+    "id": "contract",
+    "title": "Share types",
+    "type": "feature:contract",
+    "tier": "T1",
+    "goal": "Share types",
+    "owns": [
+     "packages/contract/src/share.ts"
+    ],
+    "depends_on": [],
+    "done": [
+     "Share types works (test)"
+    ],
+    "verify": [
+     "make test"
+    ]
+   },
+   {
+    "id": "api",
+    "title": "Share endpoints",
+    "type": "feature:api",
+    "tier": "T2",
+    "goal": "Share endpoints",
+    "owns": [
+     "apps/api/internal/share/handler.go",
+     "apps/api/internal/share/handler_test.go"
+    ],
+    "depends_on": [
+     "contract"
+    ],
+    "done": [
+     "Share endpoints works (test)"
+    ],
+    "verify": [
+     "make test-api"
+    ]
+   },
+   {
+    "id": "web",
+    "title": "Share button",
+    "type": "feature:web",
+    "tier": "T1",
+    "goal": "Share button",
+    "owns": [
+     "apps/web/src/share/**"
+    ],
+    "depends_on": [
+     "contract"
+    ],
+    "done": [
+     "Share button works (test)"
+    ],
+    "verify": [
+     "make test-web"
+    ]
+   },
+   {
+    "id": "wiring",
+    "title": "Register routes and nav",
+    "type": "feature:cross",
+    "tier": "T1",
+    "goal": "Register routes and nav",
+    "owns": [
+     "apps/api/internal/http/routes.go"
+    ],
+    "depends_on": [
+     "api",
+     "web"
+    ],
+    "done": [
+     "Register routes and nav works (test)"
+    ],
+    "verify": [
+     "make test-api"
+    ]
+   }
+  ]
+ },
+ "state": {
+  "contract": {
+   "status": "done",
+   "report": {
+    "summary": "Added ShareLink {token, scheduleId, expiresAt}",
+    "interfaces": "ShareLink",
+    "open_issues": []
+   },
+   "steps": [
+    {
+     "config": "sonnet/medium",
+     "ok": true
+    }
+   ]
+  },
+  "api": {
+   "status": "failed",
+   "error": null,
+   "result": "gave_up",
+   "steps": [
+    {
+     "config": "sonnet/high",
+     "ok": false,
+     "cause": "context",
+     "evidence": "edited a file outside its scope"
+    }
+   ]
+  }
+ },
+ "event": {
+  "kind": "task_failed",
+  "task": "api",
+  "task_def": {
+   "id": "api",
+   "title": "Share endpoints",
+   "type": "feature:api",
+   "tier": "T2",
+   "goal": "Share endpoints",
+   "owns": [
+    "apps/api/internal/share/handler.go",
+    "apps/api/internal/share/handler_test.go"
+   ],
+   "depends_on": [
+    "contract"
+   ],
+   "done": [
+    "Share endpoints works (test)"
+   ],
+   "verify": [
+    "make test-api"
+   ]
+  },
+  "result": "gave_up",
+  "final_message": "Implemented Create and Get. Store needs a FindByToken method, which I added to store.go.",
+  "log_tail": "OUT OF SCOPE: you changed files that another task owns, or that are shared hotspots or migrations.\n  apps/api/internal/share/store.go\nYou own: apps/api/internal/share/handler.go, apps/api/internal/share/handler_test.go"
+ },
+ "expect": {
+  "any_action": [
+   "retry"
+  ],
+  "touches": [
+   "api"
+  ],
+  "mentions": [
+   "store.go"
+  ]
+ }
+}
