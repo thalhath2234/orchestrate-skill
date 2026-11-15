@@ -25,10 +25,12 @@ A good plan makes subagents independent. Each one gets a clear goal, its own fil
 
 | Tier | Subtask looks like | Starts at |
 |---|---|---|
-| T0 | Mechanical: rename, copy change, config value, add an export | haiku/low |
+| T0 | Mechanical: rename, copy change, config value, add an export | haiku/medium |
 | T1 | Follows an existing pattern closely: new endpoint like the others, new screen from a template, add tests | sonnet/medium |
-| T2 | Some design or several modules: new data flow, state management, non-trivial logic, migration plus model | sonnet/high |
-| T3 | Hard reasoning: concurrency, auth/security model, big refactor | opus/high (try to split it instead) |
+| T2 | Some design or several modules: new data flow, state management, non-trivial logic, migration plus model | opus/low |
+| T3 | Hard reasoning: concurrency, auth/security model, big refactor | opus/medium (try to split it instead) |
+
+Tasks start low and re-run failures at `high`, Anthropic's cheapest measured policy for work with a pass/fail check (every task has `verify`). Capability failures move up a model; Opus goes to `xhigh` before Fable 5.2, the top rung. Don't raise a tier to buy a stronger model: the ladder does that on evidence.
 
 Type is `<category>:<area>`. Categories: `rename docs config bugfix feature refactor test migration review research`. The area is the package's area from `scan` (for example `api`, `web`, `mobile`, `contract`), or `cross`. Keep areas consistent across jobs, because routing learns per type.
 
@@ -76,16 +78,23 @@ Be as narrow as practical but include everything the task must create, including
   "mem_per_agent_gb": 2.5,                    // optional, heavier verify -> bigger
   "budget_usd": 15,                           // optional, stop launching tasks past this
   "review_rounds": 2,                         // review -> fix -> review (default 2)
-  "manager": {"enabled": true, "model": "opus", "effort": "high",
-              "max_interventions": 12, "max_task_retries": 2},   // optional; these are the defaults
+  "manager": {"enabled": true, "max_interventions": 12, "max_task_retries": 2},  // optional; defaults
+  "models": {"reviewer": "opus/high"},        // optional per-role override, "<model>/<effort>". Roles and
+                                              //   defaults: planner fable/high, manager opus/medium,
+                                              //   reviewer fable/high, area_reviewer opus/high,
+                                              //   integrator sonnet/high, classifier haiku/low,
+                                              //   lessons haiku/medium (scripts/models.py has the sources)
+  "max_model": "opus",                        // optional: nothing above this model, roles or ladder
+                                              //   (no Fable: reviewer/planner become opus/high)
+  "advisor": "fable",                         // optional, off by default: subagents may consult this
+                                              //   model at decision points (claude --advisor)
   "max_escalations": 2,                       // optional; model escalations per task before the manager steps in
   "area": "cross",                            // area used for review-fix routing
   "extra_tools": ["Bash(docker compose *)"],  // optional extra allowed tools for subagents
   "auto_claim": true,                         // optional (default true): a subagent may edit a file no
                                               //   task owns; the scope check assigns it to that task
   "review_diff_chars": 120000,                // optional: above this, review per area + integration
-  "reviewer": {"model": "opus", "effort": "high"},  // optional
-  "lessons": {"enabled": true, "model": "sonnet", "effort": "low"},  // optional: after the job,
+  "lessons": {"enabled": true},               // optional: after the job,
                                               //   propose AGENTS.md notes from what agents learned
   "exclude_dynamic_prompt": true,             // optional (default true): per-worktree details move out of
                                               //   the system prompt so subagents share its cache

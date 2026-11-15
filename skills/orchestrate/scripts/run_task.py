@@ -36,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_cli  # noqa: E402
+import models  # noqa: E402
 import router  # noqa: E402
 import schemas  # noqa: E402
 
@@ -153,14 +154,15 @@ DIFF STAT:
 VERIFY OUTPUT (tail):
 {tail}
 
-You may read files in the repo. Reply with the JSON object: cause, evidence (one sentence),
-agents_md (null, or {{"file": "<repo-relative AGENTS.md path>", "text": "<one-line note that
+You may read files in the repo. Reply with the JSON object: evidence first (one or two
+sentences: what the evidence shows), then cause, then agents_md (null, or {{"file": "<repo-relative AGENTS.md path>", "text": "<one-line note that
 would have prevented this>"}}, only when cause is context)."""
 
 
 def classifier_cfg() -> tuple[str, str]:
-    m, _, e = os.environ.get("ROUTER_CLASSIFIER", "sonnet/low").partition("/")
-    return m, e or "low"
+    """Haiku 5.5 at low, Anthropic's pick for classification (ticket-routing guide)."""
+    spec = os.environ.get("ROUTER_CLASSIFIER")
+    return models.parse(spec) if spec else models.role("classifier")
 
 
 def classify(task: str, rung: int, worker: dict, vout: str, repo: Path, timeout: int,
@@ -236,6 +238,10 @@ def main(argv=None) -> int:
     ap.add_argument("--budget-usd", type=float, help="stop when this run has spent this much")
     ap.add_argument("--exclude-dynamic-prompt", action="store_true",
                     help="pass --exclude-dynamic-system-prompt-sections (cache reuse across worktrees)")
+    ap.add_argument("--max-model", choices=models.MODEL_ORDER,
+                    help="never route or escalate above this model (e.g. opus: no Fable)")
+    ap.add_argument("--advisor", choices=["sonnet", "opus", "fable"],
+                    help="let the worker consult this model at decision points (claude --advisor)")
     ap.add_argument("--dry-run", action="store_true", help="only print the routing decision")
     a = ap.parse_args(argv)
     repo = a.repo.expanduser().resolve()
@@ -246,7 +252,7 @@ def main(argv=None) -> int:
     report_schema = json.loads(a.report_schema) if a.report_schema else None
     extra = ["--exclude-dynamic-system-prompt-sections"] if a.exclude_dynamic_prompt else []
 
-    decision = router.route(a.type, a.tier)
+    decision = router.route(a.type, a.tier, max_model=a.max_model)
     log(f"task {task_id} {a.type} {a.tier} -> {decision['model']}/{decision['effort']} ({decision['source']})")
     if a.dry_run:
         print(json.dumps(decision))
@@ -283,7 +289,8 @@ def main(argv=None) -> int:
             worker = claude(prompt, model, effort, repo, perm=a.permission_mode,
                             tools=a.allowed_tools, resume=session, timeout=a.claude_timeout,
                             settings=settings, schema=report_schema, budget_usd=remaining(),
-                            extra_args=extra)
+                            extra_args=extra + models.fallback_args(model)
+                            + models.advisor_args(model, a.advisor))
             session = worker.get("session_id") or session
             c = worker.get("total_cost_usd") or 0.0
             cost += c
@@ -299,12 +306,18 @@ def main(argv=None) -> int:
                 break
         step = {"config": f"{model}/{effort}", "probe": probe, "ok": ok, "cost_usd": round(cost, 6),
                 "metrics": metrics}
+        if models.fell_back(model, worker.get("model_id")):
+            # Fable unavailable -> Claude Code ran the fallback. Not evidence about either model.
+            step["fell_back_to"] = worker.get("model_id")
+            log(f"{model} unavailable; ran on {worker.get('model_id')}")
         summary["steps"].append(step)
+        evidence = "fell_back_to" not in step
 
         if ok:
-            summary["proposals"] += router.record(
-                task_id=task_id, task_type=a.type, tier=a.tier, rung=rung, ok=True, cause=None,
-                model_id=worker.get("model_id"), probe=probe, cost_usd=cost)
+            if evidence:
+                summary["proposals"] += router.record(
+                    task_id=task_id, task_type=a.type, tier=a.tier, rung=rung, ok=True, cause=None,
+                    model_id=worker.get("model_id"), probe=probe, cost_usd=cost)
             log(f"PASS at {model}/{effort}")
             break
 
@@ -319,10 +332,11 @@ def main(argv=None) -> int:
         step.update(cause=c["cause"], evidence=c.get("evidence"),
                     classifier_cost_usd=c.get("classifier_cost"))
         log(f"FAIL at {model}/{effort}: {c['cause']} - {c.get('evidence')}")
-        summary["proposals"] += router.record(
-            task_id=task_id, task_type=a.type, tier=a.tier, rung=rung, ok=False,
-            cause=c["cause"], model_id=worker.get("model_id"), probe=probe, cost_usd=cost,
-            note=c.get("evidence", ""))
+        if evidence:
+            summary["proposals"] += router.record(
+                task_id=task_id, task_type=a.type, tier=a.tier, rung=rung, ok=False,
+                cause=c["cause"], model_id=worker.get("model_id"), probe=probe, cost_usd=cost,
+                note=c.get("evidence", ""))
 
         if c["cause"] == "environment":
             summary["result"] = "environment"
@@ -336,9 +350,10 @@ def main(argv=None) -> int:
             hint = f"\nNote from a previous failed attempt: {note}"
             new = rung  # same model; the problem was knowledge, not capability
         else:
-            new = router.next_rung(rung, "effort" if c["cause"] == "effort" else "capability")
+            new = router.next_rung(rung, "effort" if c["cause"] == "effort" else "capability",
+                                   a.max_model)
             if probe:  # a failed probe goes straight back to the learned floor
-                new = max(new, decision["rung"] + 1)
+                new = decision["rung"] + 1
         escalations += 1
         if escalations > a.max_escalations or (new == rung and c["cause"] != "context"):
             summary["result"] = "gave_up"

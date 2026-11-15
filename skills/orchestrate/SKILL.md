@@ -17,7 +17,7 @@ S=$(ls -d ~/.agents/skills/orchestrate/scripts ~/.claude/skills/orchestrate/scri
 Support skills, which you load when you reach that step:
 - **orchestrate-grill**: the interview that comes before any plan (Matt Pocock's grill-with-docs).
 - **orchestrate-plan**: how to plan, split, tier, assign file ownership and write `plan.json`.
-- **orchestrate-manage**: the playbook of the **manager agent** (one Opus session per job that supervises the subagents). Load it to understand or second-guess its decisions.
+- **orchestrate-manage**: the playbook of the **manager agent** (one Opus 5.5 session per job that supervises the subagents). Load it to understand or second-guess its decisions.
 - **orchestrate-review**: what the integrator and reviewer subagents check. Load it if you need to judge a review.
 
 Who does what inside a job, and how the manager, the parallelism cap, subagent briefs and routing work: [references/internals.md](references/internals.md). You rarely need it to run a job.

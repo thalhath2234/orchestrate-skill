@@ -6,7 +6,7 @@ A multi-agent coding orchestrator for Claude Code, for single repos and monorepo
 2. Split it into subtasks, each with its own files.
 3. Run Claude subagents in parallel, with the count capped by what the machine can handle.
 4. Merge their work.
-5. Have a fresh Opus reviewer check it, and fix what it finds.
+5. Have a fresh Fable reviewer check it, and fix what it finds.
 
 A **manager agent** (one persistent Opus session per job) supervises the subagents throughout. Open issues that a rule can settle (an FYI, or a file that a not-yet-started task owns) are handled without it. When a task fails, a subagent reports something else outside its scope, or the reviewer requests changes, the manager reads the logs and code and decides what to do. It thinks in the background while other tasks keep running, and events that arrive meanwhile reach it as one batch:
 - retry with better instructions or corrected ownership
@@ -28,7 +28,7 @@ request ─► grill (rounds of questions → glossary/ADRs → you confirm) ─
                                  │ worktree + setup ─► brief ─► run_task ─► scope ✓ │ per task
                                  └──────────────────────┬───────────────────────────┘
                                    commit ─► merge into orchestrate/<job> (integrator on conflict)
-                                 ─► final verify ─► Opus review (per area + integration when big) ─► report
+                                 ─► final verify ─► Fable review (Opus per area + Fable integration when big) ─► report
         rules ◄── open issues: fyi → report · needs a pending task's file → amend it
         manager (Opus, background, batched) ◄── task failed · other open issues · review findings · your answers
                                    ──► retry · split · add_task · amend · skip · accept · ask you
@@ -71,7 +71,7 @@ To run the scripts by hand (`S=skills/orchestrate/scripts`):
 ```bash
 python3 $S/orchestrate.py scan --repo .                 # packages/areas, verify cmds, hotspots, setup
 python3 $S/orchestrate.py capacity                      # how many subagents this machine can take
-python3 $S/orchestrate.py plan --repo . --goal "..."    # optional: Opus drafts plan.json
+python3 $S/orchestrate.py plan --repo . --goal "..."    # optional: Fable drafts plan.json
 python3 $S/orchestrate.py validate plan.json            # waves, ownership conflicts, cap
 python3 $S/orchestrate.py brief plan.json <task-id>     # exact handoff a subagent will get
 python3 $S/orchestrate.py run plan.json --detach        # then:
@@ -147,16 +147,34 @@ Validation rejects plans where tasks that can run at the same time own overlappi
 - **A job starts from your last commit and only writes to `orchestrate/<job>` branches.**
 - **You stay in charge of routing.** Routing changes and AGENTS.md notes are proposals that you approve.
 
+## Which model does what
+
+Defaults follow Anthropic's model guidance ([choosing a model](https://platform.claude.com/docs/en/about-claude/models/choosing-a-model), [cost and intelligence](https://platform.claude.com/docs/en/about-claude/models/optimizing-for-cost-and-intelligence), the use-case guides) and this repo's evals:
+
+| Role | Model / effort | Why |
+|---|---|---|
+| Planner | Fable 5.2 / high | One call decides the whole job; Fable is for "demanding reasoning" and "analysis carried through to a finished document" |
+| Final reviewer | Fable 5.2 / high | Gates the merge. On Anthropic's defect-search benchmark Fable 5.2 beat Opus 5.5 at high by 1.6–5.9 points |
+| Area reviewers (big diffs) | Opus 5.5 / high | Accuracy-critical reading; Opus lost 34 points at low effort on defect search |
+| Manager | Opus 5.5 / medium | "For most agent workloads, start with Opus 5.5 at its default effort"; scored 13/13 on our evals, same as high |
+| Integrator (conflicts) | Sonnet 5.5 / high | Everyday coding at Sonnet's default |
+| Failure classifier | Haiku 5.5 / low | The ticket-routing guide's pick for classification; tied Sonnet on our evals |
+| Lessons extractor | Haiku 5.5 / medium | Extraction |
+
+Fable calls fall back to Opus when your account has no Fable access. `"max_model": "opus"` in the plan keeps everything at or below Opus; `"models": {"<role>": "model/effort"}` overrides one role.
+
 ## How routing learns
 
-The ladder is `haiku/low → haiku/medium → sonnet/medium → sonnet/high → opus/high → opus/xhigh`. Each config gets 2 attempts. A failure is classified as one of:
+The ladder is `haiku/low → haiku/medium → sonnet/medium → sonnet/high → opus/low → opus/medium → opus/high → opus/xhigh → fable/high`. Tasks start low (T0 haiku/medium, T1 sonnet/medium, T2 opus/low, T3 opus/medium) and re-run failures higher: Anthropic measured Opus 5.5 at low with failures re-run at high solving about 97% of SWE-bench Pro tasks for $0.17 each, against 95.3% for $0.29 with everything at high. Each config gets 2 attempts. A failure is classified as one of:
 
 | Cause | This task | Future tasks |
 |---|---|---|
 | environment | stop | nothing |
 | context | retry with a hint | proposes an AGENTS.md note |
-| effort | same model, more effort | evidence for a floor raise |
-| capability | next model | evidence for a floor raise |
+| effort | same model at `high` (then `xhigh`) | evidence for a floor raise |
+| capability | next model at its default effort; Opus tries `xhigh` before Fable | evidence for a floor raise |
+
+Below a model's default effort, any failure first restores the effort.
 
 API overloads and rate limits are retried with backoff and never count against a model, and a test about rate limits is code, not a broken environment.
 

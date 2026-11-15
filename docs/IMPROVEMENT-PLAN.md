@@ -39,6 +39,38 @@ Harness tests: 16 + 44 + 4, all green (`make test`, fake `claude`). Prompt evals
 | P4.2 cost per completed task | ✅ partly | `task_costs.jsonl`, coordination cost attributed per task, and the totals shown in `router.py status`. **The upward probe isn't implemented** |
 | P5.1 / P5.2 skill hygiene | ✅ | `orchestrate/SKILL.md` went from 162 to about 100 lines, with the rest moved to `references/internals.md`. "Never…" rules were rewritten as positive steps where the hook enforces them |
 
+### P6: models chosen by Anthropic's guidance, Fable added (2026-11-16)
+
+Sources: [choosing a model](https://platform.claude.com/docs/en/about-claude/models/choosing-a-model), [optimizing for cost and intelligence](https://platform.claude.com/docs/en/about-claude/models/optimizing-for-cost-and-intelligence), [effort](https://platform.claude.com/docs/en/build-with-claude/effort), [advisor](https://code.claude.com/docs/en/advisor), and the ticket-routing and legal-summarization guides. Every default is in `scripts/models.py` with its source.
+
+| Role | Before | Now | Anthropic's reason | Our eval |
+|---|---|---|---|---|
+| Planner | opus/high | **fable/high** | Fable 5.2 for "demanding reasoning" and "analysis carried through to a finished document"; high is its default | no planner evals yet |
+| Final reviewer | opus/high | **fable/high** | defect search: Fable 5.2 beat Opus 5.5 at high by 1.6–5.9 points | 6/6, $0.69/call, against 6/6 at $0.28 on opus/high; fable/medium 6/6 at $0.52. The suite is saturated |
+| Area reviewers | opus/high | opus/high | Opus where accuracy is required; low effort cost 34 points on defect search | (as before) |
+| Manager | opus/high | **opus/medium** | "For most agent workloads, start with Claude Opus 5.5 at its default effort (medium)" | 13/13, same as opus/high |
+| Classifier | sonnet/low | **haiku/low** | Haiku 5.5 at low for classification. The schema now asks for evidence first, as the guide's Haiku-at-low prompt does | 8/8 (was 15/16 before the schema change) |
+| Lessons | sonnet/low | **haiku/medium** | extraction | none |
+| Integrator | sonnet/high | sonnet/high | everyday coding at Sonnet's default | none |
+
+**Ladder.** `haiku/low → haiku/medium → sonnet/medium → sonnet/high → opus/low → opus/medium → opus/high → opus/xhigh → fable/high`. The order follows Anthropic's SWE-bench Pro cost per solved task.
+
+- **Tier starts:**
+  - T0 haiku/medium (Haiku's default, "high-volume work with outputs you can check")
+  - T1 sonnet/medium
+  - T2 **opus/low** (was sonnet/high)
+  - T3 **opus/medium** (was opus/high)
+- **Escalation** follows "if you lowered effort, restore it; otherwise try the next tier up at its default effort" and "run at a low setting and re-run only the failures at a higher one". On Opus 5.5, low first and failures re-run at high solved ~97% for $0.17 per task, against 95.3% for $0.29 with everything at high.
+- **Fable** is the top rung, reached after opus/xhigh ("if your evals at xhigh or max still fall short … move to Claude Fable 5.2").
+- **Plan knobs:** `max_model` caps everything; `models.<role>` overrides one role.
+- **Without Fable access:** every Fable call carries `--fallback-model opus`, and a step that fell back is not routing evidence.
+
+**Advisor (opt-in).** `"advisor": "fable"` passes `--advisor fable` to subagents when the pairing is valid; this was verified headless with Sonnet as the main model. It's off by default: Anthropic measured an advisor buying about what more effort buys (+1.7 points for 2.1× the cost).
+
+**Compatibility.** Ledger rows get their rung re-derived from (model, effort). Floors are now stored as `floor_cfg`. v1 floors and proposals, which store a rung index, are mapped through the old ladder. There's a test for this.
+
+**Cost to watch.** A fresh Fable session costs about $0.25 before doing anything, measured with CLI 2.1.325. Planner plus final review add an estimated $1–5 per job over Opus. T2 tasks now start on Opus at low, which Anthropic prices at about 7% more per solved task than sonnet/high, and their failures re-run on the same model.
+
 **Not done yet:** run a real v0.6 job and fill in §6 from `metrics`. The installed copy is still v0.5 while hermes-phase6 runs, and the guard would stop that job on an update.
 
 ---

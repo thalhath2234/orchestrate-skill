@@ -98,10 +98,12 @@ AREA_REVIEW = {
 
 CLASSIFIER = {
     "type": "object",
-    "required": ["cause", "evidence"],
+    "required": ["evidence", "cause"],
+    # evidence before cause: on Haiku at low effort, reasoning written out first helps the
+    # label (ticket-routing guide: "this prompt is written for Claude Haiku 5.5 at low effort").
     "properties": {
-        "cause": {"type": "string", "enum": ["environment", "context", "effort", "capability"]},
         "evidence": {"type": "string"},
+        "cause": {"type": "string", "enum": ["environment", "context", "effort", "capability"]},
         "agents_md": {"anyOf": [{"type": "null"}, {
             "type": "object", "required": ["file", "text"],
             "properties": {"file": {"type": "string"}, "text": {"type": "string"}}}]},

@@ -338,12 +338,12 @@ class OrchestrateTest(unittest.TestCase):
         self.assertLess(max(w["api"]["start"], w["web"]["start"]), min(w["api"]["end"], w["web"]["end"]),
                         "api and web ran in parallel")
         self.assertTrue(w["api"]["brief_has_upstream"])
-        self.assertEqual([(c["model"], c["effort"]) for c in self.calls_of("review")], [("opus", "high")])
+        self.assertEqual([(c["model"], c["effort"]) for c in self.calls_of("review")], [("fable", "high")])
         st = self.job_state()
         self.assertEqual(st["status"], "done")
         self.assertEqual({t: s["status"] for t, s in st["tasks"].items()},
                          {"contract": "done", "api": "done", "web": "done"})
-        self.assertEqual(st["tasks"]["api"]["steps"][0]["config"], "sonnet/high")   # T2 routing
+        self.assertEqual(st["tasks"]["api"]["steps"][0]["config"], "opus/low")      # T2 routing
         self.assertEqual(st["tasks"]["web"]["steps"][0]["config"], "sonnet/medium") # T1 routing
         wt = self.state / "jobs" / "share" / "wt"
         self.assertEqual(sorted(p.name for p in wt.iterdir()), ["_integration"], "task worktrees cleaned")
@@ -382,8 +382,8 @@ class OrchestrateTest(unittest.TestCase):
         self.assertEqual(st["tasks"]["docs"]["status"], "blocked")
         self.assertEqual(st["tasks"]["web"]["status"], "done")
         self.assertEqual(self.calls_of("review"), [])
-        api_cfgs = [c["model"] for c in self.calls_of("worker") if c["tid"] == "api"]
-        self.assertIn("opus", api_cfgs, "escalated before giving up")
+        api_cfgs = {(c["model"], c["effort"]) for c in self.calls_of("worker") if c["tid"] == "api"}
+        self.assertGreater(len(api_cfgs), 1, "escalated before giving up")
 
     def test_gate_pauses_then_resume_with_approval(self):
         plan = base_plan(self.repo)
@@ -423,7 +423,7 @@ class OrchestrateTest(unittest.TestCase):
         self.assertEqual(code, 0, err[-3000:])
         m = self.calls_of("manage")
         self.assertEqual([c["event"] for c in m], ["task_failed"])
-        self.assertEqual((m[0]["model"], m[0]["effort"]), ("opus", "high"))
+        self.assertEqual((m[0]["model"], m[0]["effort"]), ("opus", "medium"))
         self.assertTrue(m[0]["has_playbook"])
         brief = (self.state / "jobs/share/briefs/api.md").read_text()
         self.assertIn("Notes from the manager", brief)
