@@ -10,6 +10,37 @@ Written 2026-11-15 against `b74ba50` (v0.5.0).
 - The one real job run so far, `~/.local/share/orchestrate/jobs/hermes-phase6`: 18 tasks, interrupted after 112 min with 9 tasks done.
 - Two behaviours were reproduced by running the code (marked ▶).
 
+## Status: implemented in v0.6.0 (branch `v0.6-improvements`, 2026-11-15)
+
+Harness tests: 16 + 44 + 4, all green (`make test`, fake `claude`). Prompt evals: 27 cases (13 manager, 6 reviewer, 8 classifier) run against the real `claude`. Total eval and spike spend was about $11.
+
+| Item | State | Evidence / notes |
+|---|---|---|
+| P0.1 fail closed | ✅ | A reviewer with no verdict is re-asked once, then the job ends `review_failed` (exit 6). A manager with no decision is re-asked once, then it asks the user. Tests: `test_reviewer_without_verdict_…`, `test_manager_without_decision_…` |
+| P0.2 structured output | ✅ | `claude_cli.py` + `schemas.py`. Every judgment, the subagent report and the planner use `--json-schema`. Spike: schema output works with tools, with `--resume`, and with `anyOf`/`const`/`pattern`; an invalid type like `chore:contract` can't be emitted |
+| P0.3 metrics | ✅ | `orchestrate.py metrics <job>`, a calls log per role in `job.json`, and a dashboard "Cost split" tile. It also reads v0.5 jobs: hermes-phase6 (still running) is now $76.14 total, $46.82 subagents and $29.32 other, with 2.23 open issues per done task |
+| P0.4 evals | ✅ partly | `evals/run.py`, `make eval-quick` / `eval`, and paired cases. **Planner evals aren't built yet**, and there are 6–13 cases per role, under the 15–20 target |
+| P1.1 approvals via hook | ✅ with a change | `hooks/hooks.json` + `approval_gate.py` (PreToolUse → `ask`). `claude plugin validate .` passes, and a unit test covers the matcher. **No live check in Claude Code yet.** The env-var/TTY fallback was dropped because an agent can set an env var itself; `orchestrate.py guard-hook` prints the hook for `npx skills` installs instead |
+| P1.2 limits on the resulting state | ✅ with a change | A retry/split may not drop verify commands or make them trivial, and a task that owns migrations needs a gate (validation error). **Hotspots are not gated**: that would pause every job whose first task adds a dependency |
+| P1.3 fencing | ✅ | Reports, open issues, logs and findings are fenced and sanitized for the manager, reviewers and integrator. The `injection-in-open-issue` eval passes on all 3 manager configs |
+| P1.4 budget per call | ✅ | `--max-budget-usd` (the remaining budget) is passed to every call; `error_max_budget_usd` → status `budget` (exit 7). The spike showed the CLI can overshoot a tiny cap (spent $0.003 against a $0.001 cap) |
+| P1.5 environment classification | ✅ with a change | Infrastructure signatures only, a verify binary or make target that's missing, and an error-kind map. 429/529 get backoff in `claude_cli`. **`--fallback-model` isn't used**, because it would change the model mid-task and corrupt routing evidence |
+| P2.1 manager in background | ✅ | It runs on a single-worker executor and holds only the tasks it affects. Test: an independent task starts while a 3 s fake manager is still thinking |
+| P2.2 triage + batching | ✅ | Typed `open_issues`. `fyi` and `needs_file` issues for a not-started owner are settled by rule, and the rest are batched into one wake. Tests cover both |
+| P2.3 file claims + gap warning | ✅ | `claims.json` under a file lock, merged into `owns`. Validation warns about Go same-package and TS relative-import gaps. `_pat_regex` is now cached, which also speeds up the overlap check |
+| P2.4 delta snapshots | ✅ | A full snapshot only on a fresh session, then deltas plus `--add-dir` to the job dir. `fit_json` replaced slicing. Eval cost per manager decision with a fresh session is $0.16–0.37 at opus/high, **not comparable** to the $1.90 per intervention in hermes-phase6 until a v0.6 job runs |
+| P2.5 cache-friendly briefs | ✅ | The job block comes first and small root docs are inlined. `--exclude-dynamic-system-prompt-sections` was measured with a 4-worktree haiku probe: about 4.8k fewer cache-write tokens per fresh session, and the first call was about 28% cheaper. It's on by default for subagents and the classifier |
+| P2.6 T1x route | ✅ partly | Triage row added and the "every cross-package change is a job" rule removed. **The sweep over historical requests hasn't been done** |
+| P3.1 classifier | ✅ | Definitions, examples and a priority rule. Sweep, 2 trials: haiku/low and sonnet/low both 15/16, at the same cost (about $0.07 per call; the CLI system prompt dominates). sonnet/low is kept. The one miss was an ambiguous case, which has been rewritten and now passes |
+| P3.2 manager playbook | ✅ | Categories and the task schema inline, 5 worked examples from hermes-phase6, and the batch, invalid_reply and fence rules |
+| P3.3 reviewer evidence + area review | ✅ | `acceptance[]` is enforced in code. Big diffs get per-area reviewers plus an integration reviewer. Reviewer evals: 6/6 |
+| P3.4 manager sweep | ✅ measured, **default unchanged** | opus/high, opus/medium and sonnet/high all scored 13/13 on 1 trial. sonnet/high cost $1.32 against $2.57 for opus/medium. The suite is saturated (no messy long-session cases yet), so it can't tell the configs apart. Add harder cases before switching the default |
+| P4.1 lessons | ✅ | After a terminal job state, a sonnet/low extractor proposes AGENTS.md notes. It only writes to candidate AGENTS.md/CLAUDE.md files and dedupes against existing text |
+| P4.2 cost per completed task | ✅ partly | `task_costs.jsonl`, coordination cost attributed per task, and the totals shown in `router.py status`. **The upward probe isn't implemented** |
+| P5.1 / P5.2 skill hygiene | ✅ | `orchestrate/SKILL.md` went from 162 to about 100 lines, with the rest moved to `references/internals.md`. "Never…" rules were rewritten as positive steps where the hook enforces them |
+
+**Not done yet:** run a real v0.6 job and fill in §6 from `metrics`. The installed copy is still v0.5 while hermes-phase6 runs, and the guard would stop that job on an update.
+
 ---
 
 ## 1. What the guides say that applies here

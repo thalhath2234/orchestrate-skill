@@ -1,8 +1,8 @@
 {
  "id": "product-question-asks-human",
  "core": true,
- "pair": "fact-question-no-ask",
- "about": "behaviour decision -> ask the user",
+ "pair": "question-settled-by-acceptance",
+ "about": "a behaviour/privacy decision nobody has made -> ask the user",
  "files": {
   "Makefile": "lint:\n\ttrue\ntest-api:\n\tcd apps/api && go test ./...\ntest-web:\n\tpnpm --filter web test\ntest:\n\ttrue\n",
   "pnpm-workspace.yaml": "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
@@ -134,7 +134,7 @@
   "kind": "open_issues",
   "task": "contract",
   "open_issues": [
-   "Product question: should a link created by a schedule's collaborator (not the owner) be allowed? The acceptance says owner-only but the schedules API lets collaborators edit. I need a decision before api builds the permission check."
+   "Product question: the Schedule type has a `privateNotes` field. Should the public read-only share view include it? Acceptance says 'returns the schedule read-only' without naming fields, and no decision covers it. The api task needs to know before it builds the response."
   ],
   "report": {
    "summary": "Added ShareLink"

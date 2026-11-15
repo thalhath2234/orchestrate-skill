@@ -8,14 +8,14 @@ A multi-agent coding orchestrator for Claude Code, for single repos and monorepo
 4. Merge their work.
 5. Have a fresh Opus reviewer check it, and fix what it finds.
 
-A **manager agent** (one persistent Opus session per job) supervises the subagents throughout. When a task fails, a subagent reports something outside its scope, or the reviewer requests changes, the manager reads the logs and code and decides what to do:
+A **manager agent** (one persistent Opus session per job) supervises the subagents throughout. Open issues that a rule can settle (an FYI, or a file that a not-yet-started task owns) are handled without it. When a task fails, a subagent reports something else outside its scope, or the reviewer requests changes, the manager reads the logs and code and decides what to do. It thinks in the background while other tasks keep running, and events that arrive meanwhile reach it as one batch:
 - retry with better instructions or corrected ownership
 - split a task that's too big
 - add a follow-up task
 - skip
 - ask you
 
-The script validates and applies its actions.
+The script validates and applies its actions. Every model judgment (manager, reviewer, classifier, integrator, planner) is schema-checked structured output (`claude --json-schema`), and a judgment that can't be parsed never counts as a pass.
 
 Every subagent starts on the cheapest model likely to work and escalates on failure. Routing learns per task type, but only through proposals that you approve.
 
@@ -28,8 +28,9 @@ request ─► grill (rounds of questions → glossary/ADRs → you confirm) ─
                                  │ worktree + setup ─► brief ─► run_task ─► scope ✓ │ per task
                                  └──────────────────────┬───────────────────────────┘
                                    commit ─► merge into orchestrate/<job> (integrator on conflict)
-                                 ─► final verify ─► Opus review ─► report
-        manager (Opus, persistent) ◄── task failed · open issues · review findings · your answers
+                                 ─► final verify ─► Opus review (per area + integration when big) ─► report
+        rules ◄── open issues: fyi → report · needs a pending task's file → amend it
+        manager (Opus, background, batched) ◄── task failed · other open issues · review findings · your answers
                                    ──► retry · split · add_task · amend · skip · accept · ask you
 ```
 
@@ -77,7 +78,9 @@ python3 $S/orchestrate.py run plan.json --detach        # then:
 python3 $S/orchestrate.py wait <job> --timeout 540      # 0 done · 5 approval · 8 manager asks you · 4 failed · 3 env · 6 review
 python3 $S/orchestrate.py resume <job> --answer "..."   # answer the manager's question
 python3 $S/orchestrate.py resume <job> --approve <task> # after gates or fixes; done tasks are kept
+python3 $S/orchestrate.py metrics <job>                 # cost by role, cache reads, turns, first-pass rate, manager load
 python3 $S/orchestrate.py clean <job> [--branches]
+python3 $S/orchestrate.py guard-hook                    # the approval hook, for npx-skills installs
 
 python3 $S/run_task.py --repo . --type bugfix:api --tier T1 --verify "make test" "Fix …"   # single task
 python3 $S/router.py proposals | approve <id> | reject <id> | status                       # routing (you)
@@ -93,7 +96,7 @@ It's a live web dashboard:
 - **Task graph:** tasks grouped by wave, with dependency edges, live status, model path, timer and cost. Manager-added tasks and retries are badged.
 - **Timeline** of when each task ran.
 - **Activity feed:** tasks starting and finishing, the manager's decisions with its reasoning, and review rounds.
-- **Header tiles:** progress, elapsed time, cost against the budget, parallel slots and what's capping them, manager interventions, models used.
+- **Header tiles:** progress, elapsed time, cost against the budget, the cost split by role (manager share, cache reads), parallel slots and what's capping them, manager interventions and how many issues were settled by rule, models used.
 - **Banners** with copyable commands, for gated tasks waiting on you and for manager questions.
 - **Task drawer:** click any task for its goal, owned paths, done criteria, verify commands, the model path with failure causes, its report and open issues, the live log, and the exact brief it received.
 
@@ -101,13 +104,14 @@ It uses only the Python standard library and refreshes every 2 seconds. A dropdo
 
 ## What each subagent gets
 
-A generated brief containing:
+A generated brief in two parts. The first is the same for every task of the job, so parallel subagents share a cached prompt prefix: the rules, the report format, acceptance, decisions, non-goals, and the root glossary and AGENTS.md inlined when small. The second is the task:
 - its goal
-- the paths it **owns**, which are the only ones it may change
+- the paths it **owns**. A file no task owns may be edited if the task needs it; the scope check then assigns it to the task.
 - what to read first: the nearest `AGENTS.md` files and the task's `reads`
 - what its upstream tasks built (their summaries, interfaces, notes and files)
 - **done looks like**: its criteria and verify commands
-- the rules, and a JSON report format
+
+It reports as structured output, with typed open issues (`needs_file`, `needs_decision`, `fyi`).
 
 It works in its own git worktree, on a branch made from the current integration head, so it sees its dependencies' merged work.
 
@@ -128,13 +132,17 @@ It works in its own git worktree, on a branch made from the current integration 
 - hotspots: lockfiles, root configs, `go.work`
 - the setup command each worktree needs
 
-Validation rejects plans where tasks that can run at the same time own overlapping paths. Planning puts shared contracts first and gives each hotspot to a single task.
+Validation rejects plans where tasks that can run at the same time own overlapping paths, and tasks that own migrations without a gate. It warns about **ownership gaps**: unowned files in the same Go package as an owned file, or imported by one. Planning puts shared contracts first and gives each hotspot to a single task.
 
 ## Safety
 
-- **Edits stay in the worktree.** Subagents' file edits are confined to their worktree (`blockWritesOutsideWorkingDirectories`). A scope check rejects any change outside the task's owned paths and feeds the error back to the subagent. `"sandbox": true` in the plan adds an OS sandbox around their shell commands.
+- **Approvals go through you.** The plugin installs a `PreToolUse` hook: any `--approve`, `--answer` or `router.py approve` command the agent runs shows up in Claude Code's own permission prompt for you to allow. An approval typed in chat approves nothing. (`npx skills` installs: add the hook printed by `orchestrate.py guard-hook`.)
+- **Edits stay in the worktree.** Subagents' file edits are confined to their worktree (`blockWritesOutsideWorkingDirectories`). A scope check rejects changes to paths another task owns, hotspots and migrations, and feeds the error back to the subagent. `"sandbox": true` in the plan adds an OS sandbox around their shell commands.
+- **Subagent text is evidence, not instructions.** Reports, open issues and logs reach the manager, reviewer and integrator inside fences, sanitized and size-capped.
 - **The orchestrator watches its own files.** If a subagent modifies the orchestrate skill files, the job stops.
-- **The manager is bounded.** Its actions are validated as one all-or-nothing batch. It can't approve gates or change your decisions. It gets at most 12 interventions per job and 2 retries per task, then it asks you.
+- **The manager is bounded.** Its actions are validated as one all-or-nothing batch, against the resulting plan. It can't approve gates, change your decisions, drop or trivialise a task's verify commands, or add an ungated migration. It gets at most 12 interventions per job and 2 retries per task, then it asks you.
+- **Reviews fail closed.** Every acceptance criterion needs evidence (a `file:line` or a test). A reviewer that returns no verdict ends the job as `review_failed`, never `done`.
+- **The budget holds per call.** `budget_usd` is passed to every model call as `--max-budget-usd`.
 - **Risky tasks wait for you.** Gated tasks (for example migrations) pause the job until you approve them.
 - **A job starts from your last commit and only writes to `orchestrate/<job>` branches.**
 - **You stay in charge of routing.** Routing changes and AGENTS.md notes are proposals that you approve.
@@ -150,15 +158,19 @@ The ladder is `haiku/low → haiku/medium → sonnet/medium → sonnet/high → 
 | effort | same model, more effort | evidence for a floor raise |
 | capability | next model | evidence for a floor raise |
 
-Floor raises need repeated evidence (≥2 failed tasks and more than half failing, within 30 days). They expire when the window ends or a new model version ships. About 10% of tasks probe one rung cheaper, so floors can come back down. State lives in `~/.local/share/orchestrate` (or `$ORCHESTRATE_DIR`).
+API overloads and rate limits are retried with backoff and never count against a model, and a test about rate limits is code, not a broken environment.
+
+Floor raises need repeated evidence (≥2 failed tasks and more than half failing, within 30 days). They expire when the window ends or a new model version ships. About 10% of tasks probe one rung cheaper, so floors can come back down. After each job, a cheap extractor turns what the agents learned into proposed AGENTS.md notes, and `router.py status` shows the cost per completed task including the coordination it caused. All of it is proposals you approve. State lives in `~/.local/share/orchestrate` (or `$ORCHESTRATE_DIR`).
 
 ## Develop
 
 ```bash
-python3 tests/test_orchestrate.py -v   # e2e on a pnpm/Go monorepo with a fake `claude`
-python3 tests/test_routing.py -v
-claude plugin validate .
+make test              # harness: e2e on a pnpm/Go monorepo with a fake `claude`, routing, eval runner
+make eval-quick        # prompts: core snapshot evals against the real `claude` (costs money)
+make validate-plugin
 ```
+
+Every change to a `SKILL.md` or a prompt builder should ship with eval cases and pass `make eval-quick`. See [evals/README.md](evals/README.md).
 
 ## Credits
 

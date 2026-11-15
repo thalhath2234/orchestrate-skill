@@ -87,7 +87,8 @@ Be as narrow as practical but include everything the task must create, including
   "reviewer": {"model": "opus", "effort": "high"},  // optional
   "lessons": {"enabled": true, "model": "sonnet", "effort": "low"},  // optional: after the job,
                                               //   propose AGENTS.md notes from what agents learned
-  "exclude_dynamic_prompt": false,            // optional experiment: cache-friendlier subagent prompts
+  "exclude_dynamic_prompt": true,             // optional (default true): per-worktree details move out of
+                                              //   the system prompt so subagents share its cache
   "sandbox": false,                           // optional OS sandbox for subagents' shell (bwrap/
                                               //   seatbelt); safest, but tools that write caches
                                               //   outside the repo (Go, Gradle) may break

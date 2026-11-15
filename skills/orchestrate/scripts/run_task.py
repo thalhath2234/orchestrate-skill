@@ -179,7 +179,8 @@ def classify(task: str, rung: int, worker: dict, vout: str, repo: Path, timeout:
         config="/".join(router.cfg(rung)), task=task, final=str(worker.get("result", ""))[-3000:],
         stat=git(repo, "diff", "--stat")[-1500:] or "(none)", tail=vout[-4000:])
     res = claude(prompt, *classifier_cfg(), repo, perm="plan", tools=[], resume=None,
-                 timeout=timeout, schema=schemas.CLASSIFIER)
+                 timeout=timeout, schema=schemas.CLASSIFIER,
+                 extra_args=["--exclude-dynamic-system-prompt-sections"])
     out = res.get("structured") or {}
     if out.get("cause") not in router.CAUSES:
         out = {"cause": "unknown", "evidence": f"classifier unparseable: {str(res.get('result'))[:200]}"}

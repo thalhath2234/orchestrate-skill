@@ -898,7 +898,7 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
         cmd += ["--extra-tools", *plan["extra_tools"]]
     if plan.get("sandbox"):
         cmd.append("--sandbox")
-    if plan.get("exclude_dynamic_prompt"):
+    if plan.get("exclude_dynamic_prompt", True):  # measured: ~4.8k fewer cache-write tokens per session
         cmd.append("--exclude-dynamic-prompt")
     if "max_escalations" in plan:
         cmd += ["--max-escalations", str(int(plan["max_escalations"]))]
