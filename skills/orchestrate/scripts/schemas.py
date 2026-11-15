@@ -12,6 +12,14 @@ ID_PATTERN = r"^[a-z0-9][a-z0-9-]{0,40}$"
 
 _STRS = {"type": "array", "items": {"type": "string"}}
 
+# A proposed addition to a definition of done. The bar only goes up: criteria are added, never
+# removed or loosened (only the user lowers it). scope: "job" (acceptance) or a task id.
+BAR_ITEM = {
+    "type": "object",
+    "required": ["scope", "criterion", "why"],
+    "properties": {"scope": {"type": "string"}, "criterion": {"type": "string"}, "why": {"type": "string"}},
+}
+
 TASK = {
     "type": "object",
     "required": ["id", "title", "goal", "type", "tier", "owns", "done", "verify"],
@@ -52,6 +60,10 @@ MANAGER = {
             _action("add_task", ["task"], {"task": TASK}),
             _action("amend", ["task", "note"], {
                 "task": {"type": "string"}, "note": {"type": "string"}, "reads": _STRS}),
+            _action("raise_bar", ["scope", "criteria", "why"], {
+                "scope": {"type": "string"}, "criteria": {**_STRS, "minItems": 1}, "why": {"type": "string"}}),
+            _action("raise_bar", ["scope", "criteria", "why"], {
+                "scope": {"type": "string"}, "criteria": {**_STRS, "minItems": 1}, "why": {"type": "string"}}),
             _action("skip", ["task", "reason"], {"task": {"type": "string"}, "reason": {"type": "string"}}),
             _action("fix_round", ["reason"], {"reason": {"type": "string"}}),
             _action("accept", ["reason"], {"reason": {"type": "string"}}),
@@ -83,6 +95,7 @@ REVIEW = {
             "properties": {"criterion": {"type": "string"}, "met": {"type": "boolean"},
                            "evidence": {"type": "string"}}}},
         "findings": {"type": "array", "items": FINDING},
+        "raise_bar": {"type": "array", "items": BAR_ITEM},
     },
 }
 
@@ -93,6 +106,7 @@ AREA_REVIEW = {
         "verdict": {"type": "string", "enum": ["pass", "changes_requested"]},
         "summary": {"type": "string"},
         "findings": {"type": "array", "items": FINDING},
+        "raise_bar": {"type": "array", "items": BAR_ITEM},
     },
 }
 
@@ -127,14 +141,23 @@ OPEN_ISSUE = {
     },
 }
 
+DONE_CHECK = {
+    "type": "object",
+    "required": ["id", "met", "evidence"],
+    "properties": {"id": {"type": "string", "pattern": r"^[DU][0-9]+$"}, "met": {"type": "boolean"},
+                   "evidence": {"type": "string"}},
+}
+
 REPORT = {
     "type": "object",
-    "required": ["summary", "interfaces", "notes_for_dependents", "open_issues"],
+    "required": ["summary", "interfaces", "notes_for_dependents", "open_issues", "done_check", "raise_bar"],
     "properties": {
         "summary": {"type": "string"},
         "interfaces": {"type": "string"},
         "notes_for_dependents": {"type": "string"},
         "open_issues": {"type": "array", "items": OPEN_ISSUE},
+        "done_check": {"type": "array", "items": DONE_CHECK},   # one per [D#]/[U#] in the brief
+        "raise_bar": {"type": "array", "items": BAR_ITEM},
     },
 }
 
@@ -149,11 +172,12 @@ LESSONS = {
 
 PLAN = {
     "type": "object",
-    "required": ["job", "goal", "verify", "tasks"],
+    "required": ["job", "goal", "acceptance", "verify", "tasks"],
     "properties": {
         "job": {"type": "string", "pattern": ID_PATTERN},
         "goal": {"type": "string"},
-        "acceptance": _STRS, "non_goals": _STRS, "decisions": _STRS,
+        "acceptance": {**_STRS, "minItems": 1}, "non_goals": _STRS, "decisions": _STRS,
+        "quality_bar": _STRS,
         "setup": _STRS, "verify": {**_STRS, "minItems": 1}, "baseline": _STRS,
         "max_parallel": {"type": "integer"}, "mem_per_agent_gb": {"type": "number"},
         "budget_usd": {"type": "number"}, "review_rounds": {"type": "integer"},

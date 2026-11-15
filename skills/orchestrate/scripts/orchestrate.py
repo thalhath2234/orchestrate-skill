@@ -522,9 +522,15 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
         return errs, warns, []
     if plan.get("base") and not git(repo, "rev-parse", "--verify", "--quiet", plan["base"], check=False):
         errs.append(f"plan.base {plan['base']!r} does not exist")
-    for k in ("verify", "setup", "acceptance", "non_goals", "decisions"):
+    for k in ("verify", "setup", "acceptance", "non_goals", "decisions", "quality_bar"):
         if k in plan and not (isinstance(plan[k], list) and all(isinstance(x, str) for x in plan[k])):
             errs.append(f"plan.{k} must be a list of strings")
+    if not plan.get("acceptance"):
+        errs.append("plan.acceptance is required: the job's definition of done, as checkable criteria")
+    for c in plan.get("acceptance") or []:
+        if isinstance(c, str) and VAGUE.search(c):
+            warns.append(f"acceptance criterion is vague ({VAGUE.search(c).group(0)!r}); say what is "
+                         f"observable: {c[:80]}")
     errs += [f"plan.{e}" for e in models.validate_plan(plan)]
     tasks = {}
     for i, t in enumerate(plan["tasks"]):
@@ -537,6 +543,14 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
         for k in ("title", "goal", "type", "tier", "owns", "done", "verify"):
             if not t.get(k):
                 errs.append(f"task {tid}: {k} is required")
+        need = MIN_DONE.get(t.get("tier"), 1)
+        if t.get("done") and len(t["done"]) < need:
+            errs.append(f"task {tid}: a {t.get('tier')} task needs at least {need} done criteria "
+                        f"(behaviour, error paths, tests, integration), has {len(t['done'])}")
+        for d in t.get("done") or []:
+            if isinstance(d, str) and VAGUE.search(d):
+                warns.append(f"task {tid}: done criterion is vague ({VAGUE.search(d).group(0)!r}); say "
+                             f"what is observable: {d[:80]}")
         if t.get("tier") and t["tier"] not in router.TIER_DEFAULT:
             errs.append(f"task {tid}: tier must be one of {list(router.TIER_DEFAULT)}")
         if t.get("type"):
@@ -699,12 +713,25 @@ def _job_block(plan: dict, repo: Path) -> tuple[list[str], set[str]]:
          ' "notes_for_dependents": "what downstream tasks must know",',
          ' "open_issues": [{"issue": "what is still needed and why", '
          '"kind": "needs_file | needs_decision | fyi", "blocks_acceptance": true, '
-         '"files": ["path/that/needs/the/change"]}]}',
+         '"files": ["path/that/needs/the/change"]}],',
+         ' "done_check": [{"id": "D1", "met": true, "evidence": "share_test.go:42 TestCreateLink_Expired"}],',
+         ' "raise_bar": [{"scope": "job | <task-id>", "criterion": "a checkable requirement", '
+         '"why": "what you found"}]}',
          "```",
+         "`done_check`: one entry for EVERY [D#] and [U#] id in this brief, each with evidence "
+         "(file:line, a test name, or command output). An item that is unmet or has no evidence "
+         "sends the task back to you.",
+         "`raise_bar`: if the definition of done misses something this job needs (an edge case, a "
+         "failure mode, an integration point a later task depends on), add it as a checkable "
+         "criterion: scope \"job\" or the id of a task that hasn't run yet. The bar only goes up: "
+         "it is never lowered, so add only what genuinely matters.",
          "`open_issues` kinds: needs_file = a change in a path you don't own (list the files); "
          "needs_decision = a product question for the user; fyi = worth knowing, nothing to do. "
          "Set blocks_acceptance true only if the job's acceptance criteria fail without it. "
          "Use [] when there is nothing.", ""]
+    L += ["## The bar (every subtask is held to it, on top of its own done)",
+          *[f"- [U{i}] {b}" for i, b in enumerate(bar_items(plan), 1)],
+          "Decisions and non-goals below take precedence over any criterion that conflicts with them.", ""]
     if plan.get("acceptance"):
         L += ["## Job acceptance criteria", *[f"- {a}" for a in plan["acceptance"]], ""]
     if plan.get("decisions"):
@@ -761,12 +788,103 @@ def build_brief(plan: dict, task: dict, repo: Path, upstream: dict) -> str:
     if task.get("notes"):
         L += ["## Notes from the manager (earlier attempts and new information; follow these)",
               *[f"- {n}" for n in task["notes"]], ""]
-    L += ["## Done looks like", *[f"- {d}" for d in task["done"]],
+    L += ["## Done looks like (your definition of done; every item is checked)",
+          *[f"- [D{i}] {d}" for i, d in enumerate(task["done"], 1)],
+          "- And every [U#] item of the bar above.",
           "- These commands pass (run them yourself before finishing):",
           *[f"  - `{c}`" for c in task["verify"]],
           "- `git status` shows changes only inside the paths you own.",
-          "- Do not commit; end with the report described above."]
+          "- Do not commit; end with the report described above, with a `done_check` entry for "
+          "every [D#] and [U#]."]
     return "\n".join(L)
+
+
+# ================================================================ the bar ===
+# Every subtask is held to UNIVERSAL_BAR (plus plan.quality_bar) on top of its own `done`.
+# Ids are stable because both lists only grow: [U1].. for the bar, [D1].. for a task's done.
+# The bar only goes up: models add criteria from what they find (subagents, the manager,
+# reviewers), nothing in the harness removes or loosens one, and only the user lowers it.
+UNIVERSAL_BAR = [
+    "New or changed behaviour is covered by tests that fail without the change, including at least "
+    "one error or edge path (evidence: the test names). If the task changes no behaviour, say why.",
+    "You ran every verify command yourself and they pass; no test was skipped, deleted or loosened "
+    "to get there.",
+    "Your changes leave no TODO/FIXME, placeholder, commented-out code, debug output or dead code.",
+    "Errors at the boundaries you touched are handled explicitly (invalid input, missing data, "
+    "failed calls); nothing fails silently.",
+    "Names, structure and style match the surrounding code and the nearest AGENTS.md; anything "
+    "public you added is documented where this repo documents such things.",
+    "Everything you built is wired up and reachable (exported, registered, routed); nothing is "
+    "left half-done.",
+]
+MIN_DONE = {"T0": 1, "T1": 2, "T2": 3, "T3": 3}   # done criteria a task needs, by tier
+VAGUE = re.compile(r"\b(works?|working|properly|correctly|as expected|good|nice|clean(ly)?|"
+                   r"appropriate(ly)?|reasonabl[ey]|robust|etc)\b", re.I)
+BAR_MAX_PER_SOURCE = 3   # criteria adopted from one report, review or decision
+BAR_MAX_REGRESSION = 8   # review findings turned into "stays fixed" criteria per round
+BAR_MAX_JOB = 40         # criteria adopted per job: the bar rises without running away
+
+
+def bar_items(plan: dict) -> list[str]:
+    return UNIVERSAL_BAR + [q for q in plan.get("quality_bar") or [] if isinstance(q, str)]
+
+
+def done_ids(plan: dict, task: dict) -> list[str]:
+    return ([f"D{i}" for i in range(1, len(task.get("done", [])) + 1)]
+            + [f"U{i}" for i in range(1, len(bar_items(plan)) + 1)])
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\W+", " ", s.lower()).strip()
+
+
+def bar_duplicate(c: str, existing: list[str]) -> bool:
+    import difflib
+    n = _norm(c)
+    return any(n == _norm(e) or difflib.SequenceMatcher(None, n, _norm(e)).ratio() >= 0.85
+               for e in existing)
+
+
+def raise_bar(job, plan: dict, items: list, source: str, limit: int = BAR_MAX_PER_SOURCE) -> list[dict]:
+    """Adopt proposed criteria: into a not-started task's `done`, else into the job's acceptance
+    (the final review checks those). Additive only, deduplicated, capped. Returns what was added."""
+    log_ = job.state.setdefault("bar", [])
+    added = []
+    for it in (items or [])[:limit]:
+        if not isinstance(it, dict) or len(log_) >= BAR_MAX_JOB:
+            continue
+        c = sanitize(str(it.get("criterion", "")), 400).strip()
+        if len(c) < 12:
+            continue
+        scope = str(it.get("scope") or "job")
+        t = next((x for x in plan["tasks"] if x["id"] == scope), None)
+        if t is None or job.state["tasks"].get(scope, {}).get("status") not in (
+                "pending", "blocked", "awaiting_approval"):
+            scope, target = "job", plan.setdefault("acceptance", [])
+        else:
+            target = t.setdefault("done", [])
+        if bar_duplicate(c, target) or bar_duplicate(c, plan.get("acceptance", [])):
+            continue
+        target.append(c)
+        e = {"t": round(time.time(), 1), "scope": scope, "criterion": c, "source": source,
+             "why": sanitize(str(it.get("why", "")), 300)}
+        log_.append(e)
+        added.append(e)
+    if added:
+        write_json(job.dir / "plan.json", plan)
+        for e in added:
+            log(f"bar raised by {e['source']} ({e['scope']}): {e['criterion'][:110]}")
+    return added
+
+
+def regression_criteria(findings: list[dict], rnd_no: int) -> list[dict]:
+    """Blocking review findings become job criteria, so the next review must show each one fixed."""
+    out = []
+    for f in findings[:BAR_MAX_REGRESSION]:
+        where = f" ({f['file']}{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
+        out.append({"scope": "job", "why": f"review round {rnd_no} {f.get('severity', '')} finding",
+                    "criterion": f"Fixed and covered by a test: {str(f.get('issue', ''))[:300]}{where}"})
+    return out
 
 
 # ===================================================================== job ===
@@ -891,6 +1009,7 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
              + " ".join(f"--owns {shlex.quote(p)}" for p in task["owns"]))
     cmd = [sys.executable, str(HERE / "run_task.py"), "--repo", str(wt), "--type", task["type"],
            "--tier", task["tier"], "--verify", scope, "--report-schema", json.dumps(schemas.REPORT)]
+    cmd += ["--done-ids", *done_ids(plan, task)]
     if plan.get("max_model"):
         cmd += ["--max-model", plan["max_model"]]
     if plan.get("advisor"):
@@ -1016,10 +1135,15 @@ def verify_and_review(job: Job, plan: dict, rnd_no: int) -> tuple[dict, list[dic
                "findings": [{"severity": "blocker", "issue": "final verify failed",
                              "evidence": vout[-1500:]}]} if code else review(job, plan, vout)
     rnd["verdict"] = verdict
-    job.save()
     blocking = [f for f in verdict.get("findings", []) if f.get("severity") in ("blocker", "major")]
     if verdict.get("verdict") == "pass" and not verdict.get("reviewer_error"):
         blocking = []
+    if not verdict.get("reviewer_error"):
+        rnd["bar_raised"] = (raise_bar(job, plan, verdict.get("raise_bar") or [], f"reviewer:round{rnd_no}")
+                             + raise_bar(job, plan, regression_criteria(
+                                 [f for f in blocking if not str(f.get("issue", "")).startswith("acceptance criterion")],
+                                 rnd_no), f"review-finding:round{rnd_no}", BAR_MAX_REGRESSION))
+    job.save()
     return verdict, blocking
 
 
@@ -1147,6 +1271,14 @@ def _review_header(job: Job, plan: dict) -> str:
     return f"""Job acceptance criteria:
 {chr(10).join('- ' + a for a in plan.get('acceptance', [])) or '- (none given: judge against the goal)'}
 
+The bar every subtask was held to (a violation is a major finding):
+{chr(10).join('- ' + b for b in bar_items(plan))}
+
+Raise the bar where it is too low: if this job's definition of done misses something it needs (an
+edge case, a failure mode, an integration check, a missing test), add it to `raise_bar` as a
+checkable criterion with scope "job", and judge the work against it in this same review (unmet is
+a finding). The bar only goes up; never propose loosening it.
+
 Decisions settled with the user (flag violations as major; do not re-litigate them):
 {chr(10).join('- ' + d for d in plan.get('decisions', [])) or '- (none recorded)'}
 
@@ -1229,7 +1361,7 @@ Files in this area: {', '.join(files)}
 DIFF (this area only):
 {d}
 
-Reply with the JSON object: verdict, summary, findings."""
+Reply with the JSON object: verdict, summary, findings, raise_bar."""
 
     am, ae = models.role("area_reviewer", plan)
     with cf.ThreadPoolExecutor(max_workers=min(4, len(areas) or 1)) as ex:
@@ -1285,6 +1417,7 @@ criterion above. Repeat only the area findings you agree still matter."""
     if any(f.get("severity") in ("blocker", "major") for f in v.get("findings", [])):
         v["verdict"] = "changes_requested"
     v["areas"] = {a: av.get("summary") for a, av in area_v.items()}
+    v["raise_bar"] = list(v.get("raise_bar") or []) + [b for av in area_v.values() for b in av.get("raise_bar") or []]
     return v
 
 
@@ -1517,9 +1650,11 @@ def apply_actions(job: Job, plan: dict, decision: dict, event: dict) -> dict:
                     continue
             if a.get("instructions"):
                 t.setdefault("notes", []).append(a["instructions"])
-            for k in ("tier", "owns", "reads", "verify", "done"):
+            for k in ("tier", "owns", "reads", "verify"):
                 if a.get(k):
                     t[k] = a[k]
+            if a.get("done"):  # the bar only rises: new criteria are added to the old ones
+                t["done"] = list(t.get("done", [])) + [d for d in a["done"] if d not in t.get("done", [])]
             st_ops.append(("retry", tid, n + 1))
         elif kind == "split":
             if tid not in tasks or status(tid) in ("done", "running"):
@@ -1534,6 +1669,12 @@ def apply_actions(job: Job, plan: dict, decision: dict, event: dict) -> dict:
             lost = [c for c in old.get("verify", []) if c not in union_verify]
             if lost and not set(lost) <= set(new.get("verify", [])):
                 errs.append(f"split {tid}: the pieces drop verify commands {lost}; keep each in at least one piece")
+                continue
+            pieces_done = [d for x in parts for d in x.get("done", [])]
+            dropped = [d for d in old.get("done", []) if d not in pieces_done]
+            if dropped:
+                errs.append(f"split {tid}: the pieces drop done criteria {dropped}; keep each in at "
+                            "least one piece (the bar only rises)")
                 continue
             for x in parts:
                 x.setdefault("depends_on", list(old.get("depends_on", [])))
@@ -1564,6 +1705,21 @@ def apply_actions(job: Job, plan: dict, decision: dict, event: dict) -> dict:
                 tasks[tid].setdefault("notes", []).append(a["note"])
             if a.get("reads"):
                 tasks[tid]["reads"] = sorted(set(tasks[tid].get("reads", [])) | set(a["reads"]))
+        elif kind == "raise_bar":
+            scope = str(a.get("scope") or "job")
+            crit = [sanitize(str(c), 400).strip() for c in a.get("criteria") or []][:BAR_MAX_PER_SOURCE]
+            crit = [c for c in crit if len(c) >= 12]
+            if not crit:
+                errs.append("raise_bar: give at least one checkable criterion")
+                continue
+            if scope != "job" and (scope not in tasks or status(scope) not in ("pending", "blocked", "awaiting_approval")):
+                errs.append(f"raise_bar {scope}: only a task that hasn't started can get new done "
+                            "criteria; use scope \"job\" (the final review checks those)")
+                continue
+            target = new.setdefault("acceptance", []) if scope == "job" else tasks[scope].setdefault("done", [])
+            fresh = [c for c in crit if not bar_duplicate(c, target)]
+            target.extend(fresh)
+            st_ops.append(("bar", scope, [(c, a.get("why", "")) for c in fresh]))
         elif kind == "skip":
             if tid not in tasks or status(tid) in ("done", "running"):
                 errs.append(f"skip {tid}: cannot skip a done/running task")
@@ -1588,6 +1744,14 @@ def apply_actions(job: Job, plan: dict, decision: dict, event: dict) -> dict:
         out["applied"].append(a)
 
     new["tasks"] = list(tasks.values())
+    for o in plan["tasks"]:  # the bar only rises: no action may drop a done or acceptance criterion
+        t = tasks.get(o["id"])
+        lost = [d for d in o.get("done", []) if t is not None and d not in t.get("done", [])]
+        if lost:
+            errs.append(f"{o['id']}: done criteria can be added, never removed or reworded: {lost}")
+    lost_acc = [c for c in plan.get("acceptance", []) if c not in new.get("acceptance", [])]
+    if lost_acc:
+        errs.append(f"acceptance criteria can be added, never removed: {lost_acc}")
     if not errs:
         verrs, _, _ = validate(new)
         errs += [f"plan invalid after actions: {e}" for e in verrs]
@@ -1617,6 +1781,12 @@ def apply_actions(job: Job, plan: dict, decision: dict, event: dict) -> dict:
         elif op == "skip":
             job.state["tasks"][tid].update(status="skipped", skip_reason=arg)
             release_claims(job, {tid})
+        elif op == "bar":
+            for c, why in arg:
+                job.state.setdefault("bar", []).append(
+                    {"t": round(time.time(), 1), "scope": tid, "criterion": c, "source": "manager",
+                     "why": sanitize(str(why), 300)})
+                log(f"bar raised by manager ({tid}): {c[:110]}")
     # a blocked task whose failed upstream is now pending/skipped becomes runnable again
     for t in plan["tasks"]:
         st = job.state["tasks"][t["id"]]
@@ -1922,6 +2092,8 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                     if ok:
                         st.update(status="done", files=json.loads(info))
                         log(f"done  {tid} ({len(st['files'])} files merged)")
+                        raise_bar(job, plan, (res.get("report") or {}).get("raise_bar") or [],
+                                  f"subagent:{tid}")
                         issues = (res.get("report") or {}).get("open_issues") or []
                         if issues:
                             rest, auto = triage_issues(job, plan, tid, issues)
@@ -2109,6 +2281,7 @@ def extract_lessons(job: Job, plan: dict) -> None:
         "review_findings": [f for r in job.state.get("review", {}).get("rounds", [])
                             for f in (r.get("verdict") or {}).get("findings", [])
                             if f.get("severity") in ("blocker", "major")],
+        "bar_raised": [f"{e.get('criterion')} (by {e.get('source')})" for e in job.state.get("bar") or []],
     }
     if not any(material.values()):
         return
@@ -2119,8 +2292,10 @@ def extract_lessons(job: Job, plan: dict) -> None:
 A multi-agent coding job just ended in {repo.name}. Below is what its manager, subagents and
 reviewer wrote while working. Extract the durable repo knowledge a future agent would need and
 could not find quickly by reading the code: a convention, where something is wired, a gotcha in
-build or test setup. Skip anything specific to this job's feature, anything already obvious from
-file names, and anything that is a decision about this job.
+build or test setup, or a definition-of-done standard this repo should hold every change to
+(from "bar_raised": criteria agents added mid-job because the plan missed them; keep the ones
+that would apply to future work here, phrased as a rule). Skip anything specific to this job's
+feature, anything already obvious from file names, and anything that is a decision about this job.
 
 Candidate files (repo-relative): {', '.join(docs)}
 Return at most 5 lessons as JSON: {{"lessons": [{{"file": "<one of the candidate files>",
@@ -2253,6 +2428,10 @@ def render_report(job: Job, plan: dict) -> str:
                 L.append(f"- **{t}** [{tag}]: {i.get('issue', '')}")
             else:
                 L.append(f"- **{t}**: {i}")
+    bar = s.get("bar") or []
+    if bar:
+        L += ["", f"Definition of done, raised {len(bar)} time(s) during the job (the bar only rises):",
+              *[f"- {e.get('source')} → {e.get('scope')}: {e.get('criterion')}" for e in bar]]
     claimed = {t: st["claimed"] for t, st in s["tasks"].items() if st.get("claimed")}
     if claimed:
         L += ["", "Files claimed by tasks because no task owned them:",
@@ -2294,6 +2473,13 @@ REPO SCAN:
 {json.dumps(info, indent=2)[:12000]}
 
 MACHINE: up to {cap['cap']} subagents can run in parallel right now.
+
+Set the bar high. `acceptance` is the job's definition of done and each task's `done` is its own:
+checkable criteria a reviewer can confirm by reading code or running a test (behaviour, error
+paths, the tests that prove them, integration with the rest of the job). At least
+{', '.join(f'{k}: {v}' for k, v in MIN_DONE.items())} done criteria per task tier. Every task is
+also held to this bar, so don't repeat it, build on it:
+{chr(10).join('- ' + b for b in UNIVERSAL_BAR)}
 
 Use "repo": "{repo}". Reply with ONLY the plan JSON object."""
     pm, pe = models.parse(a.planner) if a.planner else models.role("planner")
@@ -2447,8 +2633,7 @@ def main(argv=None) -> int:
     s = sub.add_parser("scan"); s.add_argument("--repo", default=".")
     p = sub.add_parser("plan"); p.add_argument("--repo", default="."); p.add_argument("--goal", required=True)
     p.add_argument("--out")
-    p.add_argument("--planner", help="model/effort for the planner (default: fable/high, "
-                                     "falls back to opus without Fable access)")
+    p.add_argument("--planner", help="model/effort for the planner (default: opus/high)")
     v = sub.add_parser("validate"); v.add_argument("plan"); v.add_argument("--json", action="store_true")
     b = sub.add_parser("brief"); b.add_argument("plan"); b.add_argument("task")
     for name in ("run", "resume"):

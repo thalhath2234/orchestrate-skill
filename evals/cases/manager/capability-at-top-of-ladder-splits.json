@@ -47,7 +47,8 @@
     ],
     "depends_on": [],
     "done": [
-     "Share types works (test)"
+     "ShareLink (token, scheduleId, expiresAt) is exported from packages/contract/src/index.ts",
+     "A type-level test fails if ShareLink loses or renames a field"
     ],
     "verify": [
      "make test"
@@ -69,7 +70,9 @@
      "contract"
     ],
     "done": [
-     "Share endpoints works (test)"
+     "POST /schedules/:id/share returns 201 and an opaque token (handler_test.go)",
+     "A non-owner gets 403 and an unknown schedule 404 (handler_test.go)",
+     "GET /share/:token returns the schedule read-only; unknown or expired tokens return 404 (handler_test.go)"
     ],
     "verify": [
      "make test-api"
@@ -88,7 +91,8 @@
      "contract"
     ],
     "done": [
-     "Share button works (test)"
+     "ShareButton copies the share link to the clipboard (test)",
+     "ShareButton shows an error message when copying fails (test)"
     ],
     "verify": [
      "make test-web"
@@ -108,7 +112,8 @@
      "web"
     ],
     "done": [
-     "Register routes and nav works (test)"
+     "The share routes are registered in apps/api/internal/http/routes.go (test hits them)",
+     "The web nav shows the share entry for schedule owners only (test)"
     ],
     "verify": [
      "make test-api"

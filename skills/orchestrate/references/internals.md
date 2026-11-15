@@ -50,7 +50,9 @@ Type is `<category>:<area>`: categories `rename docs config bugfix feature refac
 
 The tier sets the starting model and effort on the ladder `haiku/low → haiku/medium → sonnet/medium → sonnet/high → opus/low → opus/medium → opus/high → opus/xhigh → fable/high` (T0 haiku/medium, T1 sonnet/medium, T2 opus/low, T3 opus/medium). An effort failure, or any failure below the model's default effort, re-runs on the same model at `high`; a capability failure moves to the next model at its default effort, with Opus going to `xhigh` before Fable. `plan.max_model` caps it. Fable calls carry `--fallback-model opus`, and a call that fell back is not routing evidence. `router.py ladder` prints the ladder and role defaults; `router.py route --type bugfix:api --tier T1` checks one decision.
 
-Role models live in `scripts/models.py`, each with its Anthropic source: planner and final reviewer Fable 5.2 at high, manager Opus 5.5 at medium, area reviewers Opus at high, integrator Sonnet at high, failure classifier Haiku 5.5 at low, lessons Haiku at medium. Override per plan with `models`.
+**The bar.** Briefs number the definition of done: `[D#]` for the task's `done`, `[U#]` for `UNIVERSAL_BAR` plus `plan.quality_bar`. `run_task.py --done-ids` checks the report's `done_check` after verify passes, and any gap is a failed attempt. `raise_bar()` adopts criteria from subagent reports, the manager's `raise_bar` action, reviewers' `raise_bar` and blocking findings. Each goes into a not-started task's `done`, otherwise into `acceptance`; additions are deduplicated and capped. `apply_actions` rejects any change that drops a `done` or `acceptance` criterion. Every addition is logged in `job.json` → `bar`.
+
+Role models live in `scripts/models.py`, each with its Anthropic source: planner Opus 5.5 at high, final reviewer Fable 5.2 at high, manager Opus 5.5 at medium, area reviewers Opus at high, integrator Sonnet at high, failure classifier Haiku 5.5 at low, lessons Haiku at medium. Override per plan with `models`.
 
 Each config gets 2 attempts. API overloads and rate limits are retried with backoff first and never count against a model. Then the failure is classified:
 

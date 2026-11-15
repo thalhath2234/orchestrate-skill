@@ -96,6 +96,13 @@ def run_manager(o, case: dict, tmp: Path, config: str | None) -> dict:
     (job.dir / "plan.json").write_text(json.dumps(plan))
     decision = o.ask_manager(job, plan, case["event"])
     applied = o.apply_actions(job, copy.deepcopy(plan), decision, case["event"])
+    corrected = None
+    if applied.get("errors"):  # as in production (manage): one corrective re-ask with the errors
+        corrected = applied["errors"]
+        retry = {"kind": "rejected_actions", "errors": applied["errors"],
+                 "previous_event": case["event"].get("kind"), "task": case["event"].get("task")}
+        decision = o.ask_manager(job, plan, retry)
+        applied = o.apply_actions(job, copy.deepcopy(plan), decision, case["event"])
     acts = decision.get("actions") or []
     exp = case["expect"]
     kinds = [a.get("action") for a in acts] or ["none"]
@@ -115,7 +122,7 @@ def run_manager(o, case: dict, tmp: Path, config: str | None) -> dict:
             fails.append(f"decision never mentions {needle!r}")
     label = ",".join(sorted(set(k for k in kinds if k != "none")) or ["none"])
     return {"ok": not fails, "label": label, "fails": fails, "cost": job.state["cost_usd"],
-            "detail": decision.get("note")}
+            "detail": decision.get("note"), "corrected": corrected}
 
 
 def run_reviewer(o, case: dict, tmp: Path, config: str | None) -> dict:
@@ -225,7 +232,9 @@ def main(argv=None) -> int:
             mark = "PASS" if row["pass_rate"] == 1 else ("FLAKY" if row["pass_rate"] > 0 else "FAIL")
             print(f"{mark:5} {role:10} {case['id']:42} {row['config']:13} pass {row['pass_rate']:.2f} "
                   f"consistent {row['consistency']:.2f} ${row['cost_usd']:.3f}"
-                  + ("" if row["pass_rate"] == 1 else f"  <- {outs[-1]['fails']}"), flush=True)
+                  + ("" if row["pass_rate"] == 1 else f"  <- {outs[-1]['fails']}")
+                  + (f"  ({sum(1 for o_ in outs if o_.get('corrected'))} needed a corrective re-ask)"
+                     if any(o_.get("corrected") for o_ in outs) else ""), flush=True)
     by = collections.defaultdict(list)
     for r in results:
         by[(r["role"], r["config"])].append(r)

@@ -18,7 +18,9 @@ A good plan makes subagents independent. Each one gets a clear goal, its own fil
    - **Integration glue last** (route registration, navigation entries, feature flags), owned by the task that depends on all the others.
 4. **Size each task** at roughly 15–45 minutes of agent work and 1–10 files. Merge trivial tasks into a neighbor. Split anything that would be T3. Aim for 2–8 tasks. More than 12 is a smell.
 5. **Tier each task** on its own merits (see below). A T3 job is usually made of T1/T2 tasks.
-6. **Write `done` and `verify`** for each task. Then the job-level `verify`, `setup` and gates.
+6. **Write the definition of done: set the bar high.** `acceptance` (required) is the job's; each task's `done` is its own. Every criterion is checkable by reading code or running a test, and says what is observable: the behaviour, the error and edge paths, the test that proves it, how it connects to the rest of the job. "Works correctly" is not a criterion; "an expired token returns 404 (handler_test.go)" is. Validation needs at least 1/2/3/3 `done` criteria for T0/T1/T2/T3 tasks and warns about vague words. Every task is also held to a fixed bar (tests that fail without the change, verify run by the agent, no TODOs or dead code, errors handled at boundaries, repo conventions, everything wired up), so build on it instead of repeating it; add repo-wide standards of your own in `quality_bar`. Then write `verify` per task, the job-level `verify`, `setup` and gates.
+
+   The definition of done keeps improving during the job. Subagents, the manager and reviewers add criteria from what they find; nothing removes or loosens one, so only the user ever lowers the bar.
 7. **Validate:** `orchestrate.py validate plan.json`. Fix every ERROR and read every warning. Drive **ownership gap** warnings to zero: each names an unowned file in the same Go package as, or imported by, a file a task owns. Give it to the task that will need it. In a real 18-task job, gaps like these produced an open issue from 8 of 9 finished tasks and most of the manager's cost.
 
 ## Tier rubric (per subtask)
@@ -67,10 +69,12 @@ Be as narrow as practical but include everything the task must create, including
   "goal": "Users can share a schedule via a public read-only link",
   "repo": "/abs/path/to/repo",
   "base": "main",                             // optional, default: current branch
-  "acceptance": ["...", "..."],               // whole-job, testable (from grilling)
+  "acceptance": ["...", "..."],               // required: the job's definition of done, checkable
   "non_goals": ["no expiry UI in this job"],  // optional, from grilling: subagents must not build these
   "decisions": ["Tokens are opaque random strings, not JWTs (docs/adr/0007-share-tokens.md)"],
                                               // optional, from grilling: settled, not to be revisited
+  "quality_bar": ["Every API error response uses the shared ErrorBody type"],  // optional: repo-wide
+                                              //   standards added to the fixed bar for every task
   "setup": ["pnpm install --frozen-lockfile --prefer-offline"],   // per worktree
   "verify": ["make lint", "make typecheck", "make test-api"],     // final; also the baseline
   "baseline": ["make lint"],                  // optional override of the pre-check
@@ -80,12 +84,12 @@ Be as narrow as practical but include everything the task must create, including
   "review_rounds": 2,                         // review -> fix -> review (default 2)
   "manager": {"enabled": true, "max_interventions": 12, "max_task_retries": 2},  // optional; defaults
   "models": {"reviewer": "opus/high"},        // optional per-role override, "<model>/<effort>". Roles and
-                                              //   defaults: planner fable/high, manager opus/medium,
+                                              //   defaults: planner opus/high, manager opus/medium,
                                               //   reviewer fable/high, area_reviewer opus/high,
                                               //   integrator sonnet/high, classifier haiku/low,
                                               //   lessons haiku/medium (scripts/models.py has the sources)
   "max_model": "opus",                        // optional: nothing above this model, roles or ladder
-                                              //   (no Fable: reviewer/planner become opus/high)
+                                              //   (no Fable: the reviewer becomes opus/high)
   "advisor": "fable",                         // optional, off by default: subagents may consult this
                                               //   model at decision points (claude --advisor)
   "max_escalations": 2,                       // optional; model escalations per task before the manager steps in
@@ -125,7 +129,7 @@ Be as narrow as practical but include everything the task must create, including
       "reads": ["apps/api/MIGRATIONS.md", "apps/api/internal/schedules/"],
       "depends_on": ["contract-share-types"],
       "gate": "Creates a DB migration",
-      "done": ["Migration up/down works", "Expired/unknown token -> 404 (tests)", "Only the owner can create links (test)"],
+      "done": ["Migration up then down leaves the schema unchanged (test)", "Expired/unknown token -> 404 (tests)", "Only the owner can create links (test)"],
       "verify": ["make test-api"]
     }
   ]

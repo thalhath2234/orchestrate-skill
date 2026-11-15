@@ -56,7 +56,7 @@ It picks the model and effort, retries, escalates and records the outcome. Exit 
 
 ## Step 3b: Job (T2/T3)
 
-1. **Plan.** Load the **orchestrate-plan** skill and write `plan.json` (for example `~/.local/share/orchestrate/plans/<job>.json`) from the confirmed grilling summary: copy its goal, acceptance, `non_goals` and `decisions` into the plan. If you lack the repo context to plan well, let a planner subagent draft it with `python3 $S/orchestrate.py plan --repo <repo> --goal "<goal + decisions>"`. Then review and adjust what it wrote.
+1. **Plan.** Load the **orchestrate-plan** skill and write `plan.json` (for example `~/.local/share/orchestrate/plans/<job>.json`) from the confirmed grilling summary: copy its goal, acceptance, `non_goals` and `decisions` into the plan. Set the bar high: every `done` and acceptance criterion must be checkable, and the bar only rises from there (subagents, the manager and reviewers add criteria during the job; nothing removes one). If you lack the repo context to plan well, let a planner subagent draft it with `python3 $S/orchestrate.py plan --repo <repo> --goal "<goal + decisions>"`. Then review and adjust what it wrote.
    - **Commit the docs.** If grilling changed the glossary or ADRs, ask the user to commit those files before running (jobs start from the last commit). Subagents read the glossary automatically.
 2. **Validate** until it is clean and has no ownership-gap warnings left:
    ```bash
@@ -73,10 +73,10 @@ It picks the model and effort, retries, escalates and records the outcome. Exit 
 
 | Code | Status | What you do |
 |---|---|---|
-| 0 | done | Summarize `report.md`, including the acceptance evidence. The work is on branch `orchestrate/<job>`. Give the user the diff and merge commands; the user merges. |
+| 0 | done | Summarize `report.md`, including the acceptance evidence and how the definition of done was raised during the job. The work is on branch `orchestrate/<job>`. Give the user the diff and merge commands; the user merges. |
 | 5 | awaiting_approval | Ask the user about each gated task. If they agree, run `resume <job> --approve <id> --detach` (Claude Code asks them to allow it), then wait again. |
 | 3 | environment | Baseline or setup failed. Show the error, fix the environment or the plan's `baseline`/`setup`, then `resume <job>`. |
-| 4 | failed | Read `~/.local/share/orchestrate/jobs/<job>/logs/<task>.log` and the report. Usually the fix is to split the task, add `reads`, clarify `done`, or correct `verify`. Edit `jobs/<job>/plan.json`, then `resume <job>`. Done tasks are kept. |
+| 4 | failed | Read `~/.local/share/orchestrate/jobs/<job>/logs/<task>.log` and the report. Usually the fix is to split the task, add `reads`, sharpen `done`, or correct `verify`. Lowering a `done` criterion is the user's call, never yours. Edit `jobs/<job>/plan.json`, then `resume <job>`. Done tasks are kept. |
 | 6 | review_failed | Show the reviewer's findings, or say that the reviewer produced no verdict (then `resume <job>` reviews again). Ask the user whether to fix by hand, add a task and resume, or accept. |
 | 8 | awaiting_human | The **manager** needs a decision. Put its question (with its recommended answer) to the user word for word, then relay the user's own answer: `resume <job> --answer "<their answer>" --detach` (Claude Code asks them to allow it). Wait again. |
 | 7 | budget | Ask the user to raise `budget_usd` or stop. |

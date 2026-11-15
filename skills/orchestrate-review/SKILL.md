@@ -72,8 +72,14 @@ Reply with only this JSON object (structured output):
     {"severity": "major", "file": "apps/web/src/share/ShareButton.tsx", "line": 42,
      "issue": "uses `expires_at` but the API returns `expiresAt`",
      "suggestion": "read `expiresAt` from the ShareLink type in packages/contract"}
+  ],
+  "raise_bar": [
+    {"scope": "job", "criterion": "Every field read from the API is typed via packages/contract (no string keys)",
+     "why": "the expires_at bug came from an untyped read"}
   ]
 }
 ```
+
+**Hold the work to the bar and raise it.** Every subtask was held to the bar listed in your prompt (tests that fail without the change, error paths handled, nothing half-wired…); a violation is a `major` finding. When the job's definition of done misses something this job needs, add it to `raise_bar` as a checkable criterion and judge the work against it in the same review. Adopted criteria, and every blocker/major finding you report, become acceptance criteria the next review must show met with evidence. Never propose loosening a criterion.
 
 Set `verdict` to `"pass"` or `"changes_requested"`.

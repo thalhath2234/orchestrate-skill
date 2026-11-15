@@ -48,7 +48,9 @@
      "apps/api/internal/http/routes.go"
     ],
     "done": [
-     "endpoints with tests"
+     "POST /schedules/:id/share returns 201 and an opaque token (handler_test.go)",
+     "A non-owner gets 403 and an unknown schedule 404 (handler_test.go)",
+     "GET /share/:token returns the schedule read-only; unknown or expired tokens return 404 (handler_test.go)"
     ],
     "verify": [
      "make test"
@@ -64,7 +66,8 @@
      "apps/web/src/share/**"
     ],
     "done": [
-     "button copies link (test)"
+     "ShareButton copies the share link to the clipboard (test)",
+     "ShareButton shows an error message when copying fails (test)"
     ],
     "verify": [
      "make test"

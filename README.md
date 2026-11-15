@@ -71,7 +71,7 @@ To run the scripts by hand (`S=skills/orchestrate/scripts`):
 ```bash
 python3 $S/orchestrate.py scan --repo .                 # packages/areas, verify cmds, hotspots, setup
 python3 $S/orchestrate.py capacity                      # how many subagents this machine can take
-python3 $S/orchestrate.py plan --repo . --goal "..."    # optional: Fable drafts plan.json
+python3 $S/orchestrate.py plan --repo . --goal "..."    # optional: Opus drafts plan.json
 python3 $S/orchestrate.py validate plan.json            # waves, ownership conflicts, cap
 python3 $S/orchestrate.py brief plan.json <task-id>     # exact handoff a subagent will get
 python3 $S/orchestrate.py run plan.json --detach        # then:
@@ -153,7 +153,7 @@ Defaults follow Anthropic's model guidance ([choosing a model](https://platform.
 
 | Role | Model / effort | Why |
 |---|---|---|
-| Planner | Fable 5.2 / high | One call decides the whole job; Fable is for "demanding reasoning" and "analysis carried through to a finished document" |
+| Planner | Opus 5.5 / high | One call decides the whole job and sets its definition of done; Opus 5.5 is Anthropic's pick for complex agentic coding, at high because everything after builds on the plan |
 | Final reviewer | Fable 5.2 / high | Gates the merge. On Anthropic's defect-search benchmark Fable 5.2 beat Opus 5.5 at high by 1.6–5.9 points |
 | Area reviewers (big diffs) | Opus 5.5 / high | Accuracy-critical reading; Opus lost 34 points at low effort on defect search |
 | Manager | Opus 5.5 / medium | "For most agent workloads, start with Opus 5.5 at its default effort"; scored 13/13 on our evals, same as high |
@@ -162,6 +162,15 @@ Defaults follow Anthropic's model guidance ([choosing a model](https://platform.
 | Lessons extractor | Haiku 5.5 / medium | Extraction |
 
 Fable calls fall back to Opus when your account has no Fable access. `"max_model": "opus"` in the plan keeps everything at or below Opus; `"models": {"<role>": "model/effort"}` overrides one role.
+
+## The bar: what done looks like
+
+Every step works against an explicit definition of done, and the definition only gets stricter:
+
+- **The planner writes it.** `acceptance` (required) for the job and `done` for each task, as checkable criteria: at least 1/2/3/3 per T0/T1/T2/T3 task, with vague words flagged. Every task is also held to a fixed bar: tests that fail without the change, including an error path; verify run by the agent; no TODOs or dead code; errors handled at the boundaries it touched; repo conventions; everything wired up. `quality_bar` adds repo-wide standards.
+- **Subagents prove it.** The brief numbers every criterion (`[D1]…`, `[U1]…`). The report's `done_check` must show each one met with evidence (file:line, a test, command output); a gap sends the task back like a failing test.
+- **Other models raise it.** A subagent that finds something missing proposes a criterion for a later task or the job. The manager can `raise_bar`. Reviewers add criteria they find missing, and every blocker or major finding becomes a criterion the next review must show fixed. Additions are checked for duplicates and capped (3 per source, 40 per job).
+- **Nothing lowers it.** Any manager action that drops or rewords a criterion is rejected, and a retry with new `done` items adds them to the old ones. Only you lower the bar, by editing the plan. `report.md` lists every criterion added during the job, who added it and why, and the lessons step can turn recurring ones into AGENTS.md rules.
 
 ## How routing learns
 

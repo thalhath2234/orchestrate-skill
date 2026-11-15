@@ -104,10 +104,20 @@ FAKE = textwrap.dedent(r'''
         if t.get("out_of_scope_first") and not retry:
             pathlib.Path(t["out_of_scope_first"]).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(t["out_of_scope_first"]).write_text("oops")
-    note("worker", tid=tid, retry=retry, start=start, end=time.time(),
+    idf = pathlib.Path(str(calls) + f".ids-{tid}")
+    ids = re.findall(r"^- \[([DU]\d+)\]", prompt, re.M)
+    if ids:
+        idf.write_text(json.dumps(ids))
+    elif idf.exists():  # a resumed session remembers its brief
+        ids = json.loads(idf.read_text())
+    unmet = [] if retry else t.get("done_unmet", [])
+    note("worker", tid=tid, retry=retry, start=start, end=time.time(), done_ids=ids,
          brief_has_upstream="Already done by upstream" in prompt, prompt_head=prompt[:120])
     out(f"did {tid}\n```json\n" + json.dumps({"summary": f"did {tid}", "interfaces": f"{tid}-api",
-        "notes_for_dependents": f"use {tid}-api", "open_issues": t.get("open_issues", [])}) + "\n```")
+        "notes_for_dependents": f"use {tid}-api", "open_issues": t.get("open_issues", []),
+        "done_check": [{"id": i, "met": i not in unmet, "evidence": f"{tid}_test.go:{n}"}
+                       for n, i in enumerate(ids, 1)],
+        "raise_bar": t.get("raise_bar", [])}) + "\n```")
 ''').lstrip()
 
 
@@ -145,13 +155,16 @@ def base_plan(repo: Path, **over) -> dict:
         "tasks": [
             {"id": "contract", "title": "types", "type": "feature:contract", "tier": "T1",
              "goal": "add share types", "owns": ["packages/contract/src/share/**"],
-             "done": ["types exist"], "verify": ["test -f packages/contract/src/share/types.ts"]},
+             "done": ["types exist", "types are exported from the package index"],
+             "verify": ["test -f packages/contract/src/share/types.ts"]},
             {"id": "api", "title": "endpoints", "type": "feature:api", "tier": "T2",
              "goal": "share endpoints", "owns": ["apps/api/share/"], "depends_on": ["contract"],
-             "done": ["endpoint exists"], "verify": ["test -f apps/api/share/handler.go"]},
+             "done": ["endpoint exists", "invalid ids return 404", "handler has a table test"],
+             "verify": ["test -f apps/api/share/handler.go"]},
             {"id": "web", "title": "button", "type": "feature:web", "tier": "T1",
              "goal": "share button", "owns": ["apps/web/src/share/**"], "depends_on": ["contract"],
-             "done": ["button exists"], "verify": ["test -f apps/web/src/share/Button.tsx"]},
+             "done": ["button exists", "button shows an error state when the request fails"],
+             "verify": ["test -f apps/web/src/share/Button.tsx"]},
         ],
     }
     plan.update(over)
@@ -453,14 +466,15 @@ class OrchestrateTest(unittest.TestCase):
                               "owns": ["docs/share.md"], "depends_on": ["api"], "done": ["doc"],
                               "verify": ["test -f docs/share.md"]})
         part = lambda i, f: {"id": i, "title": i, "goal": i, "type": "feature:api", "tier": "T1",
-                             "owns": [f], "done": ["exists"], "verify": [f"test -f {f}"]}
+                             "owns": [f], "done": [f"{f} exists", f"{f} has a test"], "verify": [f"test -f {f}"]}
         cfg = {"tasks": {**WRITES, "api": {"never": True},
                          "api-model": {"write": {"apps/api/share/model.go": "package share\n"}},
                          "api-handler": {"write": {"apps/api/share/handler.go": "package share\n"}},
                          "docs": {"write": {"docs/share.md": "# share\n"}}},
                "manager": [{"note": "too big; split", "actions": [{"action": "split", "task": "api", "into": [
                    part("api-model", "apps/api/share/model.go"),
-                   {**part("api-handler", "apps/api/share/handler.go"), "depends_on": ["contract", "api-model"]}]}]}]}
+                   {**part("api-handler", "apps/api/share/handler.go"), "depends_on": ["contract", "api-model"],
+                    "done": plan["tasks"][1]["done"]}]}]}]}
         code, out, err = self.cli("run", str(self.write_plan(plan)), cfg=cfg)
         self.assertEqual(code, 0, err[-3000:])
         saved = json.loads((self.state / "jobs/share/plan.json").read_text())
@@ -561,8 +575,10 @@ class OrchestrateTest(unittest.TestCase):
         job.state["tasks"]["contract"]["status"] = "done"
         job.state["tasks"]["api"]["status"] = "failed"
         job.state["tasks"]["web"]["status"] = "running"
+        api_done = list(plan["tasks"][1]["done"])
         part = lambda i, f, *v: {"id": i, "title": i, "goal": i, "type": "feature:api", "tier": "T1",
-                                 "owns": [f], "done": ["x"], "verify": [f"test -f {f}", *v]}
+                                 "owns": [f], "done": [f"{f} exists", f"{f} has a test"],
+                                 "verify": [f"test -f {f}", *v]}
         for bad, needle in (({"action": "amend", "task": "web", "note": "x"}, "not started"),
                             ({"action": "skip", "task": "contract"}, "cannot skip"),
                             ({"action": "accept"}, "only valid for a review"),
@@ -587,15 +603,107 @@ class OrchestrateTest(unittest.TestCase):
         self.assertIsNone(self.o.apply_actions(job, copy.deepcopy(plan), {"actions": [ok_retry]},
                                                {"kind": "task_failed"}).get("errors"), "adding a known check is fine")
         job.state["tasks"]["api"]["status"] = "failed"
-        res = self.o.apply_actions(job, plan, {"actions": [{"action": "split", "task": "api", "into": [
-            part("api-a", "apps/api/share/a.go"),
-            part("api-b", "apps/api/share/b.go", "test -f apps/api/share/handler.go")]}]}, {"kind": "task_failed"})
+        both_verify = [part("api-a", "apps/api/share/a.go"),
+                       part("api-b", "apps/api/share/b.go", "test -f apps/api/share/handler.go")]
+        res = self.o.apply_actions(job, copy.deepcopy(plan), {"actions": [{"action": "split", "task": "api",
+                                                                           "into": both_verify}]}, {"kind": "task_failed"})
+        self.assertTrue(any("drop done criteria" in e for e in res.get("errors") or []), res)
+        both_verify[1]["done"] = both_verify[1]["done"] + api_done
+        res = self.o.apply_actions(job, plan, {"actions": [{"action": "split", "task": "api", "into": both_verify}]},
+                                   {"kind": "task_failed"})
         self.assertEqual(res.get("errors"), None)
         gates = {t["id"]: t.get("gate") for t in plan["tasks"]}
         self.assertEqual(gates["api-a"], "creates a migration", "pieces of a gated task stay gated")
         review = {"kind": "review_changes_requested", "findings": [{"severity": "blocker", "issue": "x"}]}
         res = self.o.apply_actions(job, plan, {"actions": [{"action": "accept", "reason": "meh"}]}, review)
         self.assertTrue(any("blocker" in e for e in res["errors"]))
+
+    # ------------------------------------------------------- the bar (definition of done) ---
+    def test_definition_of_done_is_in_the_brief_and_enforced(self):
+        cfg = {"tasks": {**WRITES, "web": {**WRITES["web"], "done_unmet": ["D2"]}}}
+        code, _, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg=cfg)
+        self.assertEqual(code, 0, err[-3000:])
+        web = [c for c in self.calls_of("worker") if c["tid"] == "web"]
+        self.assertEqual([c["retry"] for c in web], [False, True], "an unmet [D2] sends the task back")
+        self.assertEqual(sorted(web[0]["done_ids"]),
+                         sorted(["D1", "D2"] + [f"U{i}" for i in range(1, len(self.o.UNIVERSAL_BAR) + 1)]))
+        brief = (self.state / "jobs/share/briefs/web.md").read_text()
+        self.assertIn("- [D2] button shows an error state when the request fails", brief)
+        self.assertIn("- [U1] New or changed behaviour is covered by tests", brief)
+        self.assertIn("done check: 1 gap(s): D2: not met", (self.state / "jobs/share/logs/web.log").read_text())
+
+    def test_subagents_raise_the_bar_for_later_tasks_and_the_job(self):
+        bar = [{"scope": "web", "criterion": "The button is disabled while the share request is in flight",
+                "why": "double clicks create two links"},
+               {"scope": "job", "criterion": "A share link stops working after its expiry time passes",
+                "why": "the contract has an expiresAt field"},
+               {"scope": "job", "criterion": "links work", "why": "duplicate of an existing criterion"}]
+        cfg = {"tasks": {**WRITES, "contract": {**WRITES["contract"], "raise_bar": bar}}}
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo, max_parallel=1))), cfg=cfg)
+        self.assertEqual(code, 0, err[-3000:])
+        saved = json.loads((self.state / "jobs/share/plan.json").read_text())
+        web = next(t for t in saved["tasks"] if t["id"] == "web")
+        self.assertIn(bar[0]["criterion"], web["done"])
+        self.assertEqual(saved["acceptance"], ["links work", bar[1]["criterion"]], "deduplicated")
+        self.assertIn(f"- [D3] {bar[0]['criterion']}", (self.state / "jobs/share/briefs/web.md").read_text())
+        self.assertIn(bar[1]["criterion"], Path(str(self.calls) + ".review_prompt").read_text())
+        st = self.job_state()
+        self.assertEqual([(e["source"], e["scope"]) for e in st["bar"]], [("subagent:contract", "web"),
+                                                                          ("subagent:contract", "job")])
+        self.assertIn("Definition of done, raised 2 time(s)", out)
+
+    def test_review_findings_raise_the_bar_for_the_next_round(self):
+        cfg = {"tasks": WRITES, "fix": {"apps/web/src/share/index.ts": "export * from './Button'\n"},
+               "reviews": [{"verdict": "changes_requested", "summary": "not exported",
+                            "findings": [{"severity": "major", "file": "apps/web/src/share/Button.tsx",
+                                          "issue": "Button is not exported from an index"}],
+                            "raise_bar": [{"scope": "job", "criterion": "Every new web component is exported "
+                                           "from its folder's index.ts", "why": "two were missed"}]},
+                           {"verdict": "pass", "summary": "good", "findings": []}]}
+        code, _, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg=cfg)
+        self.assertEqual(code, 0, err[-3000:])
+        saved = json.loads((self.state / "jobs/share/plan.json").read_text())
+        self.assertIn("Every new web component is exported from its folder's index.ts", saved["acceptance"])
+        self.assertTrue(any(a.startswith("Fixed and covered by a test: Button is not exported")
+                            for a in saved["acceptance"]), saved["acceptance"])
+        second = Path(str(self.calls) + ".review_prompt").read_text()   # the last review prompt
+        self.assertIn("Fixed and covered by a test: Button is not exported", second)
+        self.assertEqual(len(self.job_state()["review"]["rounds"][0]["bar_raised"]), 2)
+
+    def test_manager_can_raise_the_bar_but_never_lower_it(self):
+        import copy
+        plan = base_plan(self.repo)
+        job = self.o.start_job(plan, self.write_plan(plan))
+        job.state["tasks"]["contract"]["status"] = "done"
+        job.state["tasks"]["api"]["status"] = "failed"
+        res = self.o.apply_actions(job, plan, {"actions": [
+            {"action": "raise_bar", "scope": "web", "criteria": ["The button shows the copied link in a toast"],
+             "why": "api returns the full URL"},
+            {"action": "raise_bar", "scope": "job", "criteria": ["Links are revocable by their owner"],
+             "why": "found in review of the api"}]}, {"kind": "open_issues"})
+        self.assertIsNone(res.get("errors"), res)
+        self.assertIn("The button shows the copied link in a toast", plan["tasks"][2]["done"])
+        self.assertIn("Links are revocable by their owner", plan["acceptance"])
+        self.assertEqual([e["source"] for e in job.state["bar"]], ["manager", "manager"])
+        res = self.o.apply_actions(job, copy.deepcopy(plan), {"actions": [
+            {"action": "raise_bar", "scope": "contract", "criteria": ["Types have doc comments on every field"],
+             "why": "x"}]}, {"kind": "open_issues"})
+        self.assertTrue(any("hasn't started" in e for e in res["errors"]), res)
+        res = self.o.apply_actions(job, plan, {"actions": [
+            {"action": "retry", "task": "api", "instructions": "x", "done": ["Expired links return 410"]}]},
+            {"kind": "task_failed"})
+        self.assertIsNone(res.get("errors"), res)
+        self.assertEqual(plan["tasks"][1]["done"][-1], "Expired links return 410")
+        self.assertEqual(len(plan["tasks"][1]["done"]), 4, "a retry adds to the done criteria, never replaces them")
+
+    def test_validate_holds_the_plan_to_a_high_bar(self):
+        plan = base_plan(self.repo)
+        plan["tasks"][1]["done"] = ["endpoint works properly"]
+        del plan["acceptance"]
+        errs, warns, _ = self.o.validate(plan)
+        self.assertTrue(any("T2 task needs at least 3 done criteria" in e for e in errs), errs)
+        self.assertTrue(any("plan.acceptance is required" in e for e in errs), errs)
+        self.assertTrue(any("vague" in w and "works" in w for w in warns), warns)
 
     def test_dashboard_serves_live_job_read_only(self):
         import threading
@@ -765,7 +873,8 @@ class OrchestrateTest(unittest.TestCase):
 
     def _independent_plan(self, n=3, **over):
         tasks = [{"id": f"t{i}", "title": f"t{i}", "type": "feature:web", "tier": "T1", "goal": "g",
-                  "owns": [f"apps/web/src/t{i}/**"], "done": ["x"], "verify": [f"test -f apps/web/src/t{i}/a.ts"]}
+                  "owns": [f"apps/web/src/t{i}/**"], "done": [f"t{i}/a.ts exists", f"t{i} is exported"],
+                  "verify": [f"test -f apps/web/src/t{i}/a.ts"]}
                  for i in range(n)]
         return base_plan(self.repo, tasks=tasks, **over)
 
@@ -846,7 +955,8 @@ class OrchestrateTest(unittest.TestCase):
         self.assertTrue(any("apps/api/share/store.go" in w for w in gaps), warns)
         self.assertTrue(any("apps/web/src/share/api.ts" in w for w in gaps), warns)
         plan["tasks"].append({"id": "mig", "title": "m", "type": "feature:api", "tier": "T1", "goal": "g",
-                              "owns": ["apps/api/migrations/**"], "done": ["x"], "verify": ["make test-api"]})
+                              "owns": ["apps/api/migrations/**"], "done": ["table exists", "down migration drops it"],
+                              "verify": ["make test-api"]})
         errs, _, _ = self.o.validate(plan)
         self.assertTrue(any("needs a \"gate\"" in e for e in errs), errs)
 

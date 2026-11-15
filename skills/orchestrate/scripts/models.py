@@ -29,10 +29,11 @@ DEFAULT_EFFORT = {"haiku": "medium", "sonnet": "high", "opus": "medium", "fable"
 FALLBACK = {"fable": "opus"}
 
 ROLES: dict[str, tuple[str, str]] = {
-    # One call that decides the whole job: decomposition, ownership, verify commands.
-    # [CHOOSE] matrix: Fable 5.2 for "the highest available capability ... analysis carried
-    # through to a finished document"; Fable for "demanding reasoning" [COST]. Default effort.
-    "planner": ("fable", "high"),
+    # One call that decides the whole job: decomposition, ownership, the definition of done.
+    # Opus 5.5 (the user's choice): [CHOOSE] "complex agentic coding and enterprise work ...
+    # large-scale refactoring, complex systems engineering". high, not the default medium: the
+    # plan sets the bar for every later step, and [COST] measured high above medium on coding.
+    "planner": ("opus", "high"),
     # Small decisions in a long job. [COST] "For most agent workloads, start with Claude
     # Opus 5.5 at its default effort (medium)". Our sweep: opus/medium 13/13 (= opus/high).
     "manager": ("opus", "medium"),

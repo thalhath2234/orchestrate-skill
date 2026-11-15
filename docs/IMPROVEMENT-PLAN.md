@@ -45,7 +45,7 @@ Sources: [choosing a model](https://platform.claude.com/docs/en/about-claude/mod
 
 | Role | Before | Now | Anthropic's reason | Our eval |
 |---|---|---|---|---|
-| Planner | opus/high | **fable/high** | Fable 5.2 for "demanding reasoning" and "analysis carried through to a finished document"; high is its default | no planner evals yet |
+| Planner | opus/high | opus/high (Fable was tried, then reverted at the user's request) | Opus 5.5 for "complex agentic coding and enterprise work". high, not the default medium: the plan sets the bar for every later step | no planner evals yet |
 | Final reviewer | opus/high | **fable/high** | defect search: Fable 5.2 beat Opus 5.5 at high by 1.6–5.9 points | 6/6, $0.69/call, against 6/6 at $0.28 on opus/high; fable/medium 6/6 at $0.52. The suite is saturated |
 | Area reviewers | opus/high | opus/high | Opus where accuracy is required; low effort cost 34 points on defect search | (as before) |
 | Manager | opus/high | **opus/medium** | "For most agent workloads, start with Claude Opus 5.5 at its default effort (medium)" | 13/13, same as opus/high |
@@ -70,6 +70,22 @@ Sources: [choosing a model](https://platform.claude.com/docs/en/about-claude/mod
 **Compatibility.** Ledger rows get their rung re-derived from (model, effort). Floors are now stored as `floor_cfg`. v1 floors and proposals, which store a rung index, are mapped through the old ladder. There's a test for this.
 
 **Cost to watch.** A fresh Fable session costs about $0.25 before doing anything, measured with CLI 2.1.325. Planner plus final review add an estimated $1–5 per job over Opus. T2 tasks now start on Opus at low, which Anthropic prices at about 7% more per solved task than sonnet/high, and their failures re-run on the same model.
+
+### P7: the bar, a definition of done that only rises (2026-11-16)
+
+The user asked that every step define what done looks like, improve it from what other models find, and always set the bar high.
+
+| Step | What it does with the definition of done | Enforced by |
+|---|---|---|
+| Planner | Writes `acceptance` (now required) and each task's `done` as checkable criteria. Needs at least 1/2/3/3 criteria for T0/T1/T2/T3 tasks; vague words ("works", "properly", "correctly"…) get a warning | `validate()` errors and warnings, plus the planner prompt |
+| Every task | Held to `UNIVERSAL_BAR` plus `plan.quality_bar`: tests that fail without the change incl. an error path; verify run by the agent; no TODO/dead code; errors handled at boundaries; conventions; everything wired. The brief numbers every item `[D#]`/`[U#]` | brief |
+| Subagent | `done_check` must show every id met with evidence. A gap is a failed attempt: retry, then escalation | `run_task.py --done-ids` |
+| Subagent → others | `raise_bar` proposes criteria for a not-started task or the job | `raise_bar()`: deduplicated, ≤3 per report, ≤40 per job |
+| Manager | `raise_bar` action. A retry's `done` is added to the old list. Any action that drops or rewords a `done`/`acceptance` criterion is rejected | `apply_actions` |
+| Reviewers | Told the bar (a violation is a major finding) and asked to `raise_bar` where it's too low, judging against the addition in the same review. Area reviewers' additions are merged. Each blocker/major finding becomes a "fixed and covered by a test" acceptance criterion that the next round must show met | `verify_and_review`, `enforce_acceptance` |
+| Lessons | Recurring bar items can become AGENTS.md rules (proposals the user approves) | `extract_lessons` |
+
+`report.md` lists every criterion added, with its source and scope. Only the user lowers the bar, by editing the plan. Tests: 5 new e2e/unit tests. The eval fixtures' `done` lists were raised to the new minimums, since they were all "X works (test)".
 
 **Not done yet:** run a real v0.6 job and fill in §6 from `metrics`. The installed copy is still v0.5 while hermes-phase6 runs, and the guard would stop that job on an update.
 

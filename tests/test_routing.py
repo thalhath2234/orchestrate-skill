@@ -232,7 +232,7 @@ class RoutingTest(unittest.TestCase):
         import models
         self.assertEqual(models.role("classifier"), ("haiku", "low"))
         self.assertEqual(models.role("manager"), ("opus", "medium"))
-        self.assertEqual(models.role("planner"), ("fable", "high"))
+        self.assertEqual(models.role("planner"), ("opus", "high"))
         self.assertEqual(models.role("reviewer"), ("fable", "high"))
         self.assertEqual(models.role("reviewer", {"max_model": "opus"}), ("opus", "high"))
         self.assertEqual(models.role("manager", {"models": {"manager": "sonnet/high"}}), ("sonnet", "high"))

@@ -191,6 +191,21 @@ def classify(task: str, rung: int, worker: dict, vout: str, repo: Path, timeout:
     return out
 
 
+def done_gaps(report, ids: list[str]) -> list[str]:
+    """Definition-of-done items the worker's own report doesn't show as met with evidence."""
+    rows = {str(r.get("id")): r for r in ((report or {}).get("done_check") or []) if isinstance(r, dict)}
+    gaps = []
+    for i in ids:
+        r = rows.get(i)
+        if r is None:
+            gaps.append(f"{i}: not reported")
+        elif not r.get("met"):
+            gaps.append(f"{i}: not met ({str(r.get('evidence', ''))[:200]})")
+        elif len(str(r.get("evidence", "")).strip()) < 4:
+            gaps.append(f"{i}: marked met without evidence")
+    return gaps
+
+
 def worker_prompt(task: str, repo: Path, verify_cmds: list[str], hint: str = "") -> str:
     v = "\n".join(f"  {c}" for c in verify_cmds)
     return f"""{task}
@@ -238,6 +253,9 @@ def main(argv=None) -> int:
     ap.add_argument("--budget-usd", type=float, help="stop when this run has spent this much")
     ap.add_argument("--exclude-dynamic-prompt", action="store_true",
                     help="pass --exclude-dynamic-system-prompt-sections (cache reuse across worktrees)")
+    ap.add_argument("--done-ids", nargs="*", default=[],
+                    help="definition-of-done ids ([D1].., [U1]..) the report's done_check must show "
+                         "met with evidence; a gap counts as a failed attempt")
     ap.add_argument("--max-model", choices=models.MODEL_ORDER,
                     help="never route or escalate above this model (e.g. opus: no Fable)")
     ap.add_argument("--advisor", choices=["sonnet", "opus", "fable"],
@@ -284,7 +302,8 @@ def main(argv=None) -> int:
         metrics: dict = {}
         for attempt in range(1, a.attempts + 1):
             prompt = worker_prompt(a.task, repo, a.verify, hint) if attempt == 1 else (
-                "Verification still fails. Fix it. Output:\n" + vout[-5000:])
+                "Verification still fails. Fix it, then end with your full JSON report again. "
+                "Output:\n" + vout[-5000:])
             log(f"attempt {attempt}/{a.attempts} at {model}/{effort}")
             worker = claude(prompt, model, effort, repo, perm=a.permission_mode,
                             tools=a.allowed_tools, resume=session, timeout=a.claude_timeout,
@@ -302,6 +321,14 @@ def main(argv=None) -> int:
                 vout = str(worker.get("result"))
                 break
             ok, vout = verify(a.verify, repo, a.verify_timeout)
+            if ok and a.done_ids:
+                gaps = done_gaps(worker.get("structured"), a.done_ids)
+                if gaps:
+                    ok = False
+                    vout = ("The verify commands pass, but your definition of done is not met yet. "
+                            "Finish these items, then report a done_check entry with evidence for "
+                            "every id:\n" + "\n".join(f"- {g}" for g in gaps))
+                    log(f"done check: {len(gaps)} gap(s): {'; '.join(gaps)[:400]}")
             if ok:
                 break
         step = {"config": f"{model}/{effort}", "probe": probe, "ok": ok, "cost_usd": round(cost, 6),
