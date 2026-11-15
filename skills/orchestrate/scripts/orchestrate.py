@@ -53,7 +53,7 @@ JOBS = router.DIR / "jobs"
 PLANS = router.DIR / "plans"
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 EXIT = {"done": 0, "invalid": 2, "environment": 3, "failed": 4, "awaiting_approval": 5,
-        "review_failed": 6, "budget": 7, "interrupted": 130}
+        "review_failed": 6, "budget": 7, "awaiting_human": 8, "interrupted": 130}
 
 # Defaults for capacity (override in plan.json or env)
 MEM_PER_AGENT_GB = float(os.environ.get("ORCHESTRATE_MEM_PER_AGENT_GB", "1.5"))
@@ -573,6 +573,9 @@ def build_brief(plan: dict, task: dict, repo: Path, upstream: dict) -> str:
         for d in task["depends_on"]:
             u = upstream.get(d, {})
             r = u.get("report") or {}
+            if u.get("status") == "skipped":
+                L += [f"### {d}: {u.get('title', '')} (SKIPPED by the manager: {u.get('skip_reason', '')})"]
+                continue
             L += [f"### {d}: {u.get('title', '')}",
                   f"- Summary: {r.get('summary', '(no report)')}"]
             if r.get("interfaces"):
@@ -584,6 +587,9 @@ def build_brief(plan: dict, task: dict, repo: Path, upstream: dict) -> str:
         L.append("")
     if task.get("interfaces"):
         L += ["## Interfaces you must provide or respect", task["interfaces"].strip(), ""]
+    if task.get("notes"):
+        L += ["## Notes from the manager (earlier attempts and new information; follow these)",
+              *[f"- {n}" for n in task["notes"]], ""]
     L += ["## Done looks like", *[f"- {d}" for d in task["done"]],
           "- These commands pass (run them yourself before finishing):",
           *[f"  - `{c}`" for c in task["verify"]],
@@ -734,6 +740,8 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int) ->
         cmd += ["--extra-tools", *plan["extra_tools"]]
     if plan.get("sandbox"):
         cmd.append("--sandbox")
+    if "max_escalations" in plan:
+        cmd += ["--max-escalations", str(int(plan["max_escalations"]))]
     cmd.append(brief)
     env = {**os.environ, "ORCHESTRATE_SLOT": str(slot), "ORCHESTRATE_JOB": job.id,
            "ORCHESTRATE_TASK": task["id"]}
@@ -745,7 +753,8 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int) ->
                for s in summary.get("steps", []))
     return {"ok": p.returncode == 0, "result": summary.get("result", f"exit {p.returncode}"),
             "steps": summary.get("steps", []), "proposals": summary.get("proposals", []),
-            "report": report, "cost_usd": cost, "wt": str(wt), "branch": br}
+            "report": report, "cost_usd": cost, "wt": str(wt), "branch": br,
+            "final_message": (summary.get("final_message") or "")[-3000:]}
 
 
 def commit_and_merge(job: Job, plan: dict, task: dict, res: dict) -> tuple[bool, str]:
@@ -799,53 +808,55 @@ End with a JSON block: {{"resolved": true|false, "notes": "..."}}"""
     return True, "resolved"
 
 
-def review_phase(job: Job, plan: dict) -> str:
+def verify_and_review(job: Job, plan: dict, rnd_no: int) -> tuple[dict, list[dict]]:
+    """Final verify on the integration branch, then a fresh-context review. Returns (verdict, blocking)."""
+    integ = Path(job.state["integration_wt"])
+    code, vout = 0, ""
+    for c in plan["verify"]:
+        code, out = sh(c, integ, 1800)
+        vout += f"$ {c}\n{out[-4000:]}\n"
+        if code:
+            break
+    rnd = {"round": rnd_no, "final_verify_ok": code == 0, "final_verify_tail": vout[-3000:]}
+    job.state["review"]["rounds"].append(rnd)
+    job.save()
+    verdict = {"verdict": "changes_requested", "summary": "final verify failed",
+               "findings": [{"severity": "blocker", "issue": "final verify failed",
+                             "evidence": vout[-1500:]}]} if code else review_once(job, plan, vout)
+    rnd["verdict"] = verdict
+    job.save()
+    blocking = [f for f in verdict.get("findings", []) if f.get("severity") in ("blocker", "major")]
+    if verdict.get("verdict") == "pass":
+        blocking = []
+    return verdict, blocking
+
+
+def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) -> None:
+    """One fix subagent on the integration branch (used when the manager is off or defers)."""
     integ = Path(job.state["integration_wt"])
     ident = git_ident(Path(job.state["repo"]))
-    rounds = int(plan.get("review_rounds", 2))
     area = plan.get("area", "cross")
     union = sorted({p for t in plan["tasks"] for p in t["owns"]} | set(plan.get("review_may_edit", [])))
-    for r in range(1, rounds + 1):
-        code, vout = 0, ""
-        for c in plan["verify"]:
-            code, out = sh(c, integ, 1800)
-            vout += f"$ {c}\n{out[-4000:]}\n"
-            if code:
-                break
-        rnd = {"round": r, "final_verify_ok": code == 0, "final_verify_tail": vout[-3000:]}
-        job.state["review"]["rounds"].append(rnd)
-        job.save()
-        verdict = {"verdict": "changes_requested", "summary": "final verify failed",
-                   "findings": [{"severity": "blocker", "issue": "final verify failed",
-                                 "evidence": vout[-1500:]}]} if code else review_once(job, plan, vout)
-        rnd["verdict"] = verdict
-        job.save()
-        blocking = [f for f in verdict.get("findings", []) if f.get("severity") in ("blocker", "major")]
-        if verdict.get("verdict") == "pass" or not blocking:
-            return "done"
-        if r == rounds:
-            break
-        log(f"review round {r}: {len(blocking)} blocking finding(s); running a fix subagent")
-        scope = (f"{shlex.quote(sys.executable)} {shlex.quote(str(HERE / 'orchestrate.py'))} scope-check "
-                 + " ".join(f"--owns {shlex.quote(p)}" for p in union))
-        task = ("Fix these review findings on the integration branch of job "
-                f"\"{job.id}\" ({plan['goal']}). Do not commit.\n\n"
-                + json.dumps(blocking, indent=2)
-                + "\n\nAcceptance criteria for the whole job:\n"
-                + "\n".join(f"- {a}" for a in plan.get("acceptance", [])))
-        cmd = [sys.executable, str(HERE / "run_task.py"), "--repo", str(integ), "--type",
-               f"bugfix:{area}", "--tier", "T2", "--no-baseline", "--max-escalations", "1",
-               "--verify", scope, *sum((["--verify", v] for v in plan["verify"]), []), task]
-        with open(job.dir / "logs" / f"_fix-round-{r}.log", "a") as fh:
-            p = subprocess.run(cmd, cwd=integ, stdout=subprocess.PIPE, stderr=fh, text=True)
-        s = extract_json(p.stdout) or {}
-        job.state["cost_usd"] += sum((x.get("cost_usd") or 0) for x in s.get("steps", []))
-        rnd["fix"] = {"result": s.get("result"), "steps": s.get("steps")}
-        git(integ, "add", "-A")
-        if git(integ, "diff", "--cached", "--name-only"):
-            git(integ, *ident, "commit", "-q", "-m", f"orchestrate({job.id}): review fixes round {r}")
-        job.save()
-    return "review_failed"
+    log(f"review round {rnd_no}: {len(blocking)} blocking finding(s); running a fix subagent")
+    scope = (f"{shlex.quote(sys.executable)} {shlex.quote(str(HERE / 'orchestrate.py'))} scope-check "
+             + " ".join(f"--owns {shlex.quote(p)}" for p in union))
+    task = ("Fix these review findings on the integration branch of job "
+            f"\"{job.id}\" ({plan['goal']}). Do not commit.\n\n"
+            + json.dumps(blocking, indent=2)
+            + "\n\nAcceptance criteria for the whole job:\n"
+            + "\n".join(f"- {a}" for a in plan.get("acceptance", [])))
+    cmd = [sys.executable, str(HERE / "run_task.py"), "--repo", str(integ), "--type",
+           f"bugfix:{area}", "--tier", "T2", "--no-baseline", "--max-escalations", "1",
+           "--verify", scope, *sum((["--verify", v] for v in plan["verify"]), []), task]
+    with open(job.dir / "logs" / f"_fix-round-{rnd_no}.log", "a") as fh:
+        p = subprocess.run(cmd, cwd=integ, stdout=subprocess.PIPE, stderr=fh, text=True)
+    s = extract_json(p.stdout) or {}
+    job.state["cost_usd"] += sum((x.get("cost_usd") or 0) for x in s.get("steps", []))
+    job.state["review"]["rounds"][-1]["fix"] = {"result": s.get("result"), "steps": s.get("steps")}
+    git(integ, "add", "-A")
+    if git(integ, "diff", "--cached", "--name-only"):
+        git(integ, *ident, "commit", "-q", "-m", f"orchestrate({job.id}): review fixes round {rnd_no}")
+    job.save()
 
 
 def review_once(job: Job, plan: dict, verify_out: str) -> dict:
@@ -904,12 +915,234 @@ def guard_snapshot() -> str:
     """Fingerprint of the orchestrate skill files: subagents must never modify them."""
     import hashlib
     h = hashlib.sha256()
-    for d in (HERE.parent, HERE.parents[1] / "orchestrate-plan", HERE.parents[1] / "orchestrate-review"):
+    for d in [HERE.parent, *sorted(HERE.parents[1].glob("orchestrate-*"))]:
         for f in sorted(d.rglob("*")) if d.is_dir() else []:
             if f.is_file() and "__pycache__" not in f.parts:
                 h.update(str(f.relative_to(d.parent)).encode())
                 h.update(f.read_bytes())
     return h.hexdigest()
+
+
+# ================================================================= manager ===
+MANAGER_DEFAULTS = {"enabled": True, "model": "opus", "effort": "high",
+                    "max_interventions": 12, "max_task_retries": 2}
+TASK_FIELDS = ("id", "title", "goal", "type", "tier", "owns", "reads", "depends_on", "interfaces",
+               "done", "verify", "gate", "baseline")
+
+
+def manager_cfg(plan: dict) -> dict:
+    return {**MANAGER_DEFAULTS, **(plan.get("manager") or {})}
+
+
+def manager_state(job: Job) -> dict:
+    return job.state.setdefault("manager", {"session": None, "interventions": 0, "log": []})
+
+
+def job_snapshot(job: Job, plan: dict) -> str:
+    rows = []
+    for t in plan["tasks"]:
+        st = job.state["tasks"].get(t["id"], {})
+        rep = st.get("report") or {}
+        rows.append({"id": t["id"], "title": t["title"], "type": t["type"], "tier": t["tier"],
+                     "status": st.get("status"), "depends_on": t.get("depends_on", []),
+                     "owns": t["owns"], "gate": t.get("gate"),
+                     "model_path": " -> ".join(x.get("config", "?") for x in st.get("steps") or []),
+                     "summary": rep.get("summary"), "open_issues": rep.get("open_issues"),
+                     "error": st.get("error"), "notes": t.get("notes")})
+    return json.dumps({"goal": plan["goal"], "acceptance": plan.get("acceptance", []),
+                       "decisions": plan.get("decisions", []), "non_goals": plan.get("non_goals", []),
+                       "budget_usd": plan.get("budget_usd"), "cost_usd": round(job.state.get("cost_usd", 0), 2),
+                       "verify": plan["verify"], "tasks": rows}, indent=1)[:24000]
+
+
+def ask_manager(job: Job, plan: dict, event: dict) -> dict:
+    cfg, m = manager_cfg(plan), manager_state(job)
+    if m["interventions"] >= cfg["max_interventions"]:
+        return {"note": "intervention limit reached",
+                "actions": [{"action": "ask_human", "question":
+                             f"The manager reached its limit of {cfg['max_interventions']} interventions. "
+                             f"Latest event: {event.get('kind')} {event.get('task', '')}. How should we proceed?"}]}
+    m["interventions"] += 1
+    integ = Path(job.state["integration_wt"])
+
+    def prompt(fresh: bool) -> str:
+        head = (skill_text("orchestrate-manage") + "\n\n---\n") if fresh else ""
+        return (f"ORCHESTRATE_MANAGE\n{head}You are the MANAGER of job \"{job.id}\".\n"
+                f"EVENT: {event['kind']}\n{json.dumps(event, indent=1)[:14000]}\n\n"
+                f"JOB STATE NOW:\n{job_snapshot(job, plan)}\n\n"
+                "Reply with ONLY the JSON object described in \"Manager output\".")
+
+    res = claude(prompt(not m["session"]), cfg["model"], cfg["effort"], integ, perm="dontAsk",
+                 tools=["Read", "Grep", "Glob"], resume=m["session"])
+    if res.get("is_error") and m["session"]:  # lost session: start a fresh one with the playbook
+        res = claude(prompt(True), cfg["model"], cfg["effort"], integ, perm="dontAsk",
+                     tools=["Read", "Grep", "Glob"])
+    m["session"] = res.get("session_id") or m["session"]
+    job.state["cost_usd"] += res.get("total_cost_usd") or 0
+    decision = extract_json(str(res.get("result", ""))) or {}
+    if not isinstance(decision.get("actions"), list):
+        decision = {"note": "manager output unparseable: " + str(res.get("result"))[-300:],
+                    "actions": [{"action": "none"}]}
+    return decision
+
+
+def apply_actions(job: Job, plan: dict, decision: dict, event: dict) -> dict:
+    """Validate the manager's actions as one transaction; apply all or none."""
+    import copy
+    cfg = manager_cfg(plan)
+    new = copy.deepcopy(plan)
+    tasks = {t["id"]: t for t in new["tasks"]}
+    st_ops: list = []          # deferred job-state changes
+    errs: list[str] = []
+    out = {"hint": None, "added": [], "applied": [], "question": None, "reason": None}
+
+    def status(tid):
+        return job.state["tasks"].get(tid, {}).get("status")
+
+    def clean_task(t: dict) -> dict:
+        return {k: t[k] for k in TASK_FIELDS if k in t}
+
+    for a in decision.get("actions", []):
+        kind = a.get("action")
+        tid = a.get("task")
+        if kind == "none":
+            continue
+        if kind == "retry":
+            if tid not in tasks or status(tid) not in ("failed", "blocked", "pending"):
+                errs.append(f"retry {tid}: only failed/blocked/not-started tasks can be retried")
+                continue
+            n = job.state["tasks"][tid].get("manager_retries", 0)
+            if n >= cfg["max_task_retries"]:
+                errs.append(f"retry {tid}: already retried {n} times (max {cfg['max_task_retries']}); "
+                            "split it or ask_human")
+                continue
+            t = tasks[tid]
+            if a.get("instructions"):
+                t.setdefault("notes", []).append(a["instructions"])
+            for k in ("tier", "owns", "reads", "verify", "done"):
+                if a.get(k):
+                    t[k] = a[k]
+            st_ops.append(("retry", tid, n + 1))
+        elif kind == "split":
+            if tid not in tasks or status(tid) in ("done", "running"):
+                errs.append(f"split {tid}: only tasks that are not done/running can be split")
+                continue
+            parts = [clean_task(x) for x in a.get("into") or []]
+            if len(parts) < 2:
+                errs.append(f"split {tid}: needs at least two tasks in 'into'")
+                continue
+            old = tasks.pop(tid)
+            for x in parts:
+                x.setdefault("depends_on", list(old.get("depends_on", [])))
+                if old.get("gate") and not x.get("gate"):
+                    x["gate"] = old["gate"]  # a gated task's pieces stay gated
+                tasks[x["id"]] = x
+            ids = [x["id"] for x in parts]
+            for t in tasks.values():
+                if tid in t.get("depends_on", []):
+                    t["depends_on"] = [d for d in t["depends_on"] if d != tid] + ids
+            st_ops.append(("split", tid, ids))
+        elif kind == "add_task":
+            t = clean_task(a.get("task") or {})
+            if not t.get("id") or t["id"] in tasks or t["id"] in job.state["tasks"]:
+                errs.append(f"add_task: id {t.get('id')!r} missing or already used")
+                continue
+            tasks[t["id"]] = t
+            st_ops.append(("add", t["id"], None))
+        elif kind == "amend":
+            if tid not in tasks or status(tid) not in ("pending", "blocked", "awaiting_approval"):
+                errs.append(f"amend {tid}: only tasks that have not started can be amended")
+                continue
+            if a.get("note"):
+                tasks[tid].setdefault("notes", []).append(a["note"])
+            if a.get("reads"):
+                tasks[tid]["reads"] = sorted(set(tasks[tid].get("reads", [])) | set(a["reads"]))
+        elif kind == "skip":
+            if tid not in tasks or status(tid) in ("done", "running"):
+                errs.append(f"skip {tid}: cannot skip a done/running task")
+                continue
+            st_ops.append(("skip", tid, a.get("reason", "")))
+        elif kind in ("accept", "fix_round"):
+            if event.get("kind") != "review_changes_requested":
+                errs.append(f"{kind}: only valid for a review event")
+                continue
+            if kind == "accept" and any(f.get("severity") == "blocker" for f in event.get("findings", [])):
+                errs.append("accept: blocker findings can't be accepted by the manager; use ask_human")
+                continue
+            out["hint"], out["reason"] = kind, a.get("reason", "")
+        elif kind == "ask_human":
+            out["hint"], out["question"] = "ask_human", a.get("question") or "The manager needs your input."
+        elif kind == "abort":
+            out["hint"], out["reason"] = "abort", a.get("reason", "")
+        else:
+            errs.append(f"unknown action {kind!r}")
+            continue
+        out["applied"].append(a)
+
+    new["tasks"] = list(tasks.values())
+    if not errs:
+        verrs, _, _ = validate(new)
+        errs += [f"plan invalid after actions: {e}" for e in verrs]
+    if errs:
+        return {"hint": None, "added": [], "applied": [], "errors": errs}
+    # commit: plan + state
+    plan.clear()
+    plan.update(new)
+    write_json(job.dir / "plan.json", plan)
+    for op, tid, arg in st_ops:
+        if op == "retry":
+            job.state["tasks"][tid].update(status="pending", manager_retries=arg, error=None)
+        elif op == "split":
+            job.state["tasks"][tid]["status"] = "split"
+            job.state["tasks"][tid]["split_into"] = arg
+            for x in arg:
+                t = next(t for t in plan["tasks"] if t["id"] == x)
+                job.state["tasks"][x] = {"status": "pending", "title": t["title"], "type": t["type"],
+                                         "tier": t["tier"], "added_by": "manager"}
+            out["added"] += arg
+        elif op == "add":
+            t = next(t for t in plan["tasks"] if t["id"] == tid)
+            job.state["tasks"][tid] = {"status": "pending", "title": t["title"], "type": t["type"],
+                                       "tier": t["tier"], "added_by": "manager"}
+            out["added"].append(tid)
+        elif op == "skip":
+            job.state["tasks"][tid].update(status="skipped", skip_reason=arg)
+    # a blocked task whose failed upstream is now pending/skipped becomes runnable again
+    for t in plan["tasks"]:
+        st = job.state["tasks"][t["id"]]
+        if st["status"] == "blocked" and not any(
+                job.state["tasks"].get(d, {}).get("status") in ("failed", "blocked") for d in t.get("depends_on", [])):
+            st["status"] = "pending"
+    return out
+
+
+def manage(job: Job, plan: dict, event: dict) -> dict:
+    """Ask the manager, apply its actions (one corrective re-ask if they are invalid), log it."""
+    if not manager_cfg(plan)["enabled"]:
+        return {"hint": None, "added": [], "applied": []}
+    log(f"manager: {event['kind']} {event.get('task', '')}".rstrip())
+    decision = ask_manager(job, plan, event)
+    result = apply_actions(job, plan, decision, event)
+    entry = {"t": time.time(), "event": event["kind"], "task": event.get("task"),
+             "note": decision.get("note"), "actions": decision.get("actions")}
+    if result.get("errors"):
+        entry["rejected"] = result["errors"]
+        retry_event = {"kind": "rejected_actions", "errors": result["errors"], "previous_event": event,
+                       "task": event.get("task")}
+        decision = ask_manager(job, plan, retry_event)
+        result = apply_actions(job, plan, decision, event)
+        entry["second_try"] = {"note": decision.get("note"), "actions": decision.get("actions"),
+                               "rejected": result.get("errors")}
+        if result.get("errors"):
+            result = {"hint": "ask_human", "added": [], "applied": [],
+                      "question": "The manager's proposed changes were invalid twice: "
+                                  + "; ".join(result["errors"])[:600] + ". How should we proceed?"}
+    manager_state(job)["log"].append(entry)
+    job.save()
+    for a in result.get("applied", []):
+        t = a.get("task")
+        log(f"manager -> {a.get('action')} {t if isinstance(t, str) else (t or {}).get('id', '')}".rstrip())
+    return result
 
 
 def mark_blocked(job: Job, plan: dict) -> None:
@@ -925,8 +1158,156 @@ def mark_blocked(job: Job, plan: dict) -> None:
                 changed = True
 
 
+def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
+    """Schedule pending tasks until none can run. Returns an exit code to stop, or None if all done."""
+    integ = Path(job.state["integration_wt"])
+    repo = Path(job.state["repo"])
+    budget = plan.get("budget_usd")
+    running: dict[cf.Future, str] = {}
+    free_slots = list(range(cap))
+    pool = cf.ThreadPoolExecutor(max_workers=cap)
+    stop_reason, human_q, abort_reason = None, None, None
+
+    def tasks():
+        return {t["id"]: t for t in plan["tasks"]}
+
+    def satisfied(d):
+        return job.state["tasks"].get(d, {}).get("status") in ("done", "skipped")
+
+    def react(tid: str, event: dict) -> None:
+        nonlocal stop_reason, human_q, abort_reason
+        r = manage(job, plan, event)
+        if r.get("hint") == "ask_human":
+            stop_reason, human_q = "ask_human", r.get("question")
+        elif r.get("hint") == "abort":
+            stop_reason, abort_reason = "abort", r.get("reason")
+
+    try:
+        while True:
+            T = tasks()
+            mark_blocked(job, plan)
+            ready = [] if stop_reason else [
+                t for t in T if job.state["tasks"][t]["status"] in ("pending", "awaiting_approval")
+                and all(satisfied(d) for d in T[t].get("depends_on", []))]
+            launched = False
+            for tid in ready:
+                if len(running) >= cap:
+                    break
+                st = job.state["tasks"][tid]
+                if T[tid].get("gate") and tid not in job.state["approved"]:
+                    if st["status"] != "awaiting_approval":
+                        log(f"{tid} needs approval: {T[tid]['gate']}")
+                    st["status"] = "awaiting_approval"
+                    continue
+                if budget and job.state["cost_usd"] >= budget:
+                    stop_reason = "budget"
+                    break
+                if running and not admission_ok(float(plan.get("mem_per_agent_gb", MEM_PER_AGENT_GB))):
+                    break  # low memory right now: wait for a running task to finish
+                slot = free_slots.pop(0)
+                start_sha = git(integ, "rev-parse", "HEAD")
+                wt, br = prepare_worktree(job, tid, start_sha)
+                st.update(status="running", started=time.time(), start_sha=start_sha, slot=slot)
+                job.save()
+                log(f"start {tid} [{T[tid]['type']} {T[tid]['tier']}] slot {slot}")
+                running[pool.submit(exec_task, job, plan, T[tid], wt, br, slot)] = tid
+                launched = True
+            job.save()
+            if not running:
+                break
+            done_set, _ = cf.wait(list(running), timeout=None if launched or not ready else 30,
+                                  return_when=cf.FIRST_COMPLETED)
+            for fut in done_set:
+                tid = running.pop(fut)
+                st = job.state["tasks"][tid]
+                free_slots.append(st["slot"])
+                free_slots.sort()
+                try:
+                    res = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    res = {"ok": False, "result": "error", "error": repr(e)}
+                job.state["cost_usd"] += res.get("cost_usd") or 0
+                if guard_snapshot() != ctx["guard"]:
+                    st.update(status="failed", error="modified the orchestrate skill files")
+                    for t2 in running.values():
+                        job.state["tasks"][t2]["status"] = "pending"
+                    job.save()
+                    return finish(job, plan, "failed",
+                                  f"SECURITY: a subagent ({tid} or one running alongside it) modified "
+                                  f"the orchestrate skill files in {HERE.parent}. Job stopped. "
+                                  "Inspect them (git diff in the skill's repo) before resuming.")
+                now_main = (git(repo, "rev-parse", "HEAD"), git(repo, "status", "--porcelain"))
+                if now_main != ctx["main_before"]:
+                    job.state.setdefault("warnings", []).append(
+                        f"your main checkout changed while {tid} ran; make sure those edits are yours")
+                    ctx["main_before"] = now_main
+                st.update(ended=time.time(), result=res.get("result"), steps=res.get("steps"),
+                          report=res.get("report"), proposals=res.get("proposals"),
+                          cost_usd=res.get("cost_usd"), error=res.get("error"),
+                          final_message=res.get("final_message"))
+                if res.get("ok"):
+                    try:
+                        ok, info = commit_and_merge(job, plan, T[tid], res)
+                    except Exception as e:  # noqa: BLE001
+                        ok, info = False, f"commit/merge error: {e}"
+                    if ok:
+                        st.update(status="done", files=json.loads(info))
+                        log(f"done  {tid} ({len(st['files'])} files merged)")
+                        issues = (res.get("report") or {}).get("open_issues") or []
+                        if issues:
+                            job.save()
+                            react(tid, {"kind": "open_issues", "task": tid, "open_issues": issues,
+                                        "report": res.get("report"), "files": st["files"]})
+                    else:
+                        st.update(status="failed", error=info)
+                        log(f"FAIL  {tid}: {info}")
+                else:
+                    st["status"] = "failed"
+                    log(f"FAIL  {tid}: {res.get('result')} {res.get('error') or ''}".strip())
+                if st["status"] == "failed":
+                    job.save()
+                    logtail = (read_text(job.dir / "logs" / f"{tid}.log") or "")[-5000:]
+                    react(tid, {"kind": "task_failed", "task": tid, "task_def": T[tid],
+                                "result": st.get("result"), "error": st.get("error"),
+                                "steps": st.get("steps"), "report": st.get("report"),
+                                "final_message": (st.get("final_message") or "")[-2000:],
+                                "log_tail": logtail})
+                job.save()
+    except KeyboardInterrupt:
+        for fut, tid in running.items():
+            job.state["tasks"][tid]["status"] = "pending"
+        return finish(job, plan, "interrupted", "interrupted by user")
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+    if stop_reason == "abort":
+        return finish(job, plan, "failed", f"manager aborted the job: {abort_reason}")
+    if stop_reason == "ask_human":
+        job.state["human_question"] = human_q
+        return finish(job, plan, "awaiting_human",
+                      f"the manager needs your input: {human_q}\nAnswer with: orchestrate.py resume "
+                      f"{job.id} --answer \"...\"")
+    T = tasks()
+    statuses = {t: job.state["tasks"][t]["status"] for t in T}
+    if any(s in ("failed", "blocked") for s in statuses.values()):
+        bad = {t: s for t, s in statuses.items() if s in ("failed", "blocked")}
+        env = [t for t in bad if job.state["tasks"][t].get("result") == "environment"]
+        msg = (f"tasks failed/blocked: {bad}. Logs: {job.dir / 'logs'}. "
+               f"Fix and `orchestrate.py resume {job.id}` (done tasks are kept).")
+        return finish(job, plan, "environment" if env and len(env) == len(
+            [t for t in bad if bad[t] == "failed"]) else "failed", msg)
+    if stop_reason == "budget" or (budget and any(s == "pending" for s in statuses.values())):
+        return finish(job, plan, "budget", f"budget ${budget} reached")
+    if any(s == "awaiting_approval" for s in statuses.values()):
+        waiting = [t for t, s in statuses.items() if s == "awaiting_approval"]
+        return finish(job, plan, "awaiting_approval",
+                      f"waiting for approval: {waiting}. Resume with: orchestrate.py resume {job.id} "
+                      + " ".join(f"--approve {w}" for w in waiting))
+    return None
+
+
 def run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
-            skip_baseline: bool) -> int:
+            skip_baseline: bool, answer: str | None = None) -> int:
     job.state["pid"] = os.getpid()
     job.state["approved"] = sorted(set(job.state.get("approved", [])) | set(approve))
     job.save()
@@ -949,120 +1330,55 @@ def run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
         job.state["baseline_ok"] = True
         job.save()
 
-    guard = guard_snapshot()
-    main_before = (git(repo, "rev-parse", "HEAD"), git(repo, "status", "--porcelain"))
+    if job.state.get("human_question"):
+        if not answer:
+            return finish(job, plan, "awaiting_human",
+                          f"still waiting for your answer: {job.state['human_question']}\n"
+                          f"Answer with: orchestrate.py resume {job.id} --answer \"...\"")
+        q = job.state.pop("human_question")
+        r = manage(job, plan, {"kind": "human_answer", "question": q, "answer": answer})
+        if r.get("hint") == "ask_human":
+            job.state["human_question"] = r.get("question")
+            return finish(job, plan, "awaiting_human", f"the manager needs your input: {r.get('question')}")
+        if r.get("hint") == "abort":
+            return finish(job, plan, "failed", f"manager aborted the job: {r.get('reason')}")
+
+    ctx = {"guard": guard_snapshot(),
+           "main_before": (git(repo, "rev-parse", "HEAD"), git(repo, "status", "--porcelain"))}
     cap_info = capacity(plan, max_parallel)
-    cap = cap_info["cap"]
     job.state["capacity"] = cap_info
     job.save()
-    log(f"parallel cap = {cap} (limited by {cap_info['limited_by']}: {cap_info['limits']})")
-    tasks = {t["id"]: t for t in plan["tasks"]}
-    budget = plan.get("budget_usd")
-    running: dict[cf.Future, str] = {}
-    free_slots = list(range(cap))
-    pool = cf.ThreadPoolExecutor(max_workers=cap)
-    stop_reason = None
-    try:
-        while True:
-            mark_blocked(job, plan)
-            ready = [t for t in tasks if job.state["tasks"][t]["status"] in ("pending", "awaiting_approval")
-                     and all(job.state["tasks"][d]["status"] == "done" for d in tasks[t].get("depends_on", []))]
-            launched = False
-            for tid in ready:
-                if len(running) >= cap:
-                    break
-                st = job.state["tasks"][tid]
-                if tasks[tid].get("gate") and tid not in job.state["approved"]:
-                    if st["status"] != "awaiting_approval":
-                        log(f"{tid} needs approval: {tasks[tid]['gate']}")
-                    st["status"] = "awaiting_approval"
-                    continue
-                if budget and job.state["cost_usd"] >= budget:
-                    stop_reason = "budget"
-                    break
-                if running and not admission_ok(float(plan.get("mem_per_agent_gb", MEM_PER_AGENT_GB))):
-                    break  # low memory right now: wait for a running task to finish
-                slot = free_slots.pop(0)
-                start_sha = git(integ, "rev-parse", "HEAD")
-                wt, br = prepare_worktree(job, tid, start_sha)
-                st.update(status="running", started=time.time(), start_sha=start_sha, slot=slot)
-                job.save()
-                log(f"start {tid} [{tasks[tid]['type']} {tasks[tid]['tier']}] slot {slot}")
-                running[pool.submit(exec_task, job, plan, tasks[tid], wt, br, slot)] = tid
-                launched = True
-            job.save()
-            if not running:
-                break
-            if stop_reason and not running:
-                break
-            done_set, _ = cf.wait(list(running), timeout=None if launched or not ready else 30,
-                                  return_when=cf.FIRST_COMPLETED)
-            for fut in done_set:
-                tid = running.pop(fut)
-                st = job.state["tasks"][tid]
-                free_slots.append(st["slot"])
-                free_slots.sort()
-                try:
-                    res = fut.result()
-                except Exception as e:  # noqa: BLE001
-                    res = {"ok": False, "result": "error", "error": repr(e)}
-                job.state["cost_usd"] += res.get("cost_usd") or 0
-                if guard_snapshot() != guard:
-                    st.update(status="failed", error="modified the orchestrate skill files")
-                    job.save()
-                    for f2, t2 in running.items():
-                        job.state["tasks"][t2]["status"] = "pending"
-                    return finish(job, plan, "failed",
-                                  f"SECURITY: a subagent ({tid} or one running alongside it) modified "
-                                  f"the orchestrate skill files in {HERE.parent}. Job stopped. "
-                                  "Inspect them (git diff in the skill's repo) before resuming.")
-                now_main = (git(repo, "rev-parse", "HEAD"), git(repo, "status", "--porcelain"))
-                if now_main != main_before:
-                    job.state.setdefault("warnings", []).append(
-                        f"your main checkout changed while {tid} ran; make sure those edits are yours")
-                    main_before = now_main
-                st.update(ended=time.time(), result=res.get("result"), steps=res.get("steps"),
-                          report=res.get("report"), proposals=res.get("proposals"),
-                          cost_usd=res.get("cost_usd"), error=res.get("error"))
-                if res.get("ok"):
-                    try:
-                        ok, info = commit_and_merge(job, plan, tasks[tid], res)
-                    except Exception as e:  # noqa: BLE001
-                        ok, info = False, f"commit/merge error: {e}"
-                    if ok:
-                        st.update(status="done", files=json.loads(info))
-                        log(f"done  {tid} ({len(st['files'])} files merged)")
-                    else:
-                        st.update(status="failed", error=info)
-                        log(f"FAIL  {tid}: {info}")
-                else:
-                    st["status"] = "failed"
-                    log(f"FAIL  {tid}: {res.get('result')} {res.get('error') or ''}".strip())
-                job.save()
-    except KeyboardInterrupt:
-        for fut, tid in running.items():
-            job.state["tasks"][tid]["status"] = "pending"
-        return finish(job, plan, "interrupted", "interrupted by user")
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
-
-    statuses = {t: s["status"] for t, s in job.state["tasks"].items() if t in tasks}
-    if any(s in ("failed", "blocked") for s in statuses.values()):
-        bad = {t: s for t, s in statuses.items() if s in ("failed", "blocked")}
-        env = [t for t in bad if job.state["tasks"][t].get("result") == "environment"]
-        msg = (f"tasks failed/blocked: {bad}. Logs: {job.dir / 'logs'}. "
-               f"Fix and `orchestrate.py resume {job.id}` (done tasks are kept).")
-        return finish(job, plan, "environment" if env and len(env) == len(
-            [t for t in bad if bad[t] == "failed"]) else "failed", msg)
-    if stop_reason == "budget" or (budget and any(s == "pending" for s in statuses.values())):
-        return finish(job, plan, "budget", f"budget ${budget} reached")
-    if any(s == "awaiting_approval" for s in statuses.values()):
-        waiting = [t for t, s in statuses.items() if s == "awaiting_approval"]
-        return finish(job, plan, "awaiting_approval",
-                      f"waiting for approval: {waiting}. Resume with: orchestrate.py resume {job.id} "
-                      + " ".join(f"--approve {w}" for w in waiting))
-    log("all tasks merged; final verify + review")
-    return finish(job, plan, review_phase(job, plan), "")
+    log(f"parallel cap = {cap_info['cap']} (limited by {cap_info['limited_by']}: {cap_info['limits']})")
+    rounds = int(plan.get("review_rounds", 2))
+    while True:
+        code = run_tasks(job, plan, cap_info["cap"], ctx)
+        if code is not None:
+            return code
+        rnd_no = len(job.state["review"]["rounds"]) + 1
+        log(f"all tasks merged; final verify + review (round {rnd_no})")
+        verdict, blocking = verify_and_review(job, plan, rnd_no)
+        if not blocking:
+            return finish(job, plan, "done", "")
+        if rnd_no >= rounds:
+            return finish(job, plan, "review_failed",
+                          f"review still requests changes after {rnd_no} round(s): {verdict.get('summary', '')}")
+        r = manage(job, plan, {"kind": "review_changes_requested", "round": rnd_no,
+                               "summary": verdict.get("summary"), "findings": blocking,
+                               "final_verify_ok": job.state["review"]["rounds"][-1]["final_verify_ok"]})
+        hint = r.get("hint")
+        if hint == "accept":
+            job.state["review"]["accepted_by_manager"] = r.get("reason")
+            return finish(job, plan, "done", f"manager accepted the remaining findings: {r.get('reason')}")
+        if hint == "ask_human":
+            job.state["human_question"] = r.get("question")
+            return finish(job, plan, "awaiting_human",
+                          f"the manager needs your input: {r.get('question')}\nAnswer with: "
+                          f"orchestrate.py resume {job.id} --answer \"...\"")
+        if hint == "abort":
+            return finish(job, plan, "failed", f"manager aborted the job: {r.get('reason')}")
+        if r.get("added"):
+            continue  # the manager queued targeted fix tasks; run them, then review again
+        legacy_fix_round(job, plan, rnd_no, blocking)
 
 
 def finish(job: Job, plan: dict, status: str, message: str) -> int:
@@ -1093,6 +1409,23 @@ def render_report(job: Job, plan: dict) -> str:
         summ = ((st.get("report") or {}).get("summary") or st.get("error") or "").replace("\n", " ")[:120]
         L.append(f"| {t['id']} | {t['type']} {t['tier']} | {st.get('status')} | {path} | "
                  f"${(st.get('cost_usd') or 0):.2f} | {summ} |")
+    extra = [t for t, st in s["tasks"].items() if st.get("status") in ("split", "skipped")]
+    for t in extra:
+        st = s["tasks"][t]
+        why = f"split into {', '.join(st.get('split_into', []))}" if st["status"] == "split" else st.get("skip_reason", "")
+        L.append(f"| {t} | {st.get('type')} {st.get('tier')} | {st['status']} | - | - | {why} |")
+    if s.get("human_question"):
+        L += ["", f"**The manager is asking you:** {s['human_question']}",
+              f"Answer with: `orchestrate.py resume {job.id} --answer \"...\"`"]
+    mlog = (s.get("manager") or {}).get("log", [])
+    if mlog:
+        L += ["", f"Manager interventions ({len(mlog)}):"]
+        for e in mlog:
+            acts = ", ".join(f"{x.get('action')} {x.get('task') if isinstance(x.get('task'), str) else (x.get('task') or {}).get('id', '')}".strip()
+                             for x in (e.get("second_try") or e).get("actions") or [])
+            L.append(f"- on {e['event']} {e.get('task') or ''}: {acts or 'none'}. {e.get('note') or ''}".rstrip())
+            if e.get("rejected"):
+                L.append(f"  - first proposal rejected: {'; '.join(e['rejected'])[:300]}")
     issues = [(t, i) for t, st in s["tasks"].items() for i in ((st.get("report") or {}).get("open_issues") or [])]
     if issues:
         L += ["", "Open issues reported by subagents:", *[f"- **{t}**: {i}" for t, i in issues]]
@@ -1208,7 +1541,8 @@ def cmd_run(a, resume: bool = False) -> int:
                           "next": f"orchestrate.py wait {plan['job']} --timeout 540"}))
         return 0
     job = start_job(plan, plan_path)
-    return run_job(job, plan, a.approve or [], a.max_parallel, a.skip_baseline)
+    return run_job(job, plan, a.approve or [], a.max_parallel, a.skip_baseline,
+                   getattr(a, "answer", None))
 
 
 def cmd_status(a) -> int:
@@ -1223,7 +1557,9 @@ def cmd_status(a) -> int:
            "tasks": {t: {"status": x["status"], "type": x.get("type"), "tier": x.get("tier"),
                          "path": " → ".join(st.get("config", "?") for st in x.get("steps") or [])}
                      for t, x in s["tasks"].items()},
-           "message": s.get("message"), "report": str(job.dir / "report.md")}
+           "message": s.get("message"), "report": str(job.dir / "report.md"),
+           "manager_interventions": (s.get("manager") or {}).get("interventions", 0),
+           "human_question": s.get("human_question")}
     print(json.dumps(out, indent=2))
     return 0
 
@@ -1287,6 +1623,8 @@ def main(argv=None) -> int:
         r.add_argument("--max-parallel", type=int)
         r.add_argument("--detach", action="store_true")
         r.add_argument("--skip-baseline", action="store_true")
+        if name == "resume":
+            r.add_argument("--answer", help="your answer to the manager's question (status awaiting_human)")
     st = sub.add_parser("status"); st.add_argument("job", nargs="?")
     w = sub.add_parser("wait"); w.add_argument("job", nargs="?"); w.add_argument("--timeout", type=int, default=540)
     cl = sub.add_parser("clean"); cl.add_argument("job"); cl.add_argument("--branches", action="store_true")

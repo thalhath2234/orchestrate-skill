@@ -8,6 +8,15 @@ A multi-agent coding orchestrator for Claude Code, for single repos and monorepo
 4. Merge their work.
 5. Have a fresh Opus reviewer check it, and fix what it finds.
 
+A **manager agent** (one persistent Opus session per job) supervises the subagents throughout. When a task fails, a subagent reports something outside its scope, or the reviewer requests changes, the manager reads the logs and code and decides what to do:
+- retry with better instructions or corrected ownership
+- split a task that's too big
+- add a follow-up task
+- skip
+- ask you
+
+The script validates and applies its actions.
+
 Every subagent starts on the cheapest model likely to work and escalates on failure. Routing learns per task type, but only through proposals that you approve.
 
 ```
@@ -19,7 +28,9 @@ request ─► grill (rounds of questions → glossary/ADRs → you confirm) ─
                                  │ worktree + setup ─► brief ─► run_task ─► scope ✓ │ per task
                                  └──────────────────────┬───────────────────────────┘
                                    commit ─► merge into orchestrate/<job> (integrator on conflict)
-                                 ─► final verify ─► Opus review ─► fix round ─► report
+                                 ─► final verify ─► Opus review ─► report
+        manager (Opus, persistent) ◄── task failed · open issues · review findings · your answers
+                                   ──► retry · split · add_task · amend · skip · accept · ask you
 ```
 
 ## Install
@@ -32,13 +43,14 @@ npx skills add thalhath2234/orchestrate-skill -g
 claude plugin install orchestrate --marketplace thalhath2234/orchestrate-skill
 ```
 
-This installs four skills:
+This installs five skills:
 
 | Skill | For |
 |---|---|
 | `orchestrate` | The parent's playbook: grill, triage, single task or job, run, wait, handle outcomes |
 | `orchestrate-grill` | The interview before any plan: design-tree rounds with recommended answers, glossary and ADRs written as terms and decisions settle, and a closing summary you confirm. Matt Pocock's `grilling` + `domain-modeling`, vendored (see Credits) |
 | `orchestrate-plan` | How to plan: split by file ownership, contract first, tier each subtask, done criteria, monorepo rules, `plan.json` schema |
+| `orchestrate-manage` | The manager agent's playbook: events, diagnosis, actions, and when to ask you |
 | `orchestrate-review` | What the integrator and reviewer subagents check, severities, and output format |
 
 Requirements: Python 3.9+ (stdlib only), macOS or Linux, and `git` and `claude` on PATH.
@@ -62,7 +74,8 @@ python3 $S/orchestrate.py plan --repo . --goal "..."    # optional: Opus drafts 
 python3 $S/orchestrate.py validate plan.json            # waves, ownership conflicts, cap
 python3 $S/orchestrate.py brief plan.json <task-id>     # exact handoff a subagent will get
 python3 $S/orchestrate.py run plan.json --detach        # then:
-python3 $S/orchestrate.py wait <job> --timeout 540      # 0 done · 5 needs approval · 4 failed · 3 env · 6 review
+python3 $S/orchestrate.py wait <job> --timeout 540      # 0 done · 5 approval · 8 manager asks you · 4 failed · 3 env · 6 review
+python3 $S/orchestrate.py resume <job> --answer "..."   # answer the manager's question
 python3 $S/orchestrate.py resume <job> --approve <task> # after gates or fixes; done tasks are kept
 python3 $S/orchestrate.py clean <job> [--branches]
 
@@ -105,6 +118,7 @@ Validation rejects plans where tasks that can run at the same time own overlappi
 
 - **Edits stay in the worktree.** Subagents' file edits are confined to their worktree (`blockWritesOutsideWorkingDirectories`). A scope check rejects any change outside the task's owned paths and feeds the error back to the subagent. `"sandbox": true` in the plan adds an OS sandbox around their shell commands.
 - **The orchestrator watches its own files.** If a subagent modifies the orchestrate skill files, the job stops.
+- **The manager is bounded.** Its actions are validated as one all-or-nothing batch. It can't approve gates or change your decisions. It gets at most 12 interventions per job and 2 retries per task, then it asks you.
 - **Risky tasks wait for you.** Gated tasks (for example migrations) pause the job until you approve them.
 - **A job starts from your last commit and only writes to `orchestrate/<job>` branches.**
 - **You stay in charge of routing.** Routing changes and AGENTS.md notes are proposals that you approve.

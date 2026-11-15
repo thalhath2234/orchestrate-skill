@@ -76,6 +76,9 @@ Be as narrow as practical but include everything the task must create, including
   "mem_per_agent_gb": 2.5,                    // optional, heavier verify -> bigger
   "budget_usd": 15,                           // optional, stop launching tasks past this
   "review_rounds": 2,                         // review -> fix -> review (default 2)
+  "manager": {"enabled": true, "model": "opus", "effort": "high",
+              "max_interventions": 12, "max_task_retries": 2},   // optional; these are the defaults
+  "max_escalations": 2,                       // optional; model escalations per task before the manager steps in
   "area": "cross",                            // area used for review-fix routing
   "extra_tools": ["Bash(docker compose *)"],  // optional extra allowed tools for subagents
   "sandbox": false,                           // optional OS sandbox for subagents' shell (bwrap/

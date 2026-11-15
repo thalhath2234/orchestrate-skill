@@ -17,7 +17,18 @@ S=$(ls -d ~/.agents/skills/orchestrate/scripts ~/.claude/skills/orchestrate/scri
 Support skills, which you load when you reach that step:
 - **orchestrate-grill**: the interview that comes before any plan (Matt Pocock's grill-with-docs).
 - **orchestrate-plan**: how to plan, split, tier, assign file ownership and write `plan.json`.
+- **orchestrate-manage**: the playbook of the **manager agent** that supervises a running job. Load it to understand or second-guess its decisions.
 - **orchestrate-review**: what the integrator and reviewer subagents check. Load it if you need to judge a review.
+
+## Who does what
+
+| Role | Who | Does |
+|---|---|---|
+| **You** (the parent) | this conversation | grill the user, triage, plan, launch, relay the manager's questions, report |
+| **Manager** | one persistent Opus session per job | supervises every subagent: diagnoses failures, retries with better instructions, splits tasks that are too big, turns open issues and review findings into targeted tasks, asks the user when a decision is needed |
+| **Subagents** | `claude -p` workers in their own worktrees | do one task each, on the model routing picks |
+| **Integrator / reviewer** | fresh sessions | resolve merge conflicts, review the merged result |
+| `orchestrate.py` | script | capacity caps, worktrees, briefs, merging, and validating and applying the manager's actions |
 
 ## Step 1: Grill (always, first)
 
@@ -75,9 +86,20 @@ It picks the model and effort, retries, escalates and records the outcome. Exit 
 | 3 | environment | Baseline or setup failed. Show the error, fix the environment or the plan's `baseline`/`setup`, then `resume <job>`. |
 | 4 | failed | Read `~/.local/share/orchestrate/jobs/<job>/logs/<task>.log` and the report. Usually the fix is to split the task, add `reads`, clarify `done`, or correct `verify`. Edit `jobs/<job>/plan.json`, then `resume <job>`. Done tasks are kept. |
 | 6 | review_failed | Show the reviewer's findings. Ask the user whether to fix by hand, add a task and resume, or accept. |
+| 8 | awaiting_human | The **manager** needs a decision. The question (with its recommended answer) is in the report and in `status`. Put it to the user word for word, then pass their answer back: `resume <job> --answer "<their answer>" --detach`, and wait again. Don't answer it yourself. |
 | 7 | budget | Ask the user to raise `budget_usd` or stop. |
 
 6. **Clean up** when the user has the branch: `python3 $S/orchestrate.py clean <job>`.
+
+## The manager (automatic)
+
+The manager is woken only when judgment is needed, so it stays cheap:
+- **a task fails**, after routing has already escalated models
+- **a finished subagent reports `open_issues`** it couldn't fix inside its scope
+- **the reviewer requests changes**
+- **the user answers its question**
+
+It replies with actions: `retry` (with instructions or corrected owns/reads/verify), `split`, `add_task`, `amend`, `skip`, `fix_round`, `accept`, `ask_human` or `abort`. The script validates them as one batch (ownership, the dependency graph, limits) and applies all or none. Gates stay with the user. The defaults are at most 12 interventions per job and 2 manager retries per task; past that, it asks the user. Every decision is listed in `report.md`. Turn it off with `"manager": {"enabled": false}`, which falls back to plain stop-on-failure and one generic fix round.
 
 ## How parallelism is capped (automatic)
 

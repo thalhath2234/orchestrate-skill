@@ -53,6 +53,13 @@ FAKE = textwrap.dedent(r'''
         out('```json\n{"resolved": true}\n```')
     if prompt.startswith("ORCHESTRATE_PLAN"):
         note("plan"); out(json.dumps(cfg["plan"]))
+    if prompt.startswith("ORCHESTRATE_MANAGE"):
+        n = sum(1 for l in calls.read_text().splitlines() if '"kind": "manage"' in l) if calls.exists() else 0
+        ev = re.search(r"EVENT: (\w+)", prompt).group(1)
+        note("manage", event=ev, resumed="--resume" in a, has_playbook="# Managing an orchestrate job" in prompt)
+        pathlib.Path(str(calls) + f".manage{n}").write_text(prompt)
+        resp = cfg.get("manager", [])
+        out(json.dumps(resp[n] if n < len(resp) else {"note": "noop", "actions": [{"action": "none"}]}))
     # ---- worker ----
     tid = cwd.name
     t = cfg.get("tasks", {}).get(tid, {})
@@ -62,6 +69,8 @@ FAKE = textwrap.dedent(r'''
     if tid == "_integration":
         for p, c in cfg.get("fix", {}).items():
             pathlib.Path(p).parent.mkdir(parents=True, exist_ok=True); pathlib.Path(p).write_text(c)
+    elif t.get("fail_until_note") and "Notes from the manager" not in prompt:
+        pass
     elif not t.get("never"):
         if retry and t.get("out_of_scope_first"):
             pathlib.Path(t["out_of_scope_first"]).unlink(missing_ok=True)
@@ -74,7 +83,7 @@ FAKE = textwrap.dedent(r'''
     note("worker", tid=tid, retry=retry, start=start, end=time.time(),
          brief_has_upstream="Already done by upstream" in prompt, prompt_head=prompt[:120])
     out(f"did {tid}\n```json\n" + json.dumps({"summary": f"did {tid}", "interfaces": f"{tid}-api",
-        "notes_for_dependents": f"use {tid}-api", "open_issues": []}) + "\n```")
+        "notes_for_dependents": f"use {tid}-api", "open_issues": t.get("open_issues", [])}) + "\n```")
 ''').lstrip()
 
 
@@ -378,6 +387,172 @@ class OrchestrateTest(unittest.TestCase):
         self.assertIn("No expiry UI", review_prompt)
         brief = (self.state / "jobs/share/briefs/api.md").read_text()
         self.assertIn("Use opaque tokens", brief)
+
+    # ------------------------------------------------------------ manager
+    def test_manager_retries_failed_task_with_instructions(self):
+        cfg = {"tasks": {**WRITES, "api": {**WRITES["api"], "fail_until_note": True}},
+               "manager": [{"note": "it never created the handler", "actions": [
+                   {"action": "retry", "task": "api", "instructions": "Create apps/api/share/handler.go",
+                    "reads": ["apps/api/main.go"]}]}]}
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg=cfg)
+        self.assertEqual(code, 0, err[-3000:])
+        m = self.calls_of("manage")
+        self.assertEqual([c["event"] for c in m], ["task_failed"])
+        self.assertEqual((m[0]["model"], m[0]["effort"]), ("opus", "high"))
+        self.assertTrue(m[0]["has_playbook"])
+        brief = (self.state / "jobs/share/briefs/api.md").read_text()
+        self.assertIn("Notes from the manager", brief)
+        self.assertIn("Create apps/api/share/handler.go", brief)
+        self.assertIn("`apps/api/main.go`", brief)
+        st = self.job_state()
+        self.assertEqual(st["tasks"]["api"]["manager_retries"], 1)
+        self.assertEqual(st["status"], "done")
+        self.assertIn("Manager interventions (1)", out)
+        self.assertIn("apps/api/share/handler.go", self.branch_files())
+
+    def test_manager_session_persists_across_events(self):
+        cfg = {"tasks": {**WRITES, "api": {**WRITES["api"], "fail_until_note": True},
+                         "web": {**WRITES["web"], "open_issues": ["nav entry lives in apps/web/src/nav.ts"]}},
+               "manager": [{"actions": [{"action": "retry", "task": "api", "instructions": "write it"}]},
+                           {"note": "nav is a non-goal", "actions": [{"action": "none"}]}]}
+        code, _, err = self.cli("run", str(self.write_plan(base_plan(self.repo, max_parallel=1))), cfg=cfg)
+        self.assertEqual(code, 0, err[-3000:])
+        m = self.calls_of("manage")
+        self.assertEqual([c["event"] for c in m], ["task_failed", "open_issues"])
+        self.assertEqual([c["resumed"] for c in m], [False, True])
+        self.assertEqual([c["has_playbook"] for c in m], [True, False], "playbook only in the first prompt")
+
+    def test_manager_splits_a_failing_task_and_rewires_dependents(self):
+        plan = base_plan(self.repo)
+        plan["tasks"].append({"id": "docs", "title": "docs", "type": "docs:api", "tier": "T0", "goal": "doc",
+                              "owns": ["docs/share.md"], "depends_on": ["api"], "done": ["doc"],
+                              "verify": ["test -f docs/share.md"]})
+        part = lambda i, f: {"id": i, "title": i, "goal": i, "type": "feature:api", "tier": "T1",
+                             "owns": [f], "done": ["exists"], "verify": [f"test -f {f}"]}
+        cfg = {"tasks": {**WRITES, "api": {"never": True},
+                         "api-model": {"write": {"apps/api/share/model.go": "package share\n"}},
+                         "api-handler": {"write": {"apps/api/share/handler.go": "package share\n"}},
+                         "docs": {"write": {"docs/share.md": "# share\n"}}},
+               "manager": [{"note": "too big; split", "actions": [{"action": "split", "task": "api", "into": [
+                   part("api-model", "apps/api/share/model.go"),
+                   {**part("api-handler", "apps/api/share/handler.go"), "depends_on": ["contract", "api-model"]}]}]}]}
+        code, out, err = self.cli("run", str(self.write_plan(plan)), cfg=cfg)
+        self.assertEqual(code, 0, err[-3000:])
+        saved = json.loads((self.state / "jobs/share/plan.json").read_text())
+        ids = {t["id"]: t for t in saved["tasks"]}
+        self.assertNotIn("api", ids)
+        self.assertEqual(ids["api-model"]["depends_on"], ["contract"], "inherits the split task's deps")
+        self.assertEqual(sorted(ids["docs"]["depends_on"]), ["api-handler", "api-model"])
+        st = self.job_state()
+        self.assertEqual(st["tasks"]["api"]["status"], "split")
+        for f in ("apps/api/share/model.go", "apps/api/share/handler.go", "docs/share.md"):
+            self.assertIn(f, self.branch_files())
+        self.assertIn("split into api-model, api-handler", out)
+
+    def test_manager_turns_open_issue_into_a_task(self):
+        cfg = {"tasks": {**WRITES, "web": {**WRITES["web"], "open_issues": ["route must be registered in apps/web/src/routes.ts"]},
+                         "web-route": {"write": {"apps/web/src/routes.ts": "export const r = ['share']\n"}}},
+               "manager": [{"actions": [{"action": "add_task", "task": {
+                   "id": "web-route", "title": "register route", "goal": "register the share route",
+                   "type": "feature:web", "tier": "T0", "owns": ["apps/web/src/routes.ts"], "depends_on": ["web"],
+                   "done": ["route registered"], "verify": ["test -f apps/web/src/routes.ts"]}}]}]}
+        code, _, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg=cfg)
+        self.assertEqual(code, 0, err[-3000:])
+        self.assertEqual([c["event"] for c in self.calls_of("manage")], ["open_issues"])
+        self.assertIn("apps/web/src/routes.ts", self.branch_files())
+        self.assertEqual(self.job_state()["tasks"]["web-route"]["added_by"], "manager")
+
+    def test_manager_fixes_review_findings_with_targeted_tasks(self):
+        cfg = {"tasks": {**WRITES, "fix-web-export": {"write": {"apps/web/src/share/index.ts": "export * from './Button'\n"}}},
+               "reviews": [{"verdict": "changes_requested", "summary": "not exported",
+                            "findings": [{"severity": "major", "file": "apps/web/src/share/Button.tsx",
+                                          "issue": "not exported from an index"}]},
+                           {"verdict": "pass", "summary": "good", "findings": []}],
+               "manager": [{"actions": [{"action": "add_task", "task": {
+                   "id": "fix-web-export", "title": "export share", "goal": "add index.ts exporting Button",
+                   "type": "bugfix:web", "tier": "T0", "owns": ["apps/web/src/share/index.ts"],
+                   "depends_on": ["web"], "done": ["exported"], "verify": ["test -f apps/web/src/share/index.ts"]}}]}]}
+        code, _, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg=cfg)
+        self.assertEqual(code, 0, err[-3000:])
+        self.assertEqual([c["event"] for c in self.calls_of("manage")], ["review_changes_requested"])
+        self.assertEqual(len(self.calls_of("review")), 2)
+        self.assertFalse([c for c in self.calls_of("worker") if c["tid"] == "_integration"], "no generic fix round")
+        self.assertIn("apps/web/src/share/index.ts", self.branch_files())
+
+    def test_manager_asks_human_then_resume_with_answer(self):
+        cfg = {"tasks": {**WRITES, "api": {**WRITES["api"], "fail_until_note": True}},
+               "manager": [{"actions": [{"action": "ask_human",
+                                         "question": "Opaque tokens or JWT? (recommend opaque)"}]},
+                           {"actions": [{"action": "retry", "task": "api", "instructions": "Use opaque tokens"}]}]}
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg=cfg)
+        self.assertEqual(code, 8, err[-3000:])
+        self.assertEqual(self.job_state()["status"], "awaiting_human")
+        self.assertIn("The manager is asking you:** Opaque tokens or JWT?", out)
+        code, out, _ = self.cli("resume", "share")
+        self.assertEqual(code, 8)
+        self.assertIn("still waiting for your answer", out)
+        code, out, err = self.cli("resume", "share", "--answer", "opaque")
+        self.assertEqual(code, 0, err[-3000:])
+        self.assertEqual([c["event"] for c in self.calls_of("manage")], ["task_failed", "human_answer"])
+        self.assertIn('"answer": "opaque"', Path(str(self.calls) + ".manage1").read_text())
+        self.assertIn("Use opaque tokens", (self.state / "jobs/share/briefs/api.md").read_text())
+
+    def test_invalid_manager_actions_are_rejected_then_corrected(self):
+        bad = {"id": "web-extra", "title": "x", "goal": "x", "type": "feature:web", "tier": "T0",
+               "owns": ["apps/web/src/share/**"], "done": ["x"], "verify": ["true"]}   # overlaps web, unordered
+        good = {**bad, "owns": ["apps/web/src/share/extra.ts"], "depends_on": ["web"],
+                "verify": ["test -f apps/web/src/share/extra.ts"]}
+        cfg = {"tasks": {**WRITES, "web": {**WRITES["web"], "open_issues": ["needs extra.ts"]},
+                         "web-extra": {"write": {"apps/web/src/share/extra.ts": "x\n"}}},
+               "manager": [{"actions": [{"action": "add_task", "task": bad}]},
+                           {"actions": [{"action": "add_task", "task": good}]}]}
+        code, _, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg=cfg)
+        self.assertEqual(code, 0, err[-3000:])
+        self.assertEqual([c["event"] for c in self.calls_of("manage")], ["open_issues", "rejected_actions"])
+        entry = self.job_state()["manager"]["log"][0]
+        self.assertTrue(any("both own" in e for e in entry["rejected"]))
+        self.assertIn("apps/web/src/share/extra.ts", self.branch_files())
+
+    def test_manager_limits_escalate_to_human(self):
+        cfg = {"tasks": {**WRITES, "api": {"never": True}},
+               "manager": [{"actions": [{"action": "retry", "task": "api", "instructions": "try again"}]}]}
+        plan = base_plan(self.repo, manager={"max_interventions": 1})
+        code, out, err = self.cli("run", str(self.write_plan(plan)), cfg=cfg)
+        self.assertEqual(code, 8, err[-3000:])
+        self.assertEqual(len(self.calls_of("manage")), 1, "the limit stops further manager calls")
+        self.assertIn("limit of 1 interventions", self.job_state()["human_question"])
+
+    def test_manager_disabled_keeps_legacy_behaviour(self):
+        plan = base_plan(self.repo, manager={"enabled": False})
+        code, _, _ = self.cli("run", str(self.write_plan(plan)), cfg={"tasks": {**WRITES, "api": {"never": True}}})
+        self.assertEqual(code, 4)
+        self.assertEqual(self.calls_of("manage"), [])
+
+    def test_apply_actions_guardrails(self):
+        plan = base_plan(self.repo)
+        plan["tasks"][1]["gate"] = "creates a migration"
+        job = self.o.start_job(plan, self.write_plan(plan))
+        job.state["tasks"]["contract"]["status"] = "done"
+        job.state["tasks"]["api"]["status"] = "failed"
+        job.state["tasks"]["web"]["status"] = "running"
+        part = lambda i, f: {"id": i, "title": i, "goal": i, "type": "feature:api", "tier": "T1",
+                             "owns": [f], "done": ["x"], "verify": ["true"]}
+        for bad, needle in (({"action": "amend", "task": "web", "note": "x"}, "not started"),
+                            ({"action": "skip", "task": "contract"}, "cannot skip"),
+                            ({"action": "accept"}, "only valid for a review"),
+                            ({"action": "retry", "task": "contract"}, "can be retried"),
+                            ({"action": "teleport"}, "unknown action")):
+            res = self.o.apply_actions(job, plan, {"actions": [bad, {"action": "ask_human", "question": "q"}]}, {"kind": "x"})
+            self.assertTrue(any(needle in e for e in res["errors"]), (needle, res))
+            self.assertIsNone(res["hint"], "all-or-nothing: the valid action in the batch is not applied")
+        res = self.o.apply_actions(job, plan, {"actions": [{"action": "split", "task": "api", "into": [
+            part("api-a", "apps/api/share/a.go"), part("api-b", "apps/api/share/b.go")]}]}, {"kind": "task_failed"})
+        self.assertEqual(res.get("errors"), None)
+        gates = {t["id"]: t.get("gate") for t in plan["tasks"]}
+        self.assertEqual(gates["api-a"], "creates a migration", "pieces of a gated task stay gated")
+        review = {"kind": "review_changes_requested", "findings": [{"severity": "blocker", "issue": "x"}]}
+        res = self.o.apply_actions(job, plan, {"actions": [{"action": "accept", "reason": "meh"}]}, review)
+        self.assertTrue(any("blocker" in e for e in res["errors"]))
 
     def test_review_changes_requested_triggers_fix_round(self):
         cfg = {"tasks": WRITES,
