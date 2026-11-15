@@ -187,6 +187,7 @@ def main(argv=None) -> int:
     ap.add_argument("--config", action="append", help="model/effort to sweep, e.g. opus/medium (repeatable)")
     ap.add_argument("--json", help="write full results here")
     ap.add_argument("--min-pass", type=float, default=0.0, help="exit 1 if the pass rate is below this")
+    ap.add_argument("--keep", action="store_true", help="keep the scratch fixture repos for inspection")
     a = ap.parse_args(argv)
 
     scratch = Path(tempfile.mkdtemp(prefix="orch-eval-"))
@@ -235,6 +236,11 @@ def main(argv=None) -> int:
               f"{sum(r['consistency'] for r in rows) / n:.2f}  cost ${sum(r['cost_usd'] for r in rows):.2f} "
               f"({n} cases x {a.trials} trials)")
     overall = sum(r["pass_rate"] for r in results) / len(results)
+    if a.keep:
+        print(f"fixtures kept in {scratch}")
+    else:
+        import shutil
+        shutil.rmtree(scratch, ignore_errors=True)
     if a.json:
         Path(a.json).write_text(json.dumps({"overall_pass": overall, "results": results}, indent=2))
     return 1 if overall < a.min_pass else 0
