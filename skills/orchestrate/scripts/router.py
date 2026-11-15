@@ -31,6 +31,7 @@ DIR = Path(os.environ.get("ORCHESTRATE_DIR")
            or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "orchestrate")
 ROUTING = DIR / "routing.json"
 LEDGER = DIR / "ledger.jsonl"
+TASK_COSTS = DIR / "task_costs.jsonl"  # per orchestrate task: subagent + coordination cost
 PROPOSALS = DIR / "proposals.json"
 ALIASES = DIR / "aliases.json"
 LOCK = DIR / ".lock"
@@ -187,6 +188,24 @@ def record(*, task_id: str, task_type: str, tier: str, rung: int, ok: bool,
     return _check_raise(task_type, rung, model_id)
 
 
+def record_task_total(*, job: str, task_id: str, task_type: str, tier: str, status: str,
+                      config: str | None, task_cost: float, coord_cost: float) -> None:
+    """Cost of one orchestrate task including the manager, review and fix work it caused (P4.2).
+    Kept apart from the ledger, which only drives floors."""
+    entry = {"t": time.time(), "job": job, "task_id": task_id, "type": task_type, "tier": tier,
+             "status": status, "config": config, "task_cost_usd": round(task_cost, 4),
+             "coord_cost_usd": round(coord_cost, 4)}
+    with locked():
+        with open(TASK_COSTS, "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+
+
+def _task_costs() -> list[dict]:
+    if not TASK_COSTS.exists():
+        return []
+    return [json.loads(line) for line in TASK_COSTS.read_text().splitlines() if line.strip()]
+
+
 def _check_raise(task_type: str, rung: int, model_id: str | None) -> list[dict]:
     now = time.time()
     rows = [e for e in _ledger()
@@ -321,6 +340,17 @@ def _status() -> None:
     print("\nLedger (type, config): ok/total, cost")
     for (tt, lab), (n, ok, cost) in sorted(stats.items()):
         print(f"  {tt:22} {lab:14} {ok}/{n}  ${cost:.2f}")
+    per: dict = collections.defaultdict(lambda: [0, 0.0, 0.0])
+    for e in _task_costs():
+        if e.get("status") == "done":
+            s = per[(e["type"], e.get("config") or "-")]
+            s[0] += 1
+            s[1] += e.get("task_cost_usd") or 0
+            s[2] += e.get("coord_cost_usd") or 0
+    if per:
+        print("\nCost per completed orchestrate task (type, final config): n, subagent + coordination")
+        for (tt, lab), (n, tc, cc) in sorted(per.items()):
+            print(f"  {tt:22} {lab:14} {n}  ${tc / n:.2f} + ${cc / n:.2f} = ${(tc + cc) / n:.2f}")
     print(f"\nPending proposals: {len(pending())}   (state: {DIR})")
 
 

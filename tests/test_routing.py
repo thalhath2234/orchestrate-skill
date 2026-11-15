@@ -213,5 +213,65 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(out, str(self.tmp / "home/.local/share/orchestrate"))
 
 
+    def test_test_output_is_not_mistaken_for_a_broken_environment(self):
+        import run_task
+        rt = importlib.reload(run_task)
+        code_failures = ["--- FAIL: TestRateLimit (0.00s)\n    handler_test.go:41: expected status 429, got 200",
+                         "expected 529 retry-after header", "Error: Cannot find module 'zod'",
+                         "AssertionError: rate limit not applied"]
+        for out in code_failures:
+            self.assertIsNone(rt.env_signature(out, ["make test-api"]), out)
+        infra = {"dial tcp 127.0.0.1:5432: connect: connection refused": ["make test-api"],
+                 "make: *** No rule to make target 'test-api'.  Stop.": ["make test-api"],
+                 "bash: line 1: pnpm: command not found": ["pnpm --filter web test"],
+                 "/bin/sh: 1: go: not found": ["cd apps/api && env GOTMPDIR=x go test ./..."]}
+        for out, cmds in infra.items():
+            self.assertIsNotNone(rt.env_signature(out, cmds), out)
+
+    def test_claude_errors_map_to_causes(self):
+        import run_task
+        rt = importlib.reload(run_task)
+        self.assertEqual(rt.classify("t", 2, {"is_error": True, "error_kind": "max_turns"}, "", self.repo, 5)["cause"], "effort")
+        self.assertEqual(rt.classify("t", 2, {"is_error": True, "error_kind": "timeout"}, "", self.repo, 5)["cause"], "unknown")
+        self.assertEqual(rt.classify("t", 2, {"is_error": True, "error_kind": "overloaded"}, "", self.repo, 5)["cause"], "environment")
+
+    def test_api_overload_is_retried_not_blamed(self):
+        import claude_cli
+        cc = importlib.reload(claude_cli)
+        fake = self.tmp / "flaky"
+        counter = self.tmp / "n"
+        fake.write_text(textwrap.dedent(f"""\
+            #!/usr/bin/env python3
+            import json, pathlib
+            p = pathlib.Path({str(counter)!r}); n = int(p.read_text()) if p.exists() else 0; p.write_text(str(n + 1))
+            if n < 2:
+                print(json.dumps({{"is_error": True, "subtype": "error_during_execution", "api_error_status": 529,
+                                  "result": "overloaded_error"}}))
+            else:
+                print(json.dumps({{"is_error": False, "subtype": "success", "result": "ok", "num_turns": 2,
+                                  "structured_output": {{"cause": "effort", "evidence": "e"}},
+                                  "usage": {{"input_tokens": 1, "cache_read_input_tokens": 9}}}}))
+        """))
+        fake.chmod(0o755)
+        os.environ["ROUTER_CLAUDE_BIN"], os.environ["ORCHESTRATE_API_BACKOFF_S"] = str(fake), "0"
+        try:
+            r = cc.call("x", "sonnet", "low", self.repo, perm="plan", tools=[], schema={"type": "object"})
+        finally:
+            del os.environ["ROUTER_CLAUDE_BIN"], os.environ["ORCHESTRATE_API_BACKOFF_S"]
+        self.assertFalse(r["is_error"])
+        self.assertEqual(r["structured"], {"cause": "effort", "evidence": "e"})
+        self.assertEqual(r["metrics"]["cache_read"], 9)
+        self.assertEqual(counter.read_text(), "3")
+
+    def test_budget_stops_the_task(self):
+        fake = self.tmp / "claude"
+        fake.write_text(FAKE_CLAUDE.replace('print(json.dumps({"result": res,',
+                                            'print(json.dumps({"subtype": "error_max_budget_usd", "is_error": True, "result": res,')
+                        .replace('"is_error": False,', ""))
+        code, s, calls, err = self.run_task("feature:web", "T1", {"pass": []})
+        self.assertEqual(code, 7, err)
+        self.assertEqual(s["result"], "budget")
+        self.assertFalse(any(c["classifier"] for c in calls), "budget is not a failure to classify")
+
 if __name__ == "__main__":
     unittest.main()
