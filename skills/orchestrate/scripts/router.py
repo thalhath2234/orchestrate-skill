@@ -446,7 +446,8 @@ def _status() -> None:
 
 
 def main(argv=None) -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("route", help="print the starting model/effort for a task")
     r.add_argument("--type", required=True)

@@ -164,6 +164,15 @@ FAKE_ORCA = textwrap.dedent(r"""
             f = wt / t["out_of_scope_first"]; f.parent.mkdir(parents=True, exist_ok=True); f.write_text("oops")
         if retry and t.get("out_of_scope_first"):
             (wt / t["out_of_scope_first"]).unlink(missing_ok=True)
+        if t.get("commit_out_of_scope") and first:
+            f = wt / t["commit_out_of_scope"]; f.parent.mkdir(parents=True, exist_ok=True); f.write_text("sneaky")
+            g = ["git", "-c", "user.email=w@w", "-c", "user.name=w"]
+            subprocess.run([*g, "add", "-A"], cwd=wt, check=True, capture_output=True)
+            subprocess.run([*g, "commit", "-qm", "worker commit"], cwd=wt, check=True, capture_output=True)
+        if t.get("commit_out_of_scope") and retry:
+            subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=wt, check=True, capture_output=True)
+            for p, c in t.get("write", {}).items():
+                f = wt / p; f.parent.mkdir(parents=True, exist_ok=True); f.write_text(c)
         ids = d.setdefault("ids", re.findall(r"^- \[([DU]\d+)\]", spec, re.M))
         unmet = [] if retry else t.get("done_unmet", [])
         rep = {"summary": f"did {d['tid']}", "interfaces": f"{d['tid']}-api", "notes_for_dependents": "",
@@ -603,6 +612,20 @@ class OrchestrateTest(unittest.TestCase):
         self.assertTrue(any("never registered" in a for a in self.job_plan()["acceptance"]),
                         "the advisor's blocker became a criterion the next round must meet")
 
+    def test_manager_cannot_override_the_advisors_final_revise(self):
+        cfg = {"tasks": WRITES,
+               "advice": {"final": [{"verdict": "revise", "summary": "route not registered",
+                                     "findings": [{"severity": "major", "confidence": "high",
+                                                   "issue": "the share route is never registered"}]}]},
+               "manager": [{"note": "looks fine", "actions": [{"action": "accept", "reason": "minor"}]}]}
+        code, out, _ = self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg=cfg)
+        self.assertEqual(code, 6, out[-3000:])
+        self.assertIn("--approve advisor:final", out)
+        self.assertNotEqual(self.job_state()["status"], "done")
+        code, out, _ = self.cli("resume", "share", "--approve", "advisor:final", cfg=cfg)
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertTrue(self.job_state()["review"]["rounds"][-1]["advisor"].get("overridden_by_user"))
+
     def test_advisor_without_an_answer_fails_closed(self):
         cfg = {"tasks": WRITES, "garbage_for": ["ORCHESTRATE_ADVISE_FINAL", "ORCHESTRATE_ADVISE (retry)"]}
         code, _, _ = self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg=cfg)
@@ -776,6 +799,61 @@ class OrchestrateTest(unittest.TestCase):
         self.assertEqual(code, 0, out[-3000:])
         fresh = [c for c in self.orca_of("worker-start")]
         self.assertTrue(all(c["worktree"] == "new-top-level" and c["repo"] == f"path:{self.repo}" for c in fresh), fresh)
+
+    def test_orca_question_holds_new_work_but_running_workers_still_merge(self):
+        self.orca_env()
+        q = {"issue": "Should links expire?", "kind": "needs_decision", "blocks_acceptance": False, "files": []}
+        cfg = {"tasks": {**WRITES, "api": {**WRITES["api"], "open_issues": [q]}},
+               "manager": [{"note": "product call", "actions": [{"action": "ask_human",
+                                                                  "question": "Should links expire? Recommended: no."}]}]}
+        code, out = self.drive_orca(("run", str(self.write_plan(base_plan(self.repo)))), cfg)
+        # drive_orca delivers in start order: contract, then api, which asks; web is still running
+        self.assertEqual(code, 8, out[-3000:])
+        self.assertEqual(self.job_state()["tasks"]["web"]["status"], "running")
+        web = next(c for c in self.orca_of("worker-start") if c["tid"] == "web")
+        code, out, err = self.cli("worker-done", "share", "--payload", json.dumps(
+            {"dispatchId": web["dispatch"], "reportPath": str(Path(web["wt"]) / ".orchestrate" / "report.json")}))
+        self.assertEqual(code, 8, err[-3000:])
+        st = self.job_state()
+        self.assertEqual(st["status"], "awaiting_human")
+        self.assertEqual(st["tasks"]["web"]["status"], "done", "a worker already running still merges")
+        self.assertEqual(self.calls_of("review"), [], "no review while a question is open")
+        starts_before = len(self.orca_of("worker-start"))
+        code, out = self.drive_orca(("resume", "share", "--answer", "no expiry"), cfg)
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertEqual(len(self.orca_of("worker-start")), starts_before, "resume starts no duplicate workers")
+
+    def test_orca_resume_keeps_running_workers(self):
+        self.orca_env()
+        plan = base_plan(self.repo)
+        plan["tasks"][1]["gate"] = "touches the API"
+        code, _, err = self.cli("run", str(self.write_plan(plan)), cfg={"tasks": WRITES})
+        self.assertEqual(code, 10, err[-2000:])  # contract running
+        code, _, err = self.cli("resume", "share", cfg={"tasks": WRITES})
+        self.assertEqual(code, 10, err[-2000:])
+        self.assertEqual([c["tid"] for c in self.orca_of("worker-start")], ["contract"], "no duplicate of a live worker")
+
+    def test_orca_committed_out_of_scope_edit_is_caught(self):
+        self.orca_env()
+        cfg = {"tasks": {**WRITES, "web": {**WRITES["web"], "commit_out_of_scope": "Makefile"}}}
+        code, out = self.drive_orca(("run", str(self.write_plan(base_plan(self.repo)))), cfg)
+        self.assertEqual(code, 0, out[-3000:])
+        web = [c for c in self.orca_of("send") if c["tid"] == "web"]
+        self.assertTrue(web and "OUT OF SCOPE" in web[0]["body"] and "Makefile" in web[0]["body"], web)
+        integ = self.state / "jobs" / "share" / "wt" / "_integration"
+        self.assertNotIn("sneaky", (integ / "Makefile").read_text())
+
+    def test_headless_job_stays_headless_when_resumed_inside_orca(self):
+        self.orca_env()
+        plan = base_plan(self.repo)
+        plan["tasks"][1]["gate"] = "touches the API"
+        code, _, err = self.cli("run", str(self.write_plan(plan)), "--workers", "headless", cfg={"tasks": WRITES})
+        self.assertEqual(code, 5, err[-2000:])
+        self.assertEqual(self.job_state()["mode"], "headless")
+        code, _, err = self.cli("resume", "share", "--approve", "api", cfg={"tasks": WRITES})
+        self.assertEqual(code, 0, err[-2000:])
+        self.assertEqual(self.orca_of("worker-start"), [], "no Orca workers for a headless job")
+        self.assertIn("api", [c["tid"] for c in self.calls_of("worker")])
 
     def test_orca_wait_and_status_while_workers_run(self):
         self.orca_env()
@@ -1417,6 +1495,17 @@ class OrchestrateTest(unittest.TestCase):
                    f"{S}/orchestrate.py resume share --detach", "echo approve"):
             self.assertIsNone(ask(ok), ok)
         self.assertIsNone(ask("router.py approve x", tool="Read"))
+        # bypasses found in review: option prefixes, the script behind a variable, `=` forms
+        for cmd in (f"{S}/orchestrate.py resume j --appr advisor:plan", f"{S}/orchestrate.py resume j --ans 'ship it'",
+                    f"O={S}/orchestrate.py; python3 $O resume j --approve x", f"{S}/orchestrate.py resume j --approve=x",
+                    f"{S}/orchestrate.py run plan.json --approve advisor:plan"):
+            self.assertEqual(ask(cmd), "ask", cmd)
+        p = subprocess.run([sys.executable, str(ORCH), "resume", "share", "--appr", "api"],
+                           env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0, "argparse abbreviations are off: --appr is not --approve")
+        self.assertIn("unrecognized arguments", p.stderr)
+        src = (SCRIPTS / "approval_gate.py").read_text()
+        self.assertIn("from __future__ import annotations", src, "the hook must import on Python 3.9")
         hooks = json.loads((SCRIPTS.parents[2] / "hooks" / "hooks.json").read_text())
         self.assertIn("approval_gate.py", hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
 

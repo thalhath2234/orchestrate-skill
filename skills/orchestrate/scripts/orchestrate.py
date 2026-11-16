@@ -467,20 +467,22 @@ def patterns_overlap(a: str, b: str, files: list[str]) -> bool:
                for pref in {pa, pb} for pat in (a, b) for pr in _probes(pref, pat))
 
 
-def scope_violations(cwd: Path, owns: list[str]) -> list[str]:
+def scope_violations(cwd: Path, owns: list[str], base: str | None = None) -> list[str]:
+    """Changed paths outside `owns`: uncommitted ones, plus everything committed since `base`
+    (a worker that can commit must not get committed edits past the check)."""
     # Don't use git() here: its .strip() eats the leading space of the first
     # " M path" line, shifting every path by one character.
     out = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
                          cwd=cwd, capture_output=True, text=True).stdout
-    bad = []
+    changed = []
     for line in out.splitlines():
         path = line[3:]
-        paths = path.split(" -> ") if " -> " in path else [path]
-        for p in paths:
-            p = p.strip('"')
-            if not any(owned(p, pat) for pat in owns):
-                bad.append(p)
-    return bad
+        changed += [p.strip('"') for p in (path.split(" -> ") if " -> " in path else [path])]
+    if base:
+        committed = subprocess.run(["git", "diff", "--name-only", f"{base}..HEAD"], cwd=cwd,
+                                   capture_output=True, text=True).stdout
+        changed += [p.strip('"') for p in committed.splitlines() if p.strip()]
+    return [p for p in dict.fromkeys(changed) if not any(owned(p, pat) for pat in owns)]
 
 
 def claim_unowned(job_id: str, task_id: str, bad: list[str]) -> tuple[list[str], list[str]]:
@@ -991,6 +993,8 @@ def start_job(plan: dict, plan_path: Path) -> Job:
         for t in plan["tasks"]:
             st = job.state["tasks"].setdefault(t["id"], {"status": "pending", "title": t["title"],
                                                          "type": t["type"], "tier": t["tier"]})
+            if st["status"] == "running" and job.state.get("mode") == "orca":
+                continue  # its Orca worker is still live and will report; don't start a duplicate
             if st["status"] in ("running", "awaiting_approval", "blocked", "failed"):
                 st["status"] = "pending"
         job.state["status"] = "running"
@@ -1239,7 +1243,7 @@ def _review_context(job: Job, plan: dict) -> dict:
 
 
 def reviewer_cfg(plan: dict) -> tuple[str, str]:
-    """Final reviewer: models.role("reviewer") (Fable 5.2 at high), or the older
+    """Final reviewer: models.role("reviewer") (Opus 5.5 at medium), or the older
     plan["reviewer"] = {"model", "effort"} form."""
     m, e = models.role("reviewer", plan)
     old = plan.get("reviewer") or {}
@@ -1845,6 +1849,11 @@ def final_gate(job: Job, plan: dict, rnd_no: int, review_v: dict | None) -> tupl
     cleanup_pass(job, plan)
     integ = Path(job.state["integration_wt"])
     rnd = job.state["review"]["rounds"][-1]
+    if "advisor:final" in job.state.get("approved", []):
+        log("advisor final check overridden by the user (--approve advisor:final)")
+        rnd["advisor"] = {"overridden_by_user": True}
+        job.save()
+        return [], None
     log("asking the advisor for the final check before hand-over")
     a = job_advise(job, plan, "final", final_body(integ, job.state["base_sha"], plan,
                                                     rnd.get("final_verify_tail", ""), review_v,
@@ -2686,6 +2695,13 @@ def review_round(job: Job, plan: dict) -> int | str:
     hint = r.get("hint")
     if hint == "accept":
         job.state["review"]["accepted_by_manager"] = r.get("reason")
+        if source == "advisor":  # the advisor gates hand-over: only the user overrides it, as at the plan stage
+            return finish(job, plan, "review_failed",
+                          f"the advisor's final check asks for changes: {verdict.get('summary', '')}\n"
+                          + "\n".join(f"- [{f.get('severity')}] {f.get('issue')}" for f in blocking[:8])
+                          + f"\nThe manager would accept them: {r.get('reason')}\nThat's the user's call. To hand "
+                            f"over as it is: orchestrate.py resume {job.id} --approve advisor:final; otherwise fix "
+                            f"and resume.")
         if source == "reviewer":  # the advisor still signs off before hand-over
             adv_blocking, err = final_gate(job, plan, rnd_no, verdict)
             if err or adv_blocking:
@@ -2712,6 +2728,7 @@ def run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
             skip_baseline: bool, answer: str | None = None) -> int:
     """Headless mode: this process runs every worker itself (`claude -p` via run_task.py)."""
     job.state["pid"] = os.getpid()
+    job.state["mode"] = "headless"
     code = prepare_job(job, plan, approve, max_parallel, skip_baseline, answer)
     if code is not None:
         return code
@@ -3062,8 +3079,8 @@ def workers_mode(a, job: Job | None = None) -> str:
     """orca: the parent agent coordinates Orca workers (inside Orca); headless: a detached process
     runs `claude -p` workers itself. A resumed job keeps the mode it started in."""
     import orca_mode
-    if job is not None and job.state.get("mode"):
-        return job.state["mode"]
+    if job is not None and job.state and (job.state.get("mode") or job.state.get("tasks")):
+        return job.state.get("mode") or "headless"  # jobs from before Orca mode ran headless
     w = getattr(a, "workers", None) or "auto"
     return ("orca" if orca_mode.in_orca() else "headless") if w == "auto" else w
 
@@ -3087,7 +3104,7 @@ def cmd_run(a, resume: bool = False) -> int:
                   f"for it, add their words as \"definition_of_done\" to {plan_path}, then resume.",
                   file=sys.stderr)
         return 2
-    mode = workers_mode(a, job if resume else None)
+    mode = workers_mode(a, Job(plan["job"]))  # an existing job keeps the mode it started in
     if mode == "orca":
         import orca_mode
         if a.detach:
@@ -3224,7 +3241,8 @@ def cmd_clean(a) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("capacity")
     c.add_argument("--plan")
@@ -3277,6 +3295,8 @@ def main(argv=None) -> int:
     ad.add_argument("--tier", default="T1")
     ad.add_argument("--final", action="store_true", help="check finished work against done (needs --base)")
     ad.add_argument("--base", help="commit the work started from (for --final)")
+    for p_ in sub.choices.values():
+        p_.allow_abbrev = False  # `--appr` must not mean --approve: the approval hook matches names
     a = ap.parse_args(argv)
 
     if a.cmd == "capacity":

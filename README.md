@@ -93,7 +93,7 @@ python3 $S/orchestrate.py advise plan.json              # advisor's second opini
 python3 $S/orchestrate.py validate plan.json            # waves, ownership conflicts, cap
 python3 $S/orchestrate.py brief plan.json <task-id>     # exact handoff a subagent will get
 python3 $S/orchestrate.py run plan.json                 # inside Orca: starts Orca workers, exit 10
-python3 $S/orchestrate.py worker-done <job> --payload '<json>'   # when Orca wakes you with a worker_done
+python3 $S/orchestrate.py worker-done <job> --dispatch <id> --report-path <path>   # when Orca wakes you with a worker_done
 python3 $S/orchestrate.py run plan.json --detach        # outside Orca: headless, then:
 python3 $S/orchestrate.py wait <job> --timeout 540      # 0 done · 5 approval · 8 manager asks you · 9 advisor says revise · 10 workers running (Orca) · 4 failed · 3 env · 6 review
 python3 $S/orchestrate.py resume <job> --answer "..."   # answer the manager's question

@@ -251,8 +251,19 @@ def start(job: O.Job, plan: dict, approve: list[str], max_parallel: int | None,
         return pump(job, plan)
 
 
+def stopped(job: O.Job, plan: dict) -> int | None:
+    """A job that already ended (failed, done, aborted) takes no more steps."""
+    st = job.state.get("status")
+    if st in O.TERMINAL:
+        O.log(f"job {job.id} already ended ({st}); this worker's report changes nothing")
+        return O.EXIT.get(st, 1)
+    return None
+
+
 def worker_done(job: O.Job, plan: dict, payload: dict) -> int:
     with step_lock(job):
+        if (code := stopped(job, plan)) is not None:
+            return code
         did = payload.get("dispatchId") or payload.get("dispatch_id")
         tid = orca_state(job)["dispatches"].get(did)
         st = job.state["tasks"].get(tid or "", {})
@@ -271,6 +282,8 @@ def worker_done(job: O.Job, plan: dict, payload: dict) -> int:
 
 def worker_lost(job: O.Job, plan: dict, did: str, reason: str) -> int:
     with step_lock(job):
+        if (code := stopped(job, plan)) is not None:
+            return code
         tid = orca_state(job)["dispatches"].get(did)
         st = job.state["tasks"].get(tid or "", {})
         if not tid or st.get("status") != "running" or st.get("orca", {}).get("dispatch") != did:
@@ -306,7 +319,7 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
     wt = Path(o["worktree"])
     report = read_report(wt, payload)
     ok, out = True, ""
-    bad = O.scope_violations(wt, task["owns"])
+    bad = O.scope_violations(wt, task["owns"], base=o.get("start_sha"))
     if bad:
         bad, granted = O.claim_unowned(job.id, tid, bad)
     if bad:
@@ -461,6 +474,8 @@ def pump(job: O.Job, plan: dict) -> int:
     Returns WAITING while workers run, or the job's exit code."""
     plan = job.plan  # actions and raised criteria are written to the job's plan.json
     while True:
+        if job.state.get("human_question"):
+            return hold_for_answer(job, plan)
         queue = job.state.pop("pending_events", [])
         if queue:
             ev = queue[0] if len(queue) == 1 else {"kind": "batch", "events": queue}
@@ -468,10 +483,12 @@ def pump(job: O.Job, plan: dict) -> int:
             plan = job.plan
             if r.get("hint") == "ask_human":
                 job.state["human_question"] = r.get("question")
-                return O.finish(job, plan, "awaiting_human",
-                                f"the manager needs your input: {r.get('question')}\nAnswer with: "
-                                f"orchestrate.py resume {job.id} --answer \"...\"")
+                return hold_for_answer(job, plan)
             if r.get("hint") == "abort":
+                for t, st in job.state["tasks"].items():  # stop what still runs: nothing may merge now
+                    if st.get("status") == "running":
+                        try_orca("orchestration", "worker-stop", "--dispatch", st["orca"]["dispatch"])
+                        st["status"] = "stopped"
                 return O.finish(job, plan, "failed", f"manager aborted the job: {r.get('reason')}")
             continue
         O.mark_blocked(job, plan)
@@ -513,7 +530,8 @@ def pump(job: O.Job, plan: dict) -> int:
             job.state.update(status="running", message=f"waiting on Orca workers: {names}")
             job.save()
             print(f"WAITING on {len(running)} Orca worker(s): {names}.\nEnd your turn. When Orca wakes you "
-                  f"with a worker_done, run: orchestrate.py worker-done {job.id} --payload '<its Payload JSON>'")
+                  f"with a worker_done, run: orchestrate.py worker-done {job.id} --dispatch <dispatchId> "
+                  f"--report-path <reportPath> (both from its Payload)")
             return WAITING
         statuses = {t: sts[t]["status"] for t in T}
         if any(s in ("failed", "blocked") for s in statuses.values()):
@@ -537,6 +555,20 @@ def pump(job: O.Job, plan: dict) -> int:
         if r == "fix_round":
             add_fix_task(job, plan, job.state["review"].pop("owed_fix"))
             plan = job.plan
+
+
+def hold_for_answer(job: O.Job, plan: dict) -> int:
+    """The manager asked the user something. Until the answer comes (resume --answer), nothing
+    new starts and no review runs; workers already running finish, and their work is checked and
+    merged as it reports. Queued events wait for the answer too."""
+    running = [t for t, st in job.state["tasks"].items() if st.get("status") == "running"]
+    q = job.state["human_question"]
+    tail = (f"\n{len(running)} worker(s) are still running ({', '.join(running)}); when Orca wakes you with "
+            f"their worker_done, run worker-done as usual. Nothing new starts until the answer."
+            if running else "")
+    return O.finish(job, plan, "awaiting_human",
+                    f"the manager needs your input: {q}\nAnswer with: orchestrate.py resume {job.id} "
+                    f"--answer \"...\"{tail}")
 
 
 def add_fix_task(job: O.Job, plan: dict, owed: dict) -> None:

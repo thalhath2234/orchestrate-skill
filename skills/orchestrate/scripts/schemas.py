@@ -62,8 +62,6 @@ MANAGER = {
                 "task": {"type": "string"}, "note": {"type": "string"}, "reads": _STRS}),
             _action("raise_bar", ["scope", "criteria", "why"], {
                 "scope": {"type": "string"}, "criteria": {**_STRS, "minItems": 1}, "why": {"type": "string"}}),
-            _action("raise_bar", ["scope", "criteria", "why"], {
-                "scope": {"type": "string"}, "criteria": {**_STRS, "minItems": 1}, "why": {"type": "string"}}),
             _action("skip", ["task", "reason"], {"task": {"type": "string"}, "reason": {"type": "string"}}),
             _action("fix_round", ["reason"], {"reason": {"type": "string"}}),
             _action("accept", ["reason"], {"reason": {"type": "string"}}),

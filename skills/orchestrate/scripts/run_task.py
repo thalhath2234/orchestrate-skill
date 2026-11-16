@@ -245,15 +245,6 @@ against a command result or a file you saw in this session: report only what you
 say plainly what isn't verified."""
 
 
-# The advisor tool only helps when the worker actually calls it: Claude decides when, and on one
-# Anthropic benchmark Opus rarely did and scored 7 points below Opus alone. So say when [ADVISOR].
-CONSULT = ("\nYou have an advisor (a stronger model) available as a tool. Consult the advisor: "
-           "before you commit to an approach, when the same error comes back a second time, and "
-           "before you write your final report. Apply its guidance unless the code or a test "
-           "contradicts it; then say so in your report.")
-CONSULT_RETRY = " If this is the same failure as before, consult the advisor before changing course."
-
-
 def worker_prompt(task: str, repo: Path, verify_cmds: list[str], hint: str = "",
                   advisor: bool = False) -> str:
     v = "\n".join(f"  {c}" for c in verify_cmds)
