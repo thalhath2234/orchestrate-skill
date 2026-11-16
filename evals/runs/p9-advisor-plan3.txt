@@ -1,0 +1,5 @@
+PASS  advisor    plan-misses-route-wiring                   default       pass 1.00 consistent 1.00 $1.594
+[orchestrate 00:24:21] advisor (plan) found nothing blocking at fable/medium; asking again at high
+FLAKY advisor    plan-sound                                 default       pass 0.50 consistent 0.50 $2.794  <- []
+
+advisor    default       pass 0.75  consistency 0.75  cost $4.39 (2 cases x 2 trials)

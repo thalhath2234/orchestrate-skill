@@ -1,0 +1,4 @@
+PASS  worker     finishes-multipart-task                    opus/low      pass 1.00 consistent 1.00 $0.278
+PASS  worker     reports-out-of-scope-bug                   opus/low      pass 1.00 consistent 1.00 $0.278
+
+worker     opus/low      pass 1.00  consistency 1.00  cost $0.56 (2 cases x 1 trials)

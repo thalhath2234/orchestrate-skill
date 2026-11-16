@@ -26,7 +26,13 @@ FAKE_CLAUDE = textwrap.dedent('''\
     with open(os.environ["FAKE_CALLS"], "a") as fh:
         fh.write(json.dumps({"model": model, "effort": effort,
                              "classifier": prompt.startswith("FAILURE_CLASSIFIER"),
-                             "resume": "--resume" in a, "hint": "Note from a previous" in prompt}) + "\\n")
+                             "resume": "--resume" in a, "hint": "Note from a previous" in prompt,
+                             "fallback": a[a.index("--fallback-model") + 1] if "--fallback-model" in a else None,
+                             "advisor": a[a.index("--advisor") + 1] if "--advisor" in a else None,
+                             "consult": "consult the advisor" in prompt.lower()}) + "\\n")
+    if "--advisor" in a and cfg.get("advisor_launch_fail"):
+        sys.stderr.write("Error: Fable as the advisor needs your consent to bill usage credits. Run /model fable.\\n")
+        sys.exit(1)
     if prompt.startswith("FAILURE_CLASSIFIER"):
         res = json.dumps({"cause": cfg.get("cause", "capability"), "evidence": "fake evidence",
                           "agents_md": cfg.get("agents_md")})
@@ -34,10 +40,22 @@ FAKE_CLAUDE = textwrap.dedent('''\
         if f"{model}/{effort}" in cfg.get("pass", []):
             pathlib.Path("target.txt").write_text("fixed")
         res = "done"
+    if cfg.get("refuse") and not prompt.startswith("FAILURE_CLASSIFIER"):
+        print(json.dumps({"result": "", "session_id": "sess-1", "total_cost_usd": 0.001, "is_error": False,
+                          "subtype": "success", "stop_reason": "refusal", "stop_details": {"category": "cyber"},
+                          "modelUsage": {"claude-opus-5-5": {}}}))
+        sys.exit(0)
     ver = cfg.get("ver", "5-5")
+    used = "opus" if model == "fable" and cfg.get("no_fable") else model
     print(json.dumps({"result": res, "session_id": "sess-1", "total_cost_usd": 0.01, "is_error": False,
-                      "modelUsage": {f"claude-{model}-{ver}": {}}}))
+                      "modelUsage": {f"claude-{used}-{ver}": {}}}))
 ''')
+
+
+# The ladder mechanics (effort restore, escalation, floors, probes) are tested from the cheap
+# rungs, so these tests pin the v0.6 per-tier starts explicitly. Production starts every tier at
+# the worker role (opus/medium): see test_every_tier_starts_at_the_worker_role.
+LEGACY_START = {"T0": "haiku/medium", "T1": "sonnet/medium", "T2": "opus/low", "T3": "opus/medium"}
 
 
 class RoutingTest(unittest.TestCase):
@@ -64,54 +82,83 @@ class RoutingTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def run_task(self, ttype, tier, cfg, verify="grep -q fixed target.txt", probe_rate="0"):
+    def run_task(self, ttype, tier, cfg, verify="grep -q fixed target.txt", probe_rate="0", extra=()):
         self.cfg.write_text(json.dumps(cfg))
         (self.repo / "target.txt").write_text("broken")
         self.calls.write_text("")
         env = {**self.env, "ROUTER_PROBE_RATE": probe_rate}
         p = subprocess.run([sys.executable, str(SCRIPTS / "run_task.py"), "--repo", str(self.repo),
                             "--type", ttype, "--tier", tier, "--verify", verify,
-                            "--baseline", "test -f target.txt", "do the thing"],
+                            "--baseline", "test -f target.txt", *extra,
+                            *([] if "--start" in extra else ["--start", LEGACY_START[tier]]), "do the thing"],
                            env=env, capture_output=True, text=True)
         summary = json.loads(p.stdout) if p.stdout.strip() else {}
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         return p.returncode, summary, calls, p.stderr
+
+    def route(self, ttype, tier, **kw):
+        return self.router.route(ttype, tier, start=LEGACY_START[tier], **kw)
 
     def ledger(self):
         return [json.loads(line) for line in (self.state / "ledger.jsonl").read_text().splitlines()]
 
     # -------------------------------------------------------------------
     def test_pass_at_default_records_success_and_no_proposal(self):
-        code, s, calls, _ = self.run_task("rename:web", "T0", {"pass": ["haiku/low"]})
+        code, s, calls, _ = self.run_task("rename:web", "T0", {"pass": ["haiku/medium"]})
         self.assertEqual(code, 0)
-        self.assertEqual([c["model"] for c in calls], ["haiku"])
+        self.assertEqual([(c["model"], c["effort"]) for c in calls], [("haiku", "medium")])  # Haiku default
         self.assertEqual(s["proposals"], [])
         self.assertTrue(self.ledger()[0]["ok"])
 
     def test_two_attempts_then_capability_escalation_and_raise_proposal(self):
-        cfg = {"pass": ["opus/high"], "cause": "capability"}
+        # below the model's default effort, a failure first restores the effort (Anthropic:
+        # "if you lowered effort, restore it; otherwise try the next tier up")
+        cfg = {"pass": ["sonnet/high"], "cause": "capability"}
         code, s, calls, err = self.run_task("bugfix:api", "T1", cfg)
         self.assertEqual(code, 0, err)
         workers = [c for c in calls if not c["classifier"]]
         self.assertEqual([(c["model"], c["effort"], c["resume"]) for c in workers],
-                         [("sonnet", "medium", False), ("sonnet", "medium", True), ("opus", "high", False)])
+                         [("sonnet", "medium", False), ("sonnet", "medium", True), ("sonnet", "high", False)])
         self.assertEqual(s["proposals"], [], "one failed task is not enough evidence")
 
         code, s, *_ = self.run_task("bugfix:api", "T1", cfg)
         self.assertEqual(len(s["proposals"]), 1)
         self.assertEqual(s["proposals"][0]["kind"], "raise_floor")
         # proposal only: routing unchanged until approved
-        self.assertEqual(self.router.route("bugfix:api", "T1")["model"], "sonnet")
+        self.assertEqual(self.route("bugfix:api", "T1")["model"], "sonnet")
         self.assertEqual([p["kind"] for p in self.router.pending()], ["raise_floor"])
 
         self.router.approve(s["proposals"][0]["id"])
-        d = self.router.route("bugfix:api", "T1")
-        self.assertEqual((d["model"], d["effort"], d["source"]), ("opus", "high", "learned"))
+        d = self.route("bugfix:api", "T1")
+        self.assertEqual((d["model"], d["effort"], d["source"]), ("sonnet", "high", "learned"))
         self.assertEqual(self.router.pending(), [])
+        self.assertEqual(json.loads((self.state / "routing.json").read_text())["bugfix:api"]["floor_cfg"],
+                         "sonnet/high")
 
         # next task starts at the approved floor
         code, s, calls, _ = self.run_task("bugfix:api", "T1", cfg)
-        self.assertEqual(calls[0]["model"], "opus")
+        self.assertEqual((calls[0]["model"], calls[0]["effort"]), ("sonnet", "high"))
+
+    def test_capability_failure_at_default_effort_moves_up_a_model(self):
+        code, s, calls, err = self.run_task("bugfix:web", "T1", {"pass": ["opus/medium"], "cause": "capability"})
+        self.assertEqual(code, 0, err)
+        seen = []
+        for c in calls:
+            if not c["classifier"] and (c["model"], c["effort"]) not in seen:
+                seen.append((c["model"], c["effort"]))
+        self.assertEqual(seen, [("sonnet", "medium"), ("sonnet", "high"), ("opus", "medium")])
+
+    def test_t2_runs_low_then_reruns_failures_at_high(self):
+        # Anthropic: on Opus 5.5, low then high on failures ~97% at $0.17 vs 95.3% at $0.29 all-high
+        code, s, calls, err = self.run_task("feature:api", "T2", {"pass": ["opus/high"], "cause": "effort"})
+        self.assertEqual(code, 0, err)
+        workers = [(c["model"], c["effort"]) for c in calls if not c["classifier"]]
+        self.assertEqual(workers, [("opus", "low"), ("opus", "low"), ("opus", "high")])
+
+    def test_classifier_runs_on_haiku_low(self):
+        self.run_task("feature:api", "T2", {"pass": ["opus/high"], "cause": "effort"})
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual({(c["model"], c["effort"]) for c in calls if c["classifier"]}, {("haiku", "low")})
 
     def test_effort_failure_keeps_model_raises_effort(self):
         code, s, calls, _ = self.run_task("feature:web", "T1", {"pass": ["sonnet/high"], "cause": "effort"})
@@ -151,59 +198,182 @@ class RoutingTest(unittest.TestCase):
         self.router.approve(props[0]["id"])
         self.assertIn("Handlers live in internal/http", (self.repo / "AGENTS.md").read_text())
 
-    def test_top_of_ladder_gives_up_and_proposes_needs_human(self):
+    def test_top_of_ladder_is_fable_after_opus_xhigh(self):
         for _ in range(2):
             code, s, calls, _ = self.run_task("migration:api", "T3", {"pass": [], "cause": "capability"})
             self.assertEqual(code, 4)
         workers = [(c["model"], c["effort"]) for c in calls if not c["classifier"]]
-        self.assertEqual(sorted(set(workers)), [("opus", "high"), ("opus", "xhigh")])
+        # T3 starts at Opus's default; Opus goes to xhigh before Fable (Anthropic: "if your
+        # evals at xhigh or max still fall short ... move to Claude Fable 5.2")
+        self.assertEqual(list(dict.fromkeys(workers)), [("opus", "medium"), ("opus", "xhigh"), ("fable", "high")])
+        fable = [c for c in calls if c["model"] == "fable"]
+        self.assertTrue(all(c["fallback"] == "opus" for c in fable), "no Fable access -> Opus, not a failure")
+        self.assertTrue(all(c["fallback"] is None for c in calls if c["model"] != "fable"))
         kinds = {p["kind"] for p in self.router.pending()}
-        self.assertIn("raise_floor", kinds)  # opus/high -> opus/xhigh
+        self.assertIn("raise_floor", kinds)
+        self.assertIn("needs_human", kinds)  # failed at the top
+
+    def test_max_model_caps_the_ladder(self):
+        code, s, calls, _ = self.run_task("migration:web", "T3", {"pass": [], "cause": "capability"},
+                                          extra=("--max-model", "opus"))
+        self.assertEqual(code, 4)
+        self.assertNotIn("fable", {c["model"] for c in calls})
+        self.assertEqual(s["result"], "gave_up")
+
+    def test_fable_fallback_is_not_evidence(self):
+        code, s, calls, _ = self.run_task("migration:mobile", "T3", {"pass": ["fable/high"], "cause": "capability",
+                                                                    "no_fable": True})
+        fable_steps = [st for st in s["steps"] if st["config"] == "fable/high"]
+        self.assertTrue(fable_steps and fable_steps[0]["fell_back_to"].startswith("claude-opus"))
+        self.assertFalse(any(e["model"] == "fable" for e in self.ledger()))
+
+    def test_advisor_only_for_valid_pairings(self):
+        self.run_task("feature:web", "T1", {"pass": ["sonnet/medium"]}, extra=("--advisor", "fable"))
+        self.assertEqual({c["advisor"] for c in [json.loads(x) for x in self.calls.read_text().splitlines()]},
+                         {"fable"})
+        import models
+        self.assertEqual(models.advisor_args("fable", "opus"), [])   # advisor must rank >= main model
+        self.assertEqual(models.advisor_args("opus", "opus"), ["--advisor", "opus"])
+        self.assertEqual(models.advisor_args("sonnet", None), [])
+
+    def test_every_tier_starts_at_the_worker_role(self):
+        for tier in ("T0", "T1", "T2", "T3"):
+            d = self.router.route("feature:web", tier)
+            self.assertEqual((d["model"], d["effort"], d["source"]), ("opus", "medium", "tier-default"), tier)
+        code, s, calls, err = self.run_task("rename:web", "T0", {"pass": ["opus/medium"]},
+                                            extra=("--start", "opus/medium"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(c["model"], c["effort"]) for c in calls], [("opus", "medium")])
+        # a failure at the worker start re-runs at opus/high (effort) before a stronger model
+        code, s, calls, err = self.run_task("bugfix:web", "T1", {"pass": ["opus/high"], "cause": "effort"},
+                                            extra=("--start", "opus/medium"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(c["model"], c["effort"]) for c in calls if not c["classifier"]][-1], ("opus", "high"))
+        os.environ["ORCHESTRATE_MODEL_WORKER"] = "sonnet/high"
+        try:
+            self.assertEqual(self.router.route("feature:web", "T1")["model"], "sonnet")
+        finally:
+            del os.environ["ORCHESTRATE_MODEL_WORKER"]
+
+    def test_advisor_workers_are_told_when_to_consult(self):
+        code, s, calls, err = self.run_task("feature:web", "T1", {"pass": ["opus/high"], "cause": "effort"},
+                                            extra=("--start", "opus/medium", "--advisor", "fable"))
+        self.assertEqual(code, 0, err)
+        workers = [c for c in calls if not c["classifier"]]
+        self.assertTrue(all(c["advisor"] == "fable" and c["consult"] for c in workers), workers)
+        self.assertEqual({st["advisor"] for st in s["steps"]}, {"fable"})
+        # no advisor: no consult line
+        _, _, calls, _ = self.run_task("feature:web", "T1", {"pass": ["opus/medium"]}, extra=("--start", "opus/medium"))
+        self.assertFalse(any(c["consult"] for c in calls))
+
+    def test_max_model_caps_the_advisor(self):
+        import models
+        self.assertEqual(models.advisor_args("opus", "fable", "opus"), ["--advisor", "opus"])
+        self.assertEqual(models.advisor_args("opus", "fable", None), ["--advisor", "fable"])
+        self.assertEqual(models.advisor_args("opus", "sonnet", None), [], "an advisor below the worker is dropped")
+
+    def test_advisor_refused_at_launch_runs_on_without_it(self):
+        code, s, calls, err = self.run_task("feature:web", "T1", {"pass": ["opus/medium"], "advisor_launch_fail": True},
+                                            extra=("--start", "opus/medium", "--advisor", "fable"))
+        self.assertEqual(code, 0, err)
+        workers = [c for c in calls if not c["classifier"]]
+        self.assertEqual([(c["advisor"], c["consult"]) for c in workers], [("fable", True), (None, False)])
+        self.assertIn("usage credits", s["advisor_off"])
+        self.assertEqual([(st["config"], st["ok"]) for st in s["steps"]], [("opus/medium", True)],
+                         "the refused launch is not a failed attempt for the model")
+        self.assertTrue(self.ledger()[-1]["ok"])
+
+    def test_refusal_stops_the_task_and_is_not_evidence(self):
+        code, s, calls, err = self.run_task("feature:web", "T1", {"refuse": True}, extra=("--start", "opus/medium"))
+        self.assertEqual(code, 9, err)
+        self.assertEqual((s["result"], s["refusal_category"]), ("refused", "cyber"))
+        self.assertEqual(len([c for c in calls if not c["classifier"]]), 1, "no retry, no escalation")
+        self.assertFalse(any(c["classifier"] for c in calls), "nothing to classify")
+        self.assertFalse((self.state / "ledger.jsonl").exists() and self.ledger(), "no routing evidence")
+
+    def test_cut_off_reply_is_never_a_verdict(self):
+        import claude_cli
+        d = {"stop_reason": "max_tokens", "is_error": False, "subtype": "success",
+             "structured_output": {"verdict": "pass"}}
+        self.assertEqual(claude_cli._kind(d), "cut_off")
+        self.assertEqual(claude_cli._kind({"stop_reason": "refusal", "subtype": "success"}), "refusal")
+        self.assertIsNone(claude_cli._kind({"stop_reason": "end_turn", "subtype": "success"}))
+
+    def test_floors_from_the_old_ladder_still_route(self):
+        # v1 stored floors as indexes into haiku/low..opus/xhigh; 4 was opus/high
+        (self.state / "routing.json").write_text(json.dumps({"bugfix:api": {
+            "floor": 4, "approved_at": __import__("time").time(), "model_alias": "sonnet"}}))
+        d = self.route("bugfix:api", "T1")
+        self.assertEqual((d["model"], d["effort"], d["source"]), ("opus", "high", "learned"))
+        (self.state / "ledger.jsonl").write_text(json.dumps({
+            "t": 0, "task_id": "x", "type": "bugfix:api", "tier": "T1", "rung": 4, "model": "opus",
+            "effort": "high", "ok": True}) + "\n")
+        self.assertEqual(self.router._ledger()[0]["rung"], self.router.LADDER.index(("opus", "high")))
+
+    def test_role_defaults_follow_anthropic_guidance(self):
+        import models
+        self.assertEqual(models.role("classifier"), ("haiku", "low"))
+        self.assertEqual(models.role("manager"), ("opus", "medium"))
+        self.assertEqual(models.role("planner"), ("fable", "medium"))
+        self.assertEqual(models.role("planner", {"max_model": "opus"}), ("opus", "high"))
+        # the user's assignment (2026-11-16)
+        self.assertEqual(models.role("advisor"), ("fable", "medium"))
+        self.assertEqual(models.ADVISOR_ESCALATE, "high")
+        self.assertEqual(models.role("advisor", {"max_model": "opus"}), ("opus", "high"))
+        for r in ("manager", "worker", "reviewer", "area_reviewer", "cleanup"):
+            self.assertEqual(models.role(r), ("opus", "medium"), r)
+        self.assertEqual(models.role("manager", {"models": {"manager": "sonnet/high"}}), ("sonnet", "high"))
+        self.assertEqual(models.role("lessons", {"models": {"lessons": "sonnet"}}), ("sonnet", "high"))
+        self.assertTrue(models.validate_plan({"models": {"planer": "opus"}}))
+        self.assertTrue(models.validate_plan({"models": {"manager": "gpt/high"}}))
+        self.assertEqual(models.validate_plan({"models": {"manager": "opus/medium"}, "max_model": "opus"}), [])
 
     def test_rule_expires_when_model_version_changes(self):
-        cfg = {"pass": ["opus/high"], "cause": "capability"}
+        cfg = {"pass": ["sonnet/high"], "cause": "capability"}
         self.run_task("bugfix:mobile", "T1", cfg)
         _, s, *_ = self.run_task("bugfix:mobile", "T1", cfg)
         self.router.approve(s["proposals"][0]["id"])
-        self.assertEqual(self.router.route("bugfix:mobile", "T1")["source"], "learned")
+        self.assertEqual(self.route("bugfix:mobile", "T1")["source"], "learned")
         self.router.note_alias("sonnet", "claude-sonnet-5-6")  # new Sonnet ships
-        d = self.router.route("bugfix:mobile", "T1")
+        d = self.route("bugfix:mobile", "T1")
         self.assertEqual((d["model"], d["source"]), ("sonnet", "tier-default"))
         self.assertIn("expired", d["rule"])
 
     def test_probe_wins_propose_lowering_the_floor(self):
-        cfg = {"pass": ["opus/high"], "cause": "capability"}
+        cfg = {"pass": ["opus/medium"], "cause": "capability"}
         self.run_task("refactor:web", "T1", cfg)
         _, s, *_ = self.run_task("refactor:web", "T1", cfg)
-        self.router.approve(s["proposals"][0]["id"])           # floor = opus/high (rung 4)
+        floor = next(p for p in s["proposals"] if "opus/medium" in p["reason"])
+        self.router.approve(floor["id"])                        # floor = opus/medium
         props = []
-        for _ in range(3):  # probe at sonnet/high (rung 3), which now passes
-            code, s, calls, _ = self.run_task("refactor:web", "T1", {"pass": ["sonnet/high"]}, probe_rate="1")
+        for _ in range(3):  # probe one rung lower, at opus/low, which now passes
+            code, s, calls, _ = self.run_task("refactor:web", "T1", {"pass": ["opus/low"]}, probe_rate="1")
             self.assertEqual(code, 0)
-            self.assertEqual((calls[0]["model"], calls[0]["effort"]), ("sonnet", "high"))
+            self.assertEqual((calls[0]["model"], calls[0]["effort"]), ("opus", "low"))
             props += s["proposals"]
         self.assertEqual(len(props), 1)
         self.assertEqual(props[0]["kind"], "lower_floor")
         self.router.approve(props[0]["id"])
-        self.assertEqual(self.router.route("refactor:web", "T1")["rung"], 3)
+        d = self.route("refactor:web", "T1")
+        self.assertEqual((d["model"], d["effort"]), ("opus", "low"))
 
     def test_failed_probe_returns_to_floor(self):
-        cfg = {"pass": ["opus/high"], "cause": "capability"}
+        cfg = {"pass": ["opus/medium"], "cause": "capability"}
         self.run_task("test:api", "T1", cfg)
         _, s, *_ = self.run_task("test:api", "T1", cfg)
-        self.router.approve(s["proposals"][0]["id"])
+        self.router.approve(next(p for p in s["proposals"] if "opus/medium" in p["reason"])["id"])
         code, s, calls, _ = self.run_task("test:api", "T1", cfg, probe_rate="1")
         workers = [(c["model"], c["effort"]) for c in calls if not c["classifier"]]
-        self.assertEqual(workers[0], ("sonnet", "high"))
-        self.assertEqual(workers[-1], ("opus", "high"))
+        self.assertEqual(workers[0], ("opus", "low"))       # the probe
+        self.assertEqual(workers[-1], ("opus", "medium"))   # straight back to the floor
         self.assertEqual(code, 0)
 
     def test_bad_task_type_rejected(self):
         with self.assertRaises(SystemExit):
-            self.router.route("stuff:api", "T1")
+            self.route("stuff:api", "T1")
         with self.assertRaises(SystemExit):
-            self.router.route("bugfix:Not A Slug", "T1")
-        self.assertEqual(self.router.route("bugfix:billing-service", "T1")["model"], "sonnet")
+            self.route("bugfix:Not A Slug", "T1")
+        self.assertEqual(self.route("bugfix:billing-service", "T1")["model"], "sonnet")
 
     def test_default_state_dir_is_outside_the_skill(self):
         env = {k: v for k, v in os.environ.items() if k not in ("ORCHESTRATE_DIR", "XDG_DATA_HOME")}
@@ -212,6 +382,66 @@ class RoutingTest(unittest.TestCase):
                              cwd=SCRIPTS, env=env, capture_output=True, text=True).stdout.strip()
         self.assertEqual(out, str(self.tmp / "home/.local/share/orchestrate"))
 
+
+    def test_test_output_is_not_mistaken_for_a_broken_environment(self):
+        import run_task
+        rt = importlib.reload(run_task)
+        code_failures = ["--- FAIL: TestRateLimit (0.00s)\n    handler_test.go:41: expected status 429, got 200",
+                         "expected 529 retry-after header", "Error: Cannot find module 'zod'",
+                         "AssertionError: rate limit not applied"]
+        for out in code_failures:
+            self.assertIsNone(rt.env_signature(out, ["make test-api"]), out)
+        infra = {"dial tcp 127.0.0.1:5432: connect: connection refused": ["make test-api"],
+                 "make: *** No rule to make target 'test-api'.  Stop.": ["make test-api"],
+                 "bash: line 1: pnpm: command not found": ["pnpm --filter web test"],
+                 "/bin/sh: 1: go: not found": ["cd apps/api && env GOTMPDIR=x go test ./..."]}
+        for out, cmds in infra.items():
+            self.assertIsNotNone(rt.env_signature(out, cmds), out)
+
+    def test_claude_errors_map_to_causes(self):
+        import run_task
+        rt = importlib.reload(run_task)
+        self.assertEqual(rt.classify("t", 2, {"is_error": True, "error_kind": "max_turns"}, "", self.repo, 5)["cause"], "effort")
+        self.assertEqual(rt.classify("t", 2, {"is_error": True, "error_kind": "timeout"}, "", self.repo, 5)["cause"], "unknown")
+        self.assertEqual(rt.classify("t", 2, {"is_error": True, "error_kind": "overloaded"}, "", self.repo, 5)["cause"], "environment")
+
+    def test_api_overload_is_retried_not_blamed(self):
+        import claude_cli
+        cc = importlib.reload(claude_cli)
+        fake = self.tmp / "flaky"
+        counter = self.tmp / "n"
+        fake.write_text(textwrap.dedent(f"""\
+            #!/usr/bin/env python3
+            import json, pathlib
+            p = pathlib.Path({str(counter)!r}); n = int(p.read_text()) if p.exists() else 0; p.write_text(str(n + 1))
+            if n < 2:
+                print(json.dumps({{"is_error": True, "subtype": "error_during_execution", "api_error_status": 529,
+                                  "result": "overloaded_error"}}))
+            else:
+                print(json.dumps({{"is_error": False, "subtype": "success", "result": "ok", "num_turns": 2,
+                                  "structured_output": {{"cause": "effort", "evidence": "e"}},
+                                  "usage": {{"input_tokens": 1, "cache_read_input_tokens": 9}}}}))
+        """))
+        fake.chmod(0o755)
+        os.environ["ROUTER_CLAUDE_BIN"], os.environ["ORCHESTRATE_API_BACKOFF_S"] = str(fake), "0"
+        try:
+            r = cc.call("x", "sonnet", "low", self.repo, perm="plan", tools=[], schema={"type": "object"})
+        finally:
+            del os.environ["ROUTER_CLAUDE_BIN"], os.environ["ORCHESTRATE_API_BACKOFF_S"]
+        self.assertFalse(r["is_error"])
+        self.assertEqual(r["structured"], {"cause": "effort", "evidence": "e"})
+        self.assertEqual(r["metrics"]["cache_read"], 9)
+        self.assertEqual(counter.read_text(), "3")
+
+    def test_budget_stops_the_task(self):
+        fake = self.tmp / "claude"
+        fake.write_text(FAKE_CLAUDE.replace('print(json.dumps({"result": res,',
+                                            'print(json.dumps({"subtype": "error_max_budget_usd", "is_error": True, "result": res,')
+                        .replace('"is_error": False,', ""))
+        code, s, calls, err = self.run_task("feature:web", "T1", {"pass": []})
+        self.assertEqual(code, 7, err)
+        self.assertEqual(s["result"], "budget")
+        self.assertFalse(any(c["classifier"] for c in calls), "budget is not a failure to classify")
 
 if __name__ == "__main__":
     unittest.main()

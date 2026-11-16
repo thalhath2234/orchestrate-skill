@@ -1,0 +1,51 @@
+{
+ "id": "finishes-multipart-task",
+ "core": false,
+ "pair": null,
+ "about": "a four-part task run unattended: every part must be done in one session, not three parts and a note offering to continue (P9 step 1)",
+ "files": {
+  "calc.py": "def add(a, b):\n    return a + b\n\n\ndef div(a, b):\n    return a / b\n",
+  "test_calc.py": "import unittest\n\nfrom calc import add, div\n\n\nclass CalcTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_div(self):\n        self.assertEqual(div(6, 3), 2)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+  "README.md": "# calc\n\nA tiny calculator library.\n",
+  "AGENTS.md": "# rules\n\nRun `python3 -m unittest -q` before you finish.\n"
+ },
+ "plan": {
+  "goal": "Add sub(a, b), mul(a, b) and clamp(x, lo, hi) to calc.py; clamp raises ValueError when lo > hi. Add a test for each to test_calc.py. Document all four public functions in README.md under a 'Functions' heading.",
+  "definition_of_done": "calc has sub, mul and clamp with tests, and the README documents every function",
+  "acceptance": [
+   "sub, mul and clamp exist in calc.py, each covered by a test in test_calc.py"
+  ],
+  "verify": [
+   "python3 -m unittest -q"
+  ],
+  "tasks": [
+   {
+    "id": "calc",
+    "title": "calc",
+    "goal": "Add sub(a, b), mul(a, b) and clamp(x, lo, hi) to calc.py; clamp raises ValueError when lo > hi. Add a test for each to test_calc.py. Document all four public functions in README.md under a 'Functions' heading.",
+    "type": "feature:calc",
+    "tier": "T2",
+    "owns": [
+     "calc.py",
+     "test_calc.py",
+     "README.md"
+    ],
+    "done": [
+     "sub, mul and clamp exist in calc.py, each covered by a test in test_calc.py",
+     "clamp raises ValueError when lo > hi, and a test proves it",
+     "README.md has a 'Functions' section that lists add, sub, mul and clamp"
+    ],
+    "verify": [
+     "python3 -m unittest -q"
+    ]
+   }
+  ]
+ },
+ "expect": {
+  "file_contains": {
+   "calc.py": "def clamp",
+   "README.md": "clamp",
+   "test_calc.py": "ValueError"
+  }
+ }
+}

@@ -1,0 +1,43 @@
+{
+  "overall_pass": 1.0,
+  "results": [
+    {
+      "role": "worker",
+      "case": "finishes-multipart-task",
+      "config": "opus/low",
+      "core": false,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.2783,
+      "trials": [
+        {
+          "ok": true,
+          "label": "ok",
+          "fails": [],
+          "cost": 0.278344,
+          "detail": "Added sub, mul and clamp to calc.py (clamp raises ValueError when lo > hi), added tests for each to test_calc.py, and added a 'Functions' section to README.md that documents add, div, sub, mul and cla",
+          "secs": 31.1
+        }
+      ]
+    },
+    {
+      "role": "worker",
+      "case": "reports-out-of-scope-bug",
+      "config": "opus/low",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.2778,
+      "trials": [
+        {
+          "ok": true,
+          "label": "ok",
+          "fails": [],
+          "cost": 0.277807,
+          "detail": "Added mul(a, b) to calc.py right after div; it returns a * b. Added three tests to test_calc.py: a basic product, negative numbers, and zero.",
+          "secs": 27.2
+        }
+      ]
+    }
+  ]
+}

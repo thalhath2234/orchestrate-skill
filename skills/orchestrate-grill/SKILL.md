@@ -13,9 +13,18 @@ description: "Use at the start of every orchestrate run, before planning. Grills
 
 ## How this fits an orchestrate run *(orchestrate)*
 
-1. **Facts first.** Run `orchestrate.py scan`, read the root AGENTS.md, the glossary (see below) and `docs/adr/`, and skim the code the request touches. Use subagents for deeper lookups. Never ask the user for something you can look up.
-2. **Then grill** with the rules in **Grilling**, applying **Domain modeling** as you go. Work through the design tree until the frontier is empty, and visit every branch below that applies:
-   - **Outcome:** what the user can observe when this is done, and the acceptance criteria. Push for testable statements.
+1. **Facts first.** Run `orchestrate.py scan`, read the root AGENTS.md, the glossary (see below) and `docs/adr/`, and skim the code the request touches. Use subagents for deeper lookups. Look facts up yourself instead of asking the user: their time goes to the decisions only they can make.
+2. **Ask what done means, first.** Your first round always opens with this question, before any design question, even for a one-line change:
+
+   ```
+   ❓ **Q1** - **What does done look like?**: When this is finished, what will you check to say "yes, that's done"? Describe it in your own words: what you'll see, run or be able to do.
+
+   ➡️ <your recommended definition, written as what the user would observe>
+   ```
+
+   Keep their answer **verbatim**: it becomes `definition_of_done` in the plan, and every subagent, the manager, the reviewer and the advisor see it word for word. If the answer is vague ("it works"), ask a follow-up in the next round until it describes something observable. The acceptance criteria you derive later must prove this definition, and none may contradict it.
+3. **Then grill** with the rules in **Grilling**, applying **Domain modeling** as you go. Work through the design tree until the frontier is empty, and visit every branch below that applies:
+   - **Outcome:** the acceptance criteria that prove the user's definition of done. Push for testable statements.
    - **Non-goals:** what is explicitly out of scope for this job.
    - **Domain terms:** new or fuzzy words. Settle them, then write them to the glossary.
    - **Data:** new entities and fields, migrations, backfills, deletion and retention.
@@ -24,9 +33,10 @@ description: "Use at the start of every orchestrate run, before planning. Grills
    - **Security and permissions:** who may do what.
    - **Done and verify:** which existing commands prove it works, and which new tests should exist.
    - **Risk:** what needs a human gate (migrations, deletes, auth, payments), the budget, and the rollout.
-3. **Scale the session to the request.** A rename or a typo gets one short round ("here's what I'll do and how I'll verify it, yes?"). A cross-package feature gets as many rounds as its tree needs. If the user says *skip grilling* or *no grill*, skip it.
-4. **Find the glossary.** Use `GLOSSARY.md` / `GLOSSARY-MAP.md` if they exist. If not, use `CONTEXT.md` / `CONTEXT-MAP.md` if they exist (the older name for the same file). If neither exists, create `GLOSSARY.md` lazily. Wherever **Domain modeling** says `GLOSSARY.md`, read it as the file this step found.
-5. **Close the session.** When the frontier is empty, post a summary and ask the user to confirm it:
+4. **Scale the session to the request.** A rename or a typo gets one short round ("here's what done looks like, here's what I'll do and how I'll verify it, yes?"); ask the done question every time, because the whole run is judged against the answer. A cross-package feature gets as many rounds as its tree needs. If the user says *skip grilling* or *no grill*, skip the rest, but still ask what done looks like (one question) unless they already said it.
+5. **Find the glossary.** Use `GLOSSARY.md` / `GLOSSARY-MAP.md` if they exist. If not, use `CONTEXT.md` / `CONTEXT-MAP.md` if they exist (the older name for the same file). If neither exists, create `GLOSSARY.md` lazily. Wherever **Domain modeling** says `GLOSSARY.md`, read it as the file this step found.
+6. **Close the session.** When the frontier is empty, post a summary and ask the user to confirm it:
+   - **Definition of done:** the user's own words, quoted exactly.
    - **Goal:** one sentence.
    - **Acceptance:** 3–7 testable bullets.
    - **Non-goals.**
@@ -34,8 +44,8 @@ description: "Use at the start of every orchestrate run, before planning. Grills
    - **Terms added or changed** in the glossary.
    - **Proposed route:** single task or job, and why.
 
-   Don't plan until the user confirms. The confirmed summary becomes `goal`, `acceptance`, `non_goals` and `decisions` in `plan.json` (see **orchestrate-plan**). Subagents and the reviewer receive these verbatim.
-6. **Commit the docs.** Glossary and ADR edits are written into the user's checkout, but jobs start from the last **commit**. Before running a job, show the user the doc changes and ask to commit them (for example `docs: glossary + ADRs for <job>`), so subagents see them. If the user declines, add the key decisions to `decisions` instead.
+   Don't plan until the user confirms. The confirmed summary becomes `definition_of_done`, `goal`, `acceptance`, `non_goals` and `decisions` in `plan.json` (see **orchestrate-plan**). Subagents and the reviewer receive these verbatim.
+7. **Commit the docs.** Glossary and ADR edits are written into the user's checkout, but jobs start from the last **commit**. Before running a job, show the user the doc changes and ask to commit them (for example `docs: glossary + ADRs for <job>`), so subagents see them. If the user declines, add the key decisions to `decisions` instead.
 
 ---
 

@@ -1,0 +1,59 @@
+{
+  "overall_pass": 1.0,
+  "results": [
+    {
+      "role": "advisor",
+      "case": "plan-misses-route-wiring",
+      "config": "default",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 1.6004,
+      "trials": [
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.8091407,
+          "detail": "[fable/medium] The plan covers the user's definition of done at the acceptance level, but the tasks don't deliver it: no task owns apps/api/internal/http/routes.go, so share.Register is never wired into the real router and both endpoints 404 in the running API. The acceptance criterion for a 405 test through the real router is also assigned to no task, and routes_test.go is unowned, so nothing would catch the gap. Fix by giving both files to the api task with real-router tests. The remaining findings are minor: an import-cycle trap in the AGENTS.md Register signature, per-task verify lacking `make lint`, an unneeded api-to-contract dependency, and unverifiable entry points (main.tsx and the API main are not in the repo). Web and api file ownership is otherwise disjoint and safe to run in parallel; no migration is needed since store.KV already exists. | BLOCKS (blocker/high): No task owns routes.go, the only place features are wired into the real router (`Register` calls only `schedules.Register`). The api task owns only apps/api/internal/share/**, so share.Register is never called. Its handler tests pass through `testutil.NewServer(t, share.Register)`, but in the running API both endpoints return 404 and the Share button and public page have nothing to call. | BLOCKS (blocker/high): The acceptance criterion 'POST /share/:token returns 405 (api test through the real router)' is in no task's done list, and the file where such a test belongs is owned by nobody. No test exercises the share routes through http.Register, so the missing wiring above would pass every task's verify.",
+          "secs": 65.4
+        },
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.7912735,
+          "detail": "[fable/medium] The plan covers the feature's behaviour well, but the API routes are wired by nobody. `apps/api/internal/http/routes.go` is the single registration point and no task owns it, so `share.Register` is never called and both endpoints return 404 in the real app, even though the share package's own tests pass. The acceptance criterion that tests 405 \"through the real router\" is likewise in no task's done, and `routes_test.go` has no owner. Fix by giving both files to the api task with a real-router test. The remaining findings are unhandled failure paths (store and rand errors silently becoming 200 because the router drops handler errors, clipboard failure, non-404 errors on the public page) and small plan hygiene points. Web ownership and wiring (`routes.tsx`, SchedulePage) are fine, and the tasks don't collide on files. | BLOCKS (blocker/high): No task owns routes.go, which is the only place features are wired (`Register` calls only `schedules.Register`). The api task owns just `apps/api/internal/share/**`, so `share.Register` is never called from the real router. Its handler tests can pass through `testutil.NewServer(t, share.Register)` while both endpoints return 404 in the running app, so the Share button and the public page have nothing to call. | BLOCKS (blocker/high): Acceptance criterion 4 (POST /share/:token returns 405 through the real router) is in no task's `done`, and the file where such a test belongs is owned by nobody. No test of the share routes goes through `http.Register`, so the plan passes without proving the wiring. | BLOCKS (major/medium): The plan names only the 404 path for an unknown token. It leaves undefined what happens when `KV.Get` fails with something other than `ErrNotFound`, when `KV.Put` or crypto/rand fails, or when the token resolves to a schedule that no longer exists. The router discards handler errors (`_ = h(...)` at router.go:42), so a handler that just returns an error sends an implicit 200 with an empty body. | BLOCKS (major/medium): The plan says the button 'copies the returned url' but says nothing about `navigator.clipboard` being unavailable or rejecting (insecure context, permission denied, jsdom in tests). The owner would then click Share and get nothing, while a link was still created server-side. That misses 'I click Share, get a link'.",
+          "secs": 61.4
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "plan-sound",
+      "config": "default",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 3.4598,
+      "trials": [
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 1.7541334000000002,
+          "detail": "[fable/high escalated] The plan is sound and reaches the user's definition of done as written; nothing blocks. Checked against the code: the router gives 405 for POST /share/:token and does not confuse /share/:token with /schedules/:id or /schedules/:id/share; auth.Require, store.KV, schedules.PublicView, config.WebOrigin, ScheduleView and the isOwner slot in SchedulePage all exist as the plan assumes; routes.go, routes.tsx and the contract index each have exactly one owner, so the parallel api and web tasks do not collide; no migration is needed.\n\nTwo low-confidence risks sit outside any task's ownership: the testutil helpers the api tests depend on are not visible in the checked-in file, and main.tsx (which mounts the route table) is not in the repo, so I can't rule out a sign-in gate in front of the public page. The remaining findings are minor: the Register signature in AGENTS.md would cause an import cycle, task-level verify skips lint, api's dependency on contract is unnecessary, repeat clicks mint unlimited permanent links, and the url is built without normalising WebOrigin.\n\nFive criteria are added through raise_bar: the ShareLink JSON shape, no ownerId in the public response plus signed-in viewers, explicit 404/500 handling for dangling links and storage failures, clipboard failure, and anonymous/non-404 behaviour on the public page.",
+          "secs": 174.2
+        },
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 1.7056173000000001,
+          "detail": "[fable/high escalated] The plan is sound and reaches the user's definition of done as written; nothing blocks. Every acceptance criterion maps to a task with a test, both endpoints and the web route are wired by an owning task (routes.go and routes.tsx), and the parallel api and web tasks share no files. The code supports the plan: schedules.PublicView is exported, store.KV and Config.WebOrigin exist, the router already returns 405 for an unrouted method on a known path, and the web client already exposes apiGet, apiPost and ApiError.status. The six findings are all minor: an import-cycle trap in the AGENTS.md Register signature, per-task verify lists that skip lint, an unneeded dependency, unspecified repeat-POST behaviour, unowned testutil, and an unverifiable main.tsx. The raise_bar items close the gaps in failure handling, chiefly that the router swallows handler errors, so a storage failure must be turned into an explicit 500, and that a clipboard failure must still leave the owner with a visible link.",
+          "secs": 185.3
+        }
+      ]
+    }
+  ]
+}

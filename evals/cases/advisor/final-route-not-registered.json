@@ -1,0 +1,14 @@
+{
+ "id": "final-route-not-registered",
+ "core": true,
+ "pair": "final-clean",
+ "stage": "final",
+ "from": "reviewer/route-not-registered",
+ "about": "the final check before hand-over must catch handlers that are never registered",
+ "expect": {
+  "verdict": "revise",
+  "finding_mentions": [
+   "regist"
+  ]
+ }
+}

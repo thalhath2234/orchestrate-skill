@@ -1,0 +1,5 @@
+PASS  reviewer   decision-respected-passes                  default       pass 1.00 consistent 0.67 $1.078
+FLAKY classifier cannot-find-module-is-not-environment      default       pass 0.33 consistent 0.67 $0.242  <- ['cause effort != context']
+
+classifier default       pass 0.33  consistency 0.67  cost $0.24 (1 cases x 3 trials)
+reviewer   default       pass 1.00  consistency 0.67  cost $1.08 (1 cases x 3 trials)

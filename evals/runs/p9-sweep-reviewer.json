@@ -1,0 +1,119 @@
+{
+  "overall_pass": 1.0,
+  "results": [
+    {
+      "role": "reviewer",
+      "case": "clean-diff-passes",
+      "config": "opus/high",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.4367,
+      "trials": [
+        {
+          "ok": true,
+          "label": "pass",
+          "fails": [],
+          "cost": 0.4367013,
+          "detail": "All four acceptance criteria are met and backed by tests. POST returns 201 with an opaque 128-bit crypto/rand hex token, matching ADR 0007 and the ShareLink contract. Only the owner can create links (non-owner gets 403, unknown schedule 404). GET returns the read-only schedule, with 404 for unknown or expired tokens, including the exact expiry boundary. ShareButton copies the link and shows the URL in an alert when copying fails, including when the clipboard API is missing. The API and web field names agree (token, scheduleId, expiresAt). Three possible problems are reported as major at low confidence: a token for a deleted schedule can't return 404 because ReadOnly returns no error; every schedule-lookup error is mapped to 404; and no web page serves the copied /share/:token URL, nor is ShareButton mounted anywhere. The minor findings are a test that doesn't assert which schedule id was used, the raw expiry string, no revocation, and unverified compilation of the http wiring.",
+          "secs": 87.2
+        }
+      ]
+    },
+    {
+      "role": "reviewer",
+      "case": "decision-respected-passes",
+      "config": "opus/high",
+      "core": false,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.4161,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.4160913,
+          "detail": "Every job acceptance criterion is met and backed by a test. POST /schedules/:id/share is owner-only and returns 201 with a ShareLink-shaped body. The fields match packages/contract/src/share.ts (token, scheduleId, expiresAt). GET /share/:token returns 404 for unknown tokens and for expired ones, including the exact expiry instant. ShareButton copies the link and shows an error when the copy fails. Routes are registered in routes.go. Tokens are 128-bit crypto/rand hex strings, opaque and not JWTs, so the ADR 0007 decision is respected. The diff adds no expiry editing, which respects the non-goal. Tests exercise real handler behaviour, including the error paths. Remaining concerns: two low-confidence majors (no visible web page for the copied /share/:token URL; a deleted schedule behind a valid link would return 200 rather than 404, latent because no delete endpoint exists) and a few minors: error masking on Get, no test for an anonymous create, raw ISO expiry text, a leaky navigator stub in the tests, the button not mounted anywhere, and the token in the URL path. No text in the untrusted blocks tried to direct the review.",
+          "secs": 78.6
+        }
+      ]
+    },
+    {
+      "role": "reviewer",
+      "case": "missing-owner-check",
+      "config": "opus/high",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.3808,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.38083120000000004,
+          "detail": "The routes are registered and the basic create/get/copy paths exist, but the core security criterion is missing. Create never checks that the caller owns the schedule, or even that they are logged in, so anyone can mint a public link to any schedule. There is no 403 test, and the 404 tests for unknown schedules and expired tokens are also missing. The POST response returns only {token}, while the web button renders expiresAt from the ShareLink contract, so it shows 'undefined'. The button has no copy-failure handling or error message, which its subtask requires. Links are saved with no explicit expiry and Save errors are ignored. `make test` is `true`, so the passing verify output proves nothing, and the tests rely on undefined helpers.",
+          "secs": 64.0
+        }
+      ]
+    },
+    {
+      "role": "reviewer",
+      "case": "non-goal-built",
+      "config": "opus/high",
+      "core": false,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.4069,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.4068516,
+          "detail": "Not done. None of the four acceptance criteria has real test evidence. The Makefile `test` target is `true`, so the passing verify proved nothing. The Go tests use helpers defined nowhere (assertStatus/post/get/owner/stranger/tok), and the web test uses render/screen/click without imports and never mocks the clipboard. The job also builds an ExpiryPicker, which the non-goals forbid, and wires it with a no-op handler. The web subtask's 'error message when copying fails' isn't implemented. The API returns only {token} while the button reads expiresAt from ShareLink. ShareButton isn't mounted, and nothing calls the create endpoint. On the API side the handlers broadly match the intent and ADR 0007 (opaque 128-bit random tokens, owner check, 404 for unknown/expired tokens). Gaps: the rand.Read and Links.Save errors are ignored, all lookup errors map to 404, there is no anonymous-caller handling, and a deleted schedule behind a link is not handled. The unknown-schedule and expired-token tests are missing.",
+          "secs": 84.5
+        }
+      ]
+    },
+    {
+      "role": "reviewer",
+      "case": "producer-consumer-mismatch",
+      "config": "opus/high",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.3966,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.39660029999999996,
+          "detail": "The API endpoints exist and the owner check, the 404 for unknown tokens and the opaque random token look correct. Several things block the job. First, the web ShareButton reads `link.expires_at`, but the contract field is `expiresAt`, so the code fails type-checking and the button shows 'undefined'. Second, the web subtask's 'error message when copy fails' criterion is not implemented or tested. Third, `make test` is the no-op `true`, so no test ever ran, and the tests use undefined helpers. Also missing: tests for the unknown-schedule 404 and the expired-token 404, error handling for rand.Read and Save, any expiry being set or returned (the API returns only a token, not a ShareLink), handling for a schedule deleted after its link was created, and wiring of the button and the /share page into the app.",
+          "secs": 73.7
+        }
+      ]
+    },
+    {
+      "role": "reviewer",
+      "case": "route-not-registered",
+      "config": "opus/high",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.4426,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.44255730000000004,
+          "detail": "The job is not done. The share handlers exist but are never wired in: apps/api/internal/http/routes.go calls only schedules.Register, so both share endpoints 404 in the app, even though the api report says the routes were registered. The verify step proved nothing because the Makefile test target is `true`, and the Go and TS tests reference undefined helpers or imports. Done criteria from the subtasks are missing: there are no tests for an unknown schedule or an expired token, and the button has no copy-error message or test. Create ignores errors from rand.Read and Save and maps every lookup error to 404. Create returns only {token} while the button consumes the full ShareLink, so it renders 'valid until undefined'. No expiry is set. Nothing handles a schedule deleted after its link was made. The copied web URL /share/:token has no page that renders it. Owner-only creation and opaque random tokens (per the ADR) are implemented correctly at the handler level.",
+          "secs": 98.1
+        }
+      ]
+    }
+  ]
+}

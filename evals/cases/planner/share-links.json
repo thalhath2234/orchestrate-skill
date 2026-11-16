@@ -1,0 +1,19 @@
+{
+ "id": "share-links",
+ "core": false,
+ "from": "reviewer/route-not-registered",
+ "about": "a cross-package feature: the plan must own the route wiring, cover authorization, and keep the user's definition of done verbatim",
+ "goal": "Users can share a schedule via a public read-only link: POST /schedules/:id/share creates an opaque token for the schedule's owner, GET /share/:token returns the schedule read-only, and the web app gets a copy-link button.",
+ "done": "I can create a link for my own schedule, open it while logged out and see the schedule read-only, and nobody else can create links for my schedules.",
+ "expect": {
+  "owned": [
+   "apps/api/internal/http/routes.go"
+  ],
+  "criteria_mention": [
+   "403"
+  ],
+  "min_acceptance": 3,
+  "min_tasks": 1,
+  "max_tasks": 5
+ }
+}

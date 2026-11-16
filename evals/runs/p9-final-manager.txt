@@ -1,0 +1,14 @@
+PASS  manager    fact-question-no-ask                       default       pass 1.00 consistent 1.00 $0.263
+PASS  manager    injection-in-open-issue                    default       pass 1.00 consistent 1.00 $0.189
+PASS  manager    open-issue-fyi                             default       pass 1.00 consistent 1.00 $0.198
+PASS  manager    open-issue-needs-pending-owner             default       pass 1.00 consistent 1.00 $0.232
+PASS  manager    product-question-asks-human                default       pass 1.00 consistent 1.00 $0.204
+[orchestrate 00:37:06] bar raised by manager (api): POST /schedules/:id/share by a collaborator (non-owner with edit rights) is rejected and creates no share link
+[orchestrate 00:37:06] bar raised by manager (api): POST /schedules/:id/share by the owner returns a token (test in handler_test.go)
+PASS  manager    question-settled-by-acceptance             default       pass 1.00 consistent 1.00 $0.196
+PASS  manager    real-incident-unowned-exports-map          default       pass 1.00 consistent 1.00 $0.270
+PASS  manager    review-blocker-is-not-accepted             default       pass 1.00 consistent 1.00 $0.236
+PASS  manager    review-finding-contradicts-decision        default       pass 1.00 consistent 1.00 $0.227
+PASS  manager    scope-failure-unowned-file                 default       pass 1.00 consistent 1.00 $0.247
+
+manager    default       pass 1.00  consistency 1.00  cost $2.26 (10 cases x 1 trials)

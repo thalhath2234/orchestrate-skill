@@ -1,0 +1,23 @@
+{
+ "id": "wrong-place-is-context",
+ "core": true,
+ "pair": null,
+ "about": "stale AGENTS.md sent it to the wrong place",
+ "task": "Register the share endpoints so GET /share/:token is reachable",
+ "final_message": "Created apps/api/handlers/share_routes.go with RegisterShareRoutes and called it from an init() there.",
+ "verify_output": "$ make test-api\n--- FAIL: TestShareRouteReachable (0.00s)\n    routes_test.go:15: GET /share/abc -> 404 (route not registered)\nFAIL",
+ "files": {
+  "Makefile": "test-api:\n\tgo test ./...\n",
+  "apps/api/internal/http/routes.go": "package http\n// Register wires every feature's routes; init() registration is not used in this repo.\nfunc Register(r Router) { schedules.Register(r) }\n",
+  "AGENTS.md": "# rules\nHandlers live in apps/api/handlers/.\n"
+ },
+ "diff_files": {
+  "apps/api/handlers/share_routes.go": "package handlers\nfunc init() { RegisterShareRoutes() }\n"
+ },
+ "verify": [
+  "make test-api"
+ ],
+ "expect": {
+  "cause": "context"
+ }
+}

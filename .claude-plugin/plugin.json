@@ -1,10 +1,20 @@
 {
   "name": "orchestrate",
-  "version": "0.5.0",
+  "version": "0.7.0",
   "description": "Multi-agent coding orchestrator for repos and monorepos: grill the user (grill-with-docs), triage, plan, an Opus manager agent supervising split into owned subtasks, run parallel Claude subagents capped by machine capacity, merge, review. Routes each task to the right model and learns per task type.",
-  "author": { "name": "thalhath2234" },
+  "author": {
+    "name": "thalhath2234"
+  },
   "homepage": "https://github.com/thalhath2234/orchestrate-skill",
   "repository": "https://github.com/thalhath2234/orchestrate-skill",
   "license": "MIT",
-  "keywords": ["orchestrator", "multi-agent", "subagents", "monorepo", "model-selection", "routing", "code-review"]
+  "keywords": [
+    "orchestrator",
+    "multi-agent",
+    "subagents",
+    "monorepo",
+    "model-selection",
+    "routing",
+    "code-review"
+  ]
 }

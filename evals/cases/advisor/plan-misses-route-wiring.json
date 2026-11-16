@@ -1,0 +1,130 @@
+{
+ "id": "plan-misses-route-wiring",
+ "core": true,
+ "pair": "plan-sound",
+ "stage": "plan",
+ "files": {
+  "AGENTS.md": "# Repo rules\n\n- API: Go in apps/api. Handlers take app.Ctx; register them in a package-level Register(r *http.Router).\n- Web: React + vitest in apps/web. Call the API only through src/api/client.ts.\n- Shared types live in packages/contract and are re-exported from its index.ts.\n- `make lint` and `make test` must pass before a change is done.\n",
+  "Makefile": ".PHONY: lint test test-api test-web\n\nlint:\n\tcd apps/api && go vet ./...\n\tpnpm -r run lint\n\ntest-api:\n\tcd apps/api && go test ./...\n\ntest-web:\n\tpnpm --filter web test\n\ntest: test-api test-web\n",
+  "pnpm-workspace.yaml": "packages:\n  - 'apps/web'\n  - 'packages/*'\n",
+  "package.json": "{\"name\": \"mono\", \"private\": true}\n",
+  "docs/adr/0007-share-tokens.md": "# 7. Share tokens are opaque random strings\n\nStatus: accepted\n\n## Decision\nA share token is 32 bytes from crypto/rand, hex-encoded (64 characters). It carries no data and is not a JWT. Tokens are stored in store.KV under the namespace `share_links`, mapping token -> schedule id. Links do not expire in the first version; revocation comes later.\n\n## Why\nOpaque tokens can be revoked by deleting one KV entry, and leak nothing if logged.\n",
+  "apps/api/go.mod": "module example.com/api\n\ngo 1.22\n",
+  "apps/api/internal/app/ctx.go": "package app\n\nimport (\n\t\"example.com/api/internal/config\"\n\t\"example.com/api/internal/store\"\n)\n\n// Ctx is what every handler receives.\ntype Ctx interface {\n\tParam(name string) string\n\tUserID() string // \"\" when the caller is anonymous\n\tJSON(status int, v any) error\n\tNoContent(status int) error\n\tStore() *store.Store\n\tConfig() config.Config\n}\n\ntype Handler func(Ctx) error\n",
+  "apps/api/internal/config/config.go": "package config\n\n// Config is loaded from the environment at startup.\ntype Config struct {\n\tWebOrigin string // e.g. https://app.example.com, from WEB_ORIGIN\n}\n",
+  "apps/api/internal/store/store.go": "package store\n\nimport \"errors\"\n\nvar ErrNotFound = errors.New(\"not found\")\n\ntype Schedule struct {\n\tID      string  `json:\"id\"`\n\tOwnerID string  `json:\"ownerId\"`\n\tTitle   string  `json:\"title\"`\n\tEntries []Entry `json:\"entries\"`\n}\n\ntype Entry struct {\n\tStart string `json:\"start\"`\n\tEnd   string `json:\"end\"`\n\tLabel string `json:\"label\"`\n}\n\n// KV is a durable key-value table (SQLite-backed in production, in-memory in tests).\ntype KV interface {\n\tPut(ns, key, value string) error\n\tGet(ns, key string) (string, error) // ErrNotFound when missing\n}\n\ntype Store struct {\n\tKV        KV\n\tSchedules interface {\n\t\tGet(id string) (Schedule, error) // ErrNotFound when missing\n\t}\n}\n",
+  "apps/api/internal/auth/auth.go": "package auth\n\nimport (\n\t\"net/http\"\n\n\t\"example.com/api/internal/app\"\n)\n\n// Require wraps a handler so anonymous callers get 401.\nfunc Require(h app.Handler) app.Handler {\n\treturn func(c app.Ctx) error {\n\t\tif c.UserID() == \"\" {\n\t\t\treturn c.NoContent(http.StatusUnauthorized)\n\t\t}\n\t\treturn h(c)\n\t}\n}\n",
+  "apps/api/internal/http/router.go": "package http\n\nimport (\n\tstdhttp \"net/http\"\n\t\"strings\"\n\n\t\"example.com/api/internal/app\"\n)\n\n// Router maps method+path to handlers. Paths use :name params.\n// A known path with an unrouted method returns 405; an unknown path returns 404; a handler that\n// returns an error gets 500.\ntype Router struct {\n\troutes map[string]map[string]app.Handler\n\tnewCtx func(w stdhttp.ResponseWriter, r *stdhttp.Request, params map[string]string) app.Ctx\n}\n\nfunc NewRouter(newCtx func(stdhttp.ResponseWriter, *stdhttp.Request, map[string]string) app.Ctx) *Router {\n\treturn &Router{routes: map[string]map[string]app.Handler{}, newCtx: newCtx}\n}\n\nfunc (r *Router) GET(path string, h app.Handler)  { r.add(\"GET\", path, h) }\nfunc (r *Router) POST(path string, h app.Handler) { r.add(\"POST\", path, h) }\n\nfunc (r *Router) add(method, path string, h app.Handler) {\n\tif r.routes[path] == nil {\n\t\tr.routes[path] = map[string]app.Handler{}\n\t}\n\tr.routes[path][method] = h\n}\n\nfunc (r *Router) ServeHTTP(w stdhttp.ResponseWriter, req *stdhttp.Request) {\n\tfor pattern, byMethod := range r.routes {\n\t\tparams, ok := match(pattern, req.URL.Path)\n\t\tif !ok {\n\t\t\tcontinue\n\t\t}\n\t\th, ok := byMethod[req.Method]\n\t\tif !ok {\n\t\t\tw.WriteHeader(stdhttp.StatusMethodNotAllowed)\n\t\t\treturn\n\t\t}\n\t\tif err := h(r.newCtx(w, req, params)); err != nil {\n\t\t\tw.WriteHeader(stdhttp.StatusInternalServerError) // a handler error is a 500, never an empty 200\n\t\t}\n\t\treturn\n\t}\n\tw.WriteHeader(stdhttp.StatusNotFound)\n}\n\nfunc match(pattern, path string) (map[string]string, bool) {\n\tps, xs := strings.Split(strings.Trim(pattern, \"/\"), \"/\"), strings.Split(strings.Trim(path, \"/\"), \"/\")\n\tif len(ps) != len(xs) {\n\t\treturn nil, false\n\t}\n\tparams := map[string]string{}\n\tfor i, p := range ps {\n\t\tif strings.HasPrefix(p, \":\") {\n\t\t\tparams[p[1:]] = xs[i]\n\t\t} else if p != xs[i] {\n\t\t\treturn nil, false\n\t\t}\n\t}\n\treturn params, true\n}\n",
+  "apps/api/internal/http/routes.go": "package http\n\nimport \"example.com/api/internal/schedules\"\n\n// Register wires every feature's routes. Add new features here.\nfunc Register(r *Router) {\n\tschedules.Register(r)\n}\n",
+  "apps/api/internal/http/routes_test.go": "package http\n\nimport (\n\t\"testing\"\n\n\t\"example.com/api/internal/testutil\"\n)\n\nfunc TestScheduleRouteIsRegistered(t *testing.T) {\n\tsrv := testutil.NewServer(t, Register)\n\tsrv.AsUser(\"u1\").GET(\"/schedules/s1\").ExpectStatus(t, 200)\n}\n",
+  "apps/api/internal/schedules/schedules.go": "package schedules\n\nimport (\n\t\"net/http\"\n\n\t\"example.com/api/internal/app\"\n\t\"example.com/api/internal/auth\"\n\t\"example.com/api/internal/store\"\n)\n\ntype router interface{ GET(string, app.Handler); POST(string, app.Handler) }\n\nfunc Register(r router) {\n\tr.GET(\"/schedules/:id\", auth.Require(get))\n}\n\n// PublicView is a schedule without private fields (no owner id), safe to show to anyone.\nfunc PublicView(s store.Schedule) map[string]any {\n\treturn map[string]any{\"id\": s.ID, \"title\": s.Title, \"entries\": s.Entries}\n}\n\nfunc get(c app.Ctx) error {\n\ts, err := c.Store().Schedules.Get(c.Param(\"id\"))\n\tif err != nil {\n\t\treturn c.NoContent(http.StatusNotFound)\n\t}\n\tif s.OwnerID != c.UserID() {\n\t\treturn c.NoContent(http.StatusForbidden)\n\t}\n\treturn c.JSON(http.StatusOK, s)\n}\n",
+  "apps/api/internal/testutil/testutil.go": "package testutil\n\nimport (\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"example.com/api/internal/app\"\n\t\"example.com/api/internal/store\"\n)\n\n// Server runs a real router over an in-memory store with fixtures: schedule s1 owned by u1, s2\n// owned by u2. Config.WebOrigin is https://app.test.\ntype Server struct {\n\tStore *store.Store\n\th     *httptest.Server\n}\n\ntype router interface {\n\tGET(string, app.Handler)\n\tPOST(string, app.Handler)\n}\n\n// NewServer builds the router, calls register on it (e.g. http.Register or share.Register) and serves it.\nfunc NewServer(t *testing.T, register any) *Server { return newServer(t, register) }\n\n// AsUser and Anonymous return a client; GET/POST return a Response with ExpectStatus(t, code)\n// and JSON(t, &v). KV(ns, key) reads the store directly for assertions.\nfunc (s *Server) AsUser(id string) *Client { return &Client{s: s, user: id} }\nfunc (s *Server) Anonymous() *Client     { return &Client{s: s} }\n\ntype Client struct {\n\ts    *Server\n\tuser string\n}\n",
+  "packages/contract/package.json": "{\"name\": \"@app/contract\", \"scripts\": {\"lint\": \"tsc --noEmit\"}}\n",
+  "packages/contract/src/index.ts": "export * from './schedule'\n",
+  "packages/contract/src/schedule.ts": "export type ScheduleEntry = { start: string; end: string; label: string }\n\n// What GET /schedules/:id returns to the owner (store.Schedule's JSON).\nexport type Schedule = { id: string; ownerId: string; title: string; entries: ScheduleEntry[] }\n\n// A schedule without private fields: schedules.PublicView in the API.\nexport type ScheduleView = Omit<Schedule, 'ownerId'>\n",
+  "apps/web/package.json": "{\"name\": \"web\", \"scripts\": {\"test\": \"vitest run\", \"lint\": \"tsc --noEmit\"}, \"dependencies\": {\"react\": \"^19.0.0\", \"react-router-dom\": \"^7.0.0\", \"@app/contract\": \"workspace:*\"}, \"devDependencies\": {\"vitest\": \"^3.0.0\", \"@testing-library/react\": \"^16.0.0\", \"typescript\": \"^5.6.0\"}}\n",
+  "apps/web/src/api/client.ts": "export async function apiGet<T>(path: string): Promise<T> {\n  const r = await fetch(`/api${path}`)\n  if (!r.ok) throw new ApiError(r.status)\n  return r.json()\n}\n\nexport async function apiPost<T>(path: string, body?: unknown): Promise<T> {\n  const r = await fetch(`/api${path}`, { method: 'POST', body: JSON.stringify(body ?? {}) })\n  if (!r.ok) throw new ApiError(r.status)\n  return r.json()\n}\n\nexport class ApiError extends Error {\n  constructor(public status: number) { super(`API ${status}`) }\n}\n",
+  "apps/web/src/routes.tsx": "import { SchedulePage } from './schedule/SchedulePage'\n\n// The app's route table, rendered by react-router's useRoutes in main.tsx.\nexport const routes = [\n  { path: '/schedules/:id', element: <SchedulePage /> },\n]\n",
+  "apps/web/src/schedule/SchedulePage.tsx": "import { useEffect, useState } from 'react'\nimport { useParams } from 'react-router-dom'\nimport type { Schedule } from '@app/contract'\nimport { apiGet } from '../api/client'\nimport { useCurrentUserId } from '../session'\n\nexport function SchedulePage() {\n  const { id } = useParams()\n  const userId = useCurrentUserId()\n  const [schedule, setSchedule] = useState<Schedule | null>(null)\n  useEffect(() => { apiGet<Schedule>(`/schedules/${id}`).then(setSchedule) }, [id])\n  if (!schedule) return <p>Loading…</p>\n  const isOwner = userId !== null && userId === schedule.ownerId\n  return (\n    <main>\n      <h1>{schedule.title}</h1>\n      <div className=\"actions\">{isOwner && null /* owner actions go here */}</div>\n      <ul>{schedule.entries.map(e => <li key={e.start}>{e.label}</li>)}</ul>\n    </main>\n  )\n}\n",
+  "apps/web/src/schedule/SchedulePage.test.tsx": "import { render, screen } from '@testing-library/react'\nimport { MemoryRouter, Route, Routes } from 'react-router-dom'\nimport { vi } from 'vitest'\nimport * as client from '../api/client'\nimport { SessionContext } from '../session'\nimport { SchedulePage } from './SchedulePage'\n\ntest('renders the schedule title', async () => {\n  vi.spyOn(client, 'apiGet').mockResolvedValue({ id: 's1', ownerId: 'u1', title: 'Week', entries: [] })\n  render(\n    <SessionContext.Provider value={{ userId: 'u1' }}>\n      <MemoryRouter initialEntries={['/schedules/s1']}>\n        <Routes><Route path=\"/schedules/:id\" element={<SchedulePage />} /></Routes>\n      </MemoryRouter>\n    </SessionContext.Provider>,\n  )\n  expect(await screen.findByText('Week')).toBeTruthy()\n})\n",
+  "apps/web/src/session.ts": "import { createContext, useContext } from 'react'\n\nexport const SessionContext = createContext<{ userId: string | null }>({ userId: null })\n\n// The signed-in user's id, or null when anonymous.\nexport function useCurrentUserId(): string | null {\n  return useContext(SessionContext).userId\n}\n"
+ },
+ "about": "same fixture and plan as plan-sound, except no task owns routes.go or checks that share.Register is wired: the endpoints would exist but be unreachable (the half-wired failure the reviewer catches late)",
+ "plan": {
+  "goal": "Schedule owners can share a schedule through a public, read-only link.",
+  "definition_of_done": "As a schedule owner I click Share, get a link, and anyone who opens it, signed in or not, sees the schedule read-only. Nobody else can create links for my schedules.",
+  "acceptance": [
+   "POST /schedules/:id/share by the owner returns 201 with a ShareLink whose token is 64 hex characters and whose url is WEB_ORIGIN/share/<token> (api test)",
+   "POST /schedules/:id/share returns 401 for an anonymous caller, 403 for a signed-in non-owner and 404 for an unknown schedule, and creates no link in each case (api tests)",
+   "GET /share/:token with no credentials returns 200 and schedules.PublicView of the schedule (no owner id); an unknown token returns 404 (api tests)",
+   "Only GET is routed for /share/:token: POST to it returns 405 (api test through the real router)",
+   "On SchedulePage the owner sees a Share button that calls POST /schedules/:id/share and copies the returned url; anyone else sees no button; an API failure shows an error message (web tests)",
+   "The web route /share/:token fetches GET /share/:token and renders the schedule read-only, and shows 'This link doesn't exist' on 404 (web tests)"
+  ],
+  "decisions": [
+   "Tokens are opaque: 32 bytes from crypto/rand, hex-encoded; not JWTs (docs/adr/0007-share-tokens.md)",
+   "Links are stored in store.KV, namespace share_links, token -> schedule id; no migration is needed",
+   "Links don't expire in this job",
+   "The API builds ShareLink.url as config.WebOrigin + '/share/' + token"
+  ],
+  "non_goals": [
+   "Expiry or revocation of links",
+   "Sharing with edit rights"
+  ],
+  "verify": [
+   "make lint",
+   "make test"
+  ],
+  "tasks": [
+   {
+    "id": "contract",
+    "title": "ShareLink type",
+    "type": "feature:contract",
+    "tier": "T1",
+    "goal": "Add the ShareLink type {token, scheduleId, url} to packages/contract and export it from the index.",
+    "owns": [
+     "packages/contract/src/share.ts",
+     "packages/contract/src/index.ts"
+    ],
+    "done": [
+     "packages/contract/src/share.ts exports ShareLink = { token: string; scheduleId: string; url: string }",
+     "ShareLink is re-exported from packages/contract/src/index.ts and `make lint` typechecks it"
+    ],
+    "verify": [
+     "make lint"
+    ]
+   },
+   {
+    "id": "api",
+    "title": "Share endpoints",
+    "type": "feature:api",
+    "tier": "T2",
+    "depends_on": [
+     "contract"
+    ],
+    "goal": "Add POST /schedules/:id/share (owner only, behind auth.Require) and public GET /share/:token in a new share package, and store links in store.KV.",
+    "owns": [
+     "apps/api/internal/share/**"
+    ],
+    "done": [
+     "POST /schedules/:id/share: owner gets 201 with a 64-hex-character token and url = WebOrigin/share/<token>; the link is stored in KV namespace share_links (handler test)",
+     "POST returns 401 anonymous, 403 non-owner, 404 unknown schedule, and stores nothing in those cases (handler tests)",
+     "GET /share/:token without credentials returns 200 with schedules.PublicView; unknown token 404 (handler tests)"
+    ],
+    "verify": [
+     "make test-api"
+    ]
+   },
+   {
+    "id": "web",
+    "title": "Share button and public page",
+    "type": "feature:web",
+    "tier": "T2",
+    "depends_on": [
+     "contract"
+    ],
+    "goal": "Add a Share button on SchedulePage for the owner, and a public /share/:token page, both through src/api/client.ts.",
+    "owns": [
+     "apps/web/src/share/**",
+     "apps/web/src/schedule/SchedulePage.tsx",
+     "apps/web/src/schedule/SchedulePage.test.tsx",
+     "apps/web/src/routes.tsx"
+    ],
+    "done": [
+     "SchedulePage shows ShareButton only when the signed-in user owns the schedule; clicking it calls apiPost('/schedules/:id/share') and copies the returned url (test with a mocked client)",
+     "When the POST fails, ShareButton shows an error message (test)",
+     "routes.tsx registers /share/:token to SharedSchedulePage, which renders the schedule read-only via apiGet and shows 'This link doesn't exist' on 404 (tests through the route table)"
+    ],
+    "verify": [
+     "make test-web"
+    ]
+   }
+  ]
+ },
+ "expect": {
+  "verdict": "revise",
+  "finding_mentions": [
+   "rout"
+  ]
+ }
+}

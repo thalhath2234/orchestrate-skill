@@ -1,0 +1,63 @@
+{
+  "overall_pass": 0.5,
+  "results": [
+    {
+      "role": "advisor",
+      "case": "plan-misses-route-wiring",
+      "config": "default",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 1.6664,
+      "trials": [
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.8329133,
+          "detail": "[fable/medium] The plan as written does not reach done: no task owns `apps/api/internal/http/routes.go`, so the share endpoints are never registered in the real router. The 405 real-router acceptance criterion is also owned and tested by nobody.\n\nI could not run `make lint` or `make test` (shell access was denied), so everything below is from reading the code.\n\nBeyond the two blockers, the main risks are:\n- **JSON shape:** `PublicView` likely emits `Start`/`End`/`Label` while the web reads `start`/`label`, so the public page would render blank entries. No test in the plan catches it.\n- **Web wiring:** `routes.tsx` renders `<SchedulePage />` without props, and nothing defines where `isOwner` or the `:token` param comes from.\n- **Failure paths:** KV and `crypto/rand` errors, a clipboard that is absent or rejects, and non-404 errors on the shared page have no criteria.\n- **Verify commands:** the api and web tasks don't run `make lint`, so type and vet errors surface only at job level.\n\nOwnership between the three tasks does not collide, and the dependency order (contract first, then api and web in parallel) is fine.",
+          "secs": 78.8
+        },
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.8335307000000001,
+          "detail": "[fable/medium] Revise. The plan builds the share handlers but nobody wires them: apps/api/internal/http/routes.go and routes_test.go are owned by no task, so the endpoints would be unreachable in the running API and the \"405 through the real router\" criterion is tested by nobody. Beyond that, the web side has two integration holes that mocked tests would hide: the route table renders SchedulePage with no props (so isOwner has no source), and PublicView's entries serialize as Start/End/Label while the web expects start/end/label. Error paths (KV failure, clipboard failure, non-404 errors on the public page) are unspecified. The baseline may also be red: the test harness and JS tooling look incomplete. I read the files but could not run make lint or make test, because shell access was denied.",
+          "secs": 78.0
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "plan-sound",
+      "config": "default",
+      "core": true,
+      "pass_rate": 0.0,
+      "consistency": 1.0,
+      "cost_usd": 2.5412,
+      "trials": [
+        {
+          "ok": false,
+          "label": "revise",
+          "fails": [
+            "revise != proceed (The plan is sound and I recommend proceeding. Its criteria cover the user's definition of done, and every file it needs has exactly one owner: routes.go and routes_test.go go to api, routes.tsx and Sc)"
+          ],
+          "cost": 1.7589540000000001,
+          "detail": "[fable/high escalated] The plan is sound and I recommend proceeding. Its criteria cover the user's definition of done, and every file it needs has exactly one owner: routes.go and routes_test.go go to api, routes.tsx and SchedulePage go to web, and the contract index goes to contract. The api and web tasks do not overlap, and the decisions match ADR 0007 and the existing store.KV, auth.Require, schedules.PublicView, router 405 behaviour and client.ts. Nothing I found blocks.\n\nI could not run `make lint` or `make test` because shell access was denied, so everything here comes from reading the code. Three things are worth acting on before or during execution:\n\n- **Baseline may be red.** The checkout reads like an abridged snapshot: testutil has no code, nothing implements app.Ctx, and there is no web toolchain config. Run both verify commands on the base commit before dispatch; if they fail, testutil and the toolchain files need an owner.\n- **Wire shape is untested across the boundary.** store.Entry has no json tags, so the public endpoint may emit Start/End/Label where the contract expects start/end/label. An api test on the literal JSON keys would settle it.\n- **Share button can fail silently.** The plan has no visible confirmation and no handling for a failed clipboard write.\n\nThe rest are small: a round-trip test, non-404 errors on the public page, the local router interface to avoid an import cycle, trailing-slash handling in the url, and `make lint` in the task-level verify. The raise_bar entries cover all of these without restructuring the plan.",
+          "secs": 244.3
+        },
+        {
+          "ok": false,
+          "label": "revise",
+          "fails": [
+            "revise != proceed (The plan is sound and reaches the user's definition of done; nothing blocks. Both endpoints, the router registration, the web route, the button and the owner-only rule are each owned and tested. The p)"
+          ],
+          "cost": 0.7821963000000001,
+          "detail": "[fable/medium] The plan is sound and reaches the user's definition of done; nothing blocks. Both endpoints, the router registration, the web route, the button and the owner-only rule are each owned and tested. The parallel api and web tasks share no files, the KV storage needs no migration, and the 405 follows from the existing router. I could not run `make lint` or `make test` here, so the baseline is unconfirmed.\n\nThree things to tighten before or during execution:\n- **Wire shape:** the public payload's entry keys may come out capitalised (store.Entry has no json tags), while the web contract expects lowercase. Mocked tests on both sides would miss it; an exact-JSON assertion in the api task closes it.\n- **Test helpers:** no task owns testutil, which the api tests may need to prove \"stores nothing\" and to set WebOrigin.\n- **Owner wiring:** routes.tsx renders SchedulePage without props, so check the baseline and where isOwner comes from.\n\nThe remaining findings are minor edge cases: dangling tokens, KV failures, non-404 errors on the shared page, clipboard failure and a trailing slash in WEB_ORIGIN.",
+          "secs": 70.8
+        }
+      ]
+    }
+  ]
+}

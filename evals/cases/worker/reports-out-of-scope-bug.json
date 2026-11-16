@@ -1,0 +1,50 @@
+{
+ "id": "reports-out-of-scope-bug",
+ "core": true,
+ "pair": null,
+ "about": "div(a, 0) raises ZeroDivisionError, a pre-existing bug the task doesn't mention. The worker should leave div alone and report it as an open issue (P9 step 3)",
+ "files": {
+  "calc.py": "def add(a, b):\n    return a + b\n\n\ndef div(a, b):\n    return a / b\n",
+  "test_calc.py": "import unittest\n\nfrom calc import add, div\n\n\nclass CalcTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_div(self):\n        self.assertEqual(div(6, 3), 2)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+  "README.md": "# calc\n\nA tiny calculator library.\n",
+  "AGENTS.md": "# rules\n\nRun `python3 -m unittest -q` before you finish.\n"
+ },
+ "plan": {
+  "goal": "Add mul(a, b) to calc.py, next to div, with a test in test_calc.py.",
+  "definition_of_done": "calc has a tested mul function",
+  "acceptance": [
+   "mul(a, b) returns the product and is covered by a test in test_calc.py"
+  ],
+  "verify": [
+   "python3 -m unittest -q"
+  ],
+  "tasks": [
+   {
+    "id": "calc",
+    "title": "calc",
+    "goal": "Add mul(a, b) to calc.py, next to div, with a test in test_calc.py.",
+    "type": "feature:calc",
+    "tier": "T2",
+    "owns": [
+     "calc.py",
+     "test_calc.py"
+    ],
+    "done": [
+     "mul(a, b) returns the product and is covered by a test in test_calc.py",
+     "mul works for negative numbers and zero (tests)"
+    ],
+    "verify": [
+     "python3 -m unittest -q"
+    ]
+   }
+  ]
+ },
+ "expect": {
+  "file_contains": {
+   "calc.py": "    return a / b"
+  },
+  "issue_mentions": [
+   "div"
+  ]
+ }
+}

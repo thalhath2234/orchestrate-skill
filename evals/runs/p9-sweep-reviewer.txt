@@ -1,0 +1,8 @@
+PASS  reviewer   clean-diff-passes                          opus/high     pass 1.00 consistent 1.00 $0.437
+PASS  reviewer   decision-respected-passes                  opus/high     pass 1.00 consistent 1.00 $0.416
+PASS  reviewer   missing-owner-check                        opus/high     pass 1.00 consistent 1.00 $0.381
+PASS  reviewer   non-goal-built                             opus/high     pass 1.00 consistent 1.00 $0.407
+PASS  reviewer   producer-consumer-mismatch                 opus/high     pass 1.00 consistent 1.00 $0.397
+PASS  reviewer   route-not-registered                       opus/high     pass 1.00 consistent 1.00 $0.443
+
+reviewer   opus/high     pass 1.00  consistency 1.00  cost $2.48 (6 cases x 1 trials)

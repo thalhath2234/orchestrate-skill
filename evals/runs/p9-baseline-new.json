@@ -1,0 +1,138 @@
+{
+  "overall_pass": 1.0,
+  "results": [
+    {
+      "role": "advisor",
+      "case": "final-clean",
+      "config": "default",
+      "core": false,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.9433,
+      "trials": [
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 0.9433313,
+          "detail": "[fable/medium] All four acceptance criteria are met and each has a test; nothing blocks the handover. I did not re-run the tests: this checkout has no go.mod or web package manifest, so I relied on the supplied verify output and on reading the code.\n\n- **POST returns a token:** `TestCreateReturnsLinkMatchingContract` checks 201, a 32-hex-character token, the schedule id, the expiry, and that the link is saved. The JSON shape matches `packages/contract/src/share.ts`.\n- **GET is read-only, unknown tokens 404:** `TestGetReturnsReadOnlySchedule` and `TestGetUnknownTokenIs404` cover it; expired tokens also 404 (`TestGetExpiredTokenIs404`).\n- **Only the owner can create links:** `TestCreateRejectsNonOwner` checks 403 and that no link is saved.\n- **Share button copies the link:** `Button.test.tsx` checks the clipboard receives a URL containing `/share/t1`, plus the failure path.\n\nThe token is 16 bytes from `crypto/rand`, hex-encoded, which is consistent with the opaque-token decision. The button shows the expiry as text only, so the no-expiry-UI non-goal holds. There is no debug code, TODOs or out-of-scope change in the diff.\n\nThe minor findings are integration points the fake-based unit tests cannot show: whether the GET route is actually reachable without auth, and that nothing in the web app mounts the button or calls the POST endpoint yet.",
+          "secs": 26.1
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "final-route-not-registered",
+      "config": "default",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.5065,
+      "trials": [
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.5064717,
+          "detail": "[fable/medium] Not done. The share routes are never mounted: apps/api/internal/http/routes.go:5-7 only calls schedules.Register, and nothing in the repo calls share.Register, so both endpoints 404 in the real app. The passing verify proves nothing, because the Makefile `test` target is just `true` and the Go tests use helpers and fixtures that are not defined anywhere in the repo. There are also error-path holes in the handler, expiry text in the button that touches the non-goal, and the cited ADR file is missing.",
+          "secs": 29.0
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "plan-misses-route-wiring",
+      "config": "default",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.5031,
+      "trials": [
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.5031037,
+          "detail": "[fable/medium] The plan builds a share package and a ShareButton but nobody wires either in. Routes are registered centrally in apps/api/internal/http/routes.go (it calls schedules.Register), and no task owns that file, so the new endpoints would be unreachable while handler tests still pass. The same gap exists on the web side and for the shared contract type in packages/contract/src/share.ts. On top of that, `make lint` and `make test` are both `true`, so every verify command passes with nothing built, and the ADR the plan cites does not exist. Revise before executing: add wiring ownership, real verify commands, and settle storage, expiry and the public-auth exemption.",
+          "secs": 39.9
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "plan-sound",
+      "config": "default",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.5466,
+      "trials": [
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 0.5466053000000001,
+          "detail": "[fable/medium] The plan is sound: all four acceptance criteria map to a task `done` item, the router wiring is explicitly owned and tested, file ownership is disjoint, and the two tasks can run in parallel because the shared contract type already exists in packages/contract/src/share.ts. No blockers or majors. The main thing to tighten is verification: `make test` and `make lint` are both `true` in the Makefile, so they pass vacuously and no task owns the Makefile. The other gaps are small: expired tokens are undefined, the ADR the plan cites does not exist, and the button's link source and mount point are unstated.",
+          "secs": 38.8
+        }
+      ]
+    },
+    {
+      "role": "planner",
+      "case": "share-links",
+      "config": "default",
+      "core": false,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 1.2109,
+      "trials": [
+        {
+          "ok": true,
+          "label": "3 tasks",
+          "fails": [],
+          "cost": 1.2109454999999998,
+          "detail": "contract-share-types; api-share; web-share",
+          "secs": 83.9
+        }
+      ]
+    },
+    {
+      "role": "worker",
+      "case": "finishes-multipart-task",
+      "config": "default",
+      "core": false,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.5428,
+      "trials": [
+        {
+          "ok": true,
+          "label": "ok",
+          "fails": [],
+          "cost": 0.542824,
+          "detail": "Added sub, mul and clamp (raises ValueError when lo > hi) to calc.py, with tests for each in test_calc.py (including the error path), and a '## Functions' section in README.md documenting every public",
+          "secs": 49.8
+        }
+      ]
+    },
+    {
+      "role": "worker",
+      "case": "reports-out-of-scope-bug",
+      "config": "default",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.2611,
+      "trials": [
+        {
+          "ok": true,
+          "label": "ok",
+          "fails": [],
+          "cost": 0.261093,
+          "detail": "Added mul(a, b) to calc.py directly after div, returning a * b. Added three tests to test_calc.py: test_mul, test_mul_negative and test_mul_zero. `python3 -m unittest -q` passes, with 5 tests OK.",
+          "secs": 27.4
+        }
+      ]
+    }
+  ]
+}

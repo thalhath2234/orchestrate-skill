@@ -9,7 +9,7 @@ A good plan makes subagents independent. Each one gets a clear goal, its own fil
 
 ## Process
 
-1. **Start from the confirmed grilling summary** (the **orchestrate-grill** skill). Its goal, acceptance criteria, non-goals and decisions go into `goal`, `acceptance`, `non_goals` and `decisions`, word for word. If a product decision turns up missing while you plan, go back and ask; don't guess one.
+1. **Start from the confirmed grilling summary** (the **orchestrate-grill** skill). The user's definition of done goes into `definition_of_done` exactly as they said it; its goal, acceptance criteria, non-goals and decisions go into `goal`, `acceptance`, `non_goals` and `decisions`, word for word. If a product decision turns up missing while you plan, go back and ask; don't guess one.
 2. **Map the repo:** `orchestrate.py scan --repo <repo>`. It lists packages and their areas, suggested verify commands, hotspots (lockfiles and root configs), AGENTS.md files and the setup command. Read the root AGENTS.md and the AGENTS.md of every package you'll touch. Skim the code you'll change (entry points, an existing similar feature) so the plan follows existing patterns.
 3. **Split by ownership, not by step.** Each task owns a set of paths that nobody running at the same time owns:
    - **Contract first.** Shared types, API schemas or a contract package come first (wave 1). Consumers depend on them.
@@ -18,29 +18,33 @@ A good plan makes subagents independent. Each one gets a clear goal, its own fil
    - **Integration glue last** (route registration, navigation entries, feature flags), owned by the task that depends on all the others.
 4. **Size each task** at roughly 15–45 minutes of agent work and 1–10 files. Merge trivial tasks into a neighbor. Split anything that would be T3. Aim for 2–8 tasks. More than 12 is a smell.
 5. **Tier each task** on its own merits (see below). A T3 job is usually made of T1/T2 tasks.
-6. **Write `done` and `verify`** for each task. Then the job-level `verify`, `setup` and gates.
-7. **Validate:** `orchestrate.py validate plan.json`. Fix every ERROR and read every warning.
+6. **Write the definition of done: set the bar high.** `definition_of_done` (required) is the user's sentence; `acceptance` (required) is the job's checkable proof of it, and together the criteria must cover everything that sentence promises; each task's `done` is its own. Every criterion is checkable by reading code or running a test, and says what is observable: the behaviour, the error and edge paths, the test that proves it, how it connects to the rest of the job. "Works correctly" is not a criterion; "an expired token returns 404 (handler_test.go)" is. Validation needs at least 1/2/3/3 `done` criteria for T0/T1/T2/T3 tasks and warns about vague words. Every task is also held to a fixed bar (tests that fail without the change, verify run by the agent, no TODOs or dead code, errors handled at boundaries, repo conventions, everything wired up), so build on it instead of repeating it; add repo-wide standards of your own in `quality_bar`. Then write `verify` per task, the job-level `verify`, `setup` and gates.
+
+   The definition of done keeps improving during the job. Subagents, the manager and reviewers add criteria from what they find; nothing removes or loosens one, so only the user ever lowers the bar.
+7. **Validate:** `orchestrate.py validate plan.json`. Fix every ERROR and read every warning. Drive **ownership gap** warnings to zero: each names an unowned file in the same Go package as, or imported by, a file a task owns. Give it to the task that will need it. In a real 18-task job, gaps like these produced an open issue from 8 of 9 finished tasks and most of the manager's cost.
 
 ## Tier rubric (per subtask)
 
-| Tier | Subtask looks like | Starts at |
+| Tier | Subtask looks like | Done criteria needed |
 |---|---|---|
-| T0 | Mechanical: rename, copy change, config value, add an export | haiku/low |
-| T1 | Follows an existing pattern closely: new endpoint like the others, new screen from a template, add tests | sonnet/medium |
-| T2 | Some design or several modules: new data flow, state management, non-trivial logic, migration plus model | sonnet/high |
-| T3 | Hard reasoning: concurrency, auth/security model, big refactor | opus/high (try to split it instead) |
+| T0 | Mechanical: rename, copy change, config value, add an export | ≥ 1 |
+| T1 | Follows an existing pattern closely: new endpoint like the others, new screen from a template, add tests | ≥ 2 |
+| T2 | Some design or several modules: new data flow, state management, non-trivial logic, migration plus model | ≥ 3 |
+| T3 | Hard reasoning: concurrency, auth/security model, big refactor (try to split it instead) | ≥ 3 |
+
+Every task, whatever its tier, starts on the worker model: Opus 5.5 at medium. Failures re-run at `high`; capability failures go to `xhigh`, then Fable 5.2, the top rung. Don't raise a tier to buy a stronger model: the ladder does that on evidence. Before the plan runs, the advisor (Fable 5.2) checks it against the definition of done and can stop the job, so a plan that misses part of done comes back to you.
 
 Type is `<category>:<area>`. Categories: `rename docs config bugfix feature refactor test migration review research`. The area is the package's area from `scan` (for example `api`, `web`, `mobile`, `contract`), or `cross`. Keep areas consistent across jobs, because routing learns per type.
 
 ## Monorepo rules
 
 - **Hotspots** (lockfiles, root `package.json`, `go.work`, root Makefile/tsconfig/CI): at most **one** task owns each. If several tasks need new dependencies, create a small first task (`config:infra`, T0/T1) that adds them all and owns the lockfile, and make the others depend on it. Otherwise, forbid new dependencies.
-- **Migrations:** one task owns the migrations folder pattern for the job. Add a `gate`, because migrations need human approval. Use the repo's migration tool and naming from its docs.
+- **Migrations:** one task owns the migrations folder pattern for the job, with a `gate` (validation rejects a task that owns migrations without one). Use the repo's migration tool and naming from its docs.
 - **Generated code** (codegen, OpenAPI clients) is owned by the task that runs the generator.
 - **Verify per package:** use the package's own commands from `scan.packages[].verify_suggestions` (for example `make test-api`, `pnpm --filter web run typecheck`). Use the repo-wide suite only in job-level `verify`.
 - **Setup:** set `setup` from `scan.suggested_setup` (for example `pnpm install --frozen-lockfile --prefer-offline`). It runs in every worktree.
 - **Resource weight:** if verify runs heavy builds (tsc on a large app, Gradle, Go race tests), set `"mem_per_agent_gb": 2.5` (or more) so the parallel cap stays safe.
-- **Ports:** never put dev-server commands in verify. If an e2e check needs a server, give it its own port offset with `$ORCHESTRATE_SLOT`.
+- **Ports:** keep dev-server commands out of verify, because parallel worktrees would fight over the same ports. If an e2e check needs a server, give it its own port offset with `$ORCHESTRATE_SLOT`.
 
 ## Ownership patterns
 
@@ -65,10 +69,14 @@ Be as narrow as practical but include everything the task must create, including
   "goal": "Users can share a schedule via a public read-only link",
   "repo": "/abs/path/to/repo",
   "base": "main",                             // optional, default: current branch
-  "acceptance": ["...", "..."],               // whole-job, testable (from grilling)
+  "definition_of_done": "I can open a shared link in a private window and see the schedule, read-only",
+                                              // required: the user's own words, verbatim (grill Q1)
+  "acceptance": ["...", "..."],               // required: checkable criteria that prove definition_of_done
   "non_goals": ["no expiry UI in this job"],  // optional, from grilling: subagents must not build these
   "decisions": ["Tokens are opaque random strings, not JWTs (docs/adr/0007-share-tokens.md)"],
                                               // optional, from grilling: settled, not to be revisited
+  "quality_bar": ["Every API error response uses the shared ErrorBody type"],  // optional: repo-wide
+                                              //   standards added to the fixed bar for every task
   "setup": ["pnpm install --frozen-lockfile --prefer-offline"],   // per worktree
   "verify": ["make lint", "make typecheck", "make test-api"],     // final; also the baseline
   "baseline": ["make lint"],                  // optional override of the pre-check
@@ -76,11 +84,34 @@ Be as narrow as practical but include everything the task must create, including
   "mem_per_agent_gb": 2.5,                    // optional, heavier verify -> bigger
   "budget_usd": 15,                           // optional, stop launching tasks past this
   "review_rounds": 2,                         // review -> fix -> review (default 2)
-  "manager": {"enabled": true, "model": "opus", "effort": "high",
-              "max_interventions": 12, "max_task_retries": 2},   // optional; these are the defaults
+  "manager": {"enabled": true, "max_interventions": 12, "max_task_retries": 2},  // optional; defaults
+  "models": {"reviewer": "opus/high"},        // optional per-role override, "<model>/<effort>". Roles and
+                                              //   defaults: advisor fable/medium (then high if it finds
+                                              //   nothing), planner fable/medium, manager, worker, reviewer,
+                                              //   area_reviewer and cleanup opus/medium, integrator
+                                              //   sonnet/high, classifier haiku/low, lessons haiku/medium
+                                              //   (scripts/models.py has the sources)
+  "max_model": "opus",                        // optional: nothing above this model, roles or ladder
+                                              //   (no Fable: the advisor becomes opus/high)
+  "advisor": "fable",                         // optional, off by default: workers get the advisor tool
+                                              //   (claude --advisor) and are told to consult it before
+                                              //   choosing an approach, on a repeated error and before
+                                              //   reporting. Worth it for long tasks hard in spots, not
+                                              //   short ones. Capped by max_model; must rank >= the
+                                              //   worker (Opus workers: fable or opus). If the launch is
+                                              //   refused (e.g. Fable usage-credits consent) the task
+                                              //   runs on without it. Not the plan/final advisor checks,
+                                              //   which always run (models.advisor)
   "max_escalations": 2,                       // optional; model escalations per task before the manager steps in
   "area": "cross",                            // area used for review-fix routing
   "extra_tools": ["Bash(docker compose *)"],  // optional extra allowed tools for subagents
+  "auto_claim": true,                         // optional (default true): a subagent may edit a file no
+                                              //   task owns; the scope check assigns it to that task
+  "review_diff_chars": 120000,                // optional: above this, review per area + integration
+  "lessons": {"enabled": true},               // optional: after the job,
+                                              //   propose AGENTS.md notes from what agents learned
+  "exclude_dynamic_prompt": true,             // optional (default true): per-worktree details move out of
+                                              //   the system prompt so subagents share its cache
   "sandbox": false,                           // optional OS sandbox for subagents' shell (bwrap/
                                               //   seatbelt); safest, but tools that write caches
                                               //   outside the repo (Go, Gradle) may break
@@ -108,7 +139,7 @@ Be as narrow as practical but include everything the task must create, including
       "reads": ["apps/api/MIGRATIONS.md", "apps/api/internal/schedules/"],
       "depends_on": ["contract-share-types"],
       "gate": "Creates a DB migration",
-      "done": ["Migration up/down works", "Expired/unknown token -> 404 (tests)", "Only the owner can create links (test)"],
+      "done": ["Migration up then down leaves the schema unchanged (test)", "Expired/unknown token -> 404 (tests)", "Only the owner can create links (test)"],
       "verify": ["make test-api"]
     }
   ]
@@ -116,6 +147,8 @@ Be as narrow as practical but include everything the task must create, including
 ```
 
 Every subagent's brief includes `non_goals`, `decisions` and the repo glossary (`GLOSSARY.md` or `CONTEXT.md`), and so does the reviewer's prompt. Write decisions so a subagent can act on them alone.
+
+Each subagent reports `open_issues` as `{issue, kind: needs_file | needs_decision | fyi, blocks_acceptance, files}`. `fyi` issues and `needs_file` issues whose files belong to one not-started task are handled by rule; only the rest wake the manager.
 
 Comments above are for explanation only. Real `plan.json` must be plain JSON. Required per task: `id, title, goal, type, tier, owns, done, verify`. Optional: `reads, depends_on, interfaces, gate, baseline`.
 

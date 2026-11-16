@@ -1,0 +1,40 @@
+{
+  "overall_pass": 1.0,
+  "results": [
+    {
+      "role": "advisor",
+      "case": "plan-sound",
+      "config": "default",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 5.155,
+      "trials": [
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 1.7399337999999998,
+          "detail": "[fable/high escalated] The plan is sound and gets to the user's definition of done; nothing blocks. Checked against the code: app.Ctx gives the handlers everything they need (Param, UserID, Store().KV, Store().Schedules, Config().WebOrigin); auth.Require gives the 401; the router returns 405 for POST /share/:token and the new paths don't collide with /schedules/:id; routes.go, routes_test.go and routes.tsx are each owned, so both endpoints and the public page are wired and tested through the real router and route table; the api and web tasks own disjoint files and can run in parallel after contract; the ADR matches the token and storage decisions and no migration is needed. The findings are all minor: testutil's helpers appear only as comments in the checked-in file and no task owns it (low confidence, since the baseline passed), 'creates no link' needs a stated way to be checked, share.Register must use a local router interface to avoid an import cycle, and the api and web tasks should also run `make lint`. Six criteria are raised on the tasks: JSON shape matching the contract, dangling links, KV write failure, clipboard feedback and failure, a concrete read-only/anonymous test, and non-404 errors on the public page.",
+          "secs": 198.4
+        },
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 1.7436073999999997,
+          "detail": "[fable/high escalated] The plan is sound and gets to the user's definition of done; nothing blocks. Every acceptance criterion is owned by a task, both routes are wired (routes.go and routes.tsx) and tested through the real router and route table, and the parallel api and web tasks share no files. The router's segment matching gives the 405 for POST /share/:token as the plan expects, and `ScheduleView` already exists in the contract for the public page.\n\nThe one thing to confirm before starting is the test harness: `testutil.go` as tracked does not define the helpers the api tests need, and no task owns it. The baseline says tests pass, so I rate this low confidence.\n\nThe other findings are minor: the 'creates no link' check needs a recording KV, task-level verifies skip `make lint`, and the clipboard-only handover can fail silently. I put the missing edge cases in `raise_bar` so the work is held to them without stopping.",
+          "secs": 191.9
+        },
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 1.6714973,
+          "detail": "[fable/high escalated] The plan is sound and can be executed as written; I found no blockers or majors. I checked it against the code by reading only (nothing could be run).\n\n- **Building blocks exist:** store.KV, schedules.PublicView, auth.Require, config.WebOrigin, the ScheduleView contract type and the testutil fixtures (s1 owned by u1, s2 by u2, WebOrigin https://app.test) are all in the repo.\n- **Routing works:** the new patterns don't collide with /schedules/:id, and the router already returns 405 for an unrouted method on a known path.\n- **Ownership and wiring:** file ownership is disjoint, and both routes.go and routes.tsx are owned and covered by tests.\n- **Link shape:** the API's url (WEB_ORIGIN/share/<token>) matches the web route /share/:token.\n\nThe six findings are all minor. The three most worth acting on:\n- AGENTS.md's `Register(r *http.Router)` signature would cause an import cycle; the share package should copy the local router interface from schedules.\n- The \"stores nothing\" criterion needs a recording KV, because KV has no list or count.\n- The api and web task verifies omit `make lint`, so a type error surfaces only at job level.\n\nThe raise_bar items close gaps against the user's own words: a signed-in non-owner opening a link, the owner actually getting a visible link when the clipboard fails, non-404 errors on the public page, dead-link and store-failure paths, and the JSON field names matching the contract.",
+          "secs": 165.9
+        }
+      ]
+    }
+  ]
+}

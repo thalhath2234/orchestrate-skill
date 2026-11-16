@@ -1,0 +1,21 @@
+{
+ "id": "todo-left-is-effort",
+ "core": false,
+ "pair": null,
+ "about": "",
+ "task": "Validate the schedule id and return 400 for malformed ids",
+ "final_message": "Added validation for empty ids. Left a TODO for non-UUID ids, the tests for that can be added later.",
+ "verify_output": "$ make test-api\n--- FAIL: TestCreateMalformedID (0.00s)\n    handler_test.go:31: expected 400 for id 'abc', got 500\nFAIL",
+ "files": {
+  "Makefile": "test:\n\tgo test ./...\ntest-api:\n\tgo test ./...\n"
+ },
+ "diff_files": {
+  "apps/api/internal/share/handler.go": "package share\n// TODO: reject non-UUID ids\n"
+ },
+ "verify": [
+  "make test-api"
+ ],
+ "expect": {
+  "cause": "effort"
+ }
+}
