@@ -21,9 +21,9 @@ import sys
 # --approve x` must still ask. Option prefixes are matched too (`--appr`); the scripts also turn
 # argparse abbreviations off, so a prefix fails to parse instead of approving anything.
 RULES = [
-    (re.compile(r"orchestrate", re.I), re.compile(r"(?:^|[\s;&|])--app\w*"),
+    (re.compile(r"orchestrate", re.I), re.compile(r"--app\w*"),  # also quoted: "--approve"
      "approves a gated orchestrate task or overrides the advisor"),
-    (re.compile(r"orchestrate", re.I), re.compile(r"(?:^|[\s;&|])--ans\w*"),
+    (re.compile(r"orchestrate", re.I), re.compile(r"--ans\w*"),
      "sends your answer to the orchestrate manager"),
     (re.compile(r"router", re.I), re.compile(r"\bapprove\b"),
      "approves an orchestrate routing or AGENTS.md proposal"),

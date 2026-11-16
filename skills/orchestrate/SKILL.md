@@ -88,7 +88,7 @@ Inside Orca, run a single task as a one-task job instead (Step 3b with a plan of
    ```
    Then **end your turn**. Orca wakes you with each worker's mail. Handle only this job's workers this way:
    - **`worker_done`:** run `python3 $S/orchestrate.py worker-done <job> --dispatch <dispatchId> --report-path <reportPath>`, with the two values copied from the message's Payload, in the background (Bash `run_in_background`, timeout 2 hours): it checks and merges the work and starts what became ready, and the last one runs the review, which can take many minutes. When it exits: 10 means workers are still running, so end your turn; any other code goes to the outcome table below.
-   - **An `escalation` with a `stopReason`, or a worker that `exited` or is `lost`:** run `python3 $S/orchestrate.py worker-lost <job> --dispatch <dispatch id> --reason "<what Orca said>"` the same way.
+   - **An `escalation` with a `stopReason`, or a worker that `exited` or is `lost`** (also when `status` shows a task running whose worker is gone; a resume keeps running tasks and waits for their reports): run `python3 $S/orchestrate.py worker-lost <job> --dispatch <dispatch id> --reason "<what Orca said>"` the same way.
    - **A `question` from a worker:** answer it with `orca orchestration reply --id <message id> --body "..."` when the plan, its decisions or the brief answer it. If it needs a product decision, ask the user first and reply with their words.
    - Leave the job's workers to the script: it starts them, sends failed checks back to them, starts stronger models in the same worktree, and releases them after merging. Don't start, steer or stop them yourself, and don't poll; Orca wakes you.
 

@@ -479,7 +479,8 @@ def scope_violations(cwd: Path, owns: list[str], base: str | None = None) -> lis
         path = line[3:]
         changed += [p.strip('"') for p in (path.split(" -> ") if " -> " in path else [path])]
     if base:
-        committed = subprocess.run(["git", "diff", "--name-only", f"{base}..HEAD"], cwd=cwd,
+        # --no-renames: a committed `git mv` lists both paths, so moving another task's file away is caught
+        committed = subprocess.run(["git", "diff", "--name-only", "--no-renames", f"{base}..HEAD"], cwd=cwd,
                                    capture_output=True, text=True).stdout
         changed += [p.strip('"') for p in committed.splitlines() if p.strip()]
     return [p for p in dict.fromkeys(changed) if not any(owned(p, pat) for pat in owns)]
@@ -995,8 +996,8 @@ def start_job(plan: dict, plan_path: Path) -> Job:
                                                          "type": t["type"], "tier": t["tier"]})
             if st["status"] == "running" and job.state.get("mode") == "orca":
                 continue  # its Orca worker is still live and will report; don't start a duplicate
-            if st["status"] in ("running", "awaiting_approval", "blocked", "failed"):
-                st["status"] = "pending"
+            if st["status"] in ("running", "awaiting_approval", "blocked", "failed", "stopped"):
+                st["status"] = "pending"  # "stopped": an Orca worker the manager's abort stopped
         job.state["status"] = "running"
     job.save()
     return job

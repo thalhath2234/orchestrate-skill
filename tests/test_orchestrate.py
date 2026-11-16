@@ -169,6 +169,16 @@ FAKE_ORCA = textwrap.dedent(r"""
             g = ["git", "-c", "user.email=w@w", "-c", "user.name=w"]
             subprocess.run([*g, "add", "-A"], cwd=wt, check=True, capture_output=True)
             subprocess.run([*g, "commit", "-qm", "worker commit"], cwd=wt, check=True, capture_output=True)
+        if t.get("commit_rename") and first:
+            src, dst = t["commit_rename"]
+            g = ["git", "-c", "user.email=w@w", "-c", "user.name=w"]
+            (wt / dst).parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run([*g, "mv", src, dst], cwd=wt, check=True, capture_output=True)
+            subprocess.run([*g, "commit", "-qm", "worker rename"], cwd=wt, check=True, capture_output=True)
+        if t.get("commit_rename") and retry:
+            subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=wt, check=True, capture_output=True)
+            for p, c in t.get("write", {}).items():
+                f = wt / p; f.parent.mkdir(parents=True, exist_ok=True); f.write_text(c)
         if t.get("commit_out_of_scope") and retry:
             subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=wt, check=True, capture_output=True)
             for p, c in t.get("write", {}).items():
@@ -212,6 +222,8 @@ FAKE_ORCA = textwrap.dedent(r"""
         work(d, "", retry=True)
         log("send", dispatch=did, tid=d["tid"], body=opt("--body"))
         done({"delivered": True})
+    if cmd == "orchestration worker-stop":
+        log("stop", dispatch=opt("--dispatch")); done({"state": "stopped"})
     if cmd == "orchestration worker-release":
         log("release", dispatch=opt("--dispatch")); done({"state": "released"})
     if cmd == "orchestration worker-read":
@@ -842,6 +854,37 @@ class OrchestrateTest(unittest.TestCase):
         self.assertTrue(web and "OUT OF SCOPE" in web[0]["body"] and "Makefile" in web[0]["body"], web)
         integ = self.state / "jobs" / "share" / "wt" / "_integration"
         self.assertNotIn("sneaky", (integ / "Makefile").read_text())
+
+    def test_orca_committed_rename_out_of_scope_is_caught(self):
+        self.orca_env()
+        cfg = {"tasks": {**WRITES, "contract": {**WRITES["contract"],
+                                                "commit_rename": ["pnpm-lock.yaml", "packages/contract/src/share/lock.yaml"]}}}
+        code, out = self.drive_orca(("run", str(self.write_plan(base_plan(self.repo)))), cfg)
+        self.assertEqual(code, 0, out[-3000:])
+        body = next(c["body"] for c in self.orca_of("send") if c["tid"] == "contract")
+        self.assertIn("pnpm-lock.yaml", body, "a committed rename lists its source: moving a hotspot away is caught")
+        self.assertIn("pnpm-lock.yaml", self.branch_files())
+
+    def test_orca_abort_stops_workers_and_resume_restarts_them(self):
+        self.orca_env()
+        cfg = {"tasks": {**WRITES, "contract": {**WRITES["contract"], "open_issues": [
+                   {"issue": "the contract can't be shared", "kind": "needs_decision", "blocks_acceptance": True, "files": []}]}},
+               "manager": [{"note": "stop", "actions": [{"action": "abort", "reason": "plan is wrong"}]}]}
+        plan = base_plan(self.repo)
+        for t in plan["tasks"]:
+            t["depends_on"] = []  # all three run at once
+        code, out = self.drive_orca(("run", str(self.write_plan(plan))), cfg)
+        self.assertEqual(code, 4, out[-3000:])
+        st = self.job_state()
+        stopped = [t for t, x in st["tasks"].items() if x["status"] == "stopped"]
+        self.assertTrue(stopped, st["tasks"])
+        self.assertEqual(sorted(c["dispatch"] for c in self.orca_of("stop")),
+                         sorted(st["tasks"][t]["orca"]["dispatch"] for t in stopped))
+        cfg2 = {"tasks": WRITES}
+        code, out = self.drive_orca(("resume", "share"), cfg2)
+        self.assertEqual(code, 0, out[-3000:])
+        for f in ("apps/api/share/handler.go", "apps/web/src/share/Button.tsx"):
+            self.assertIn(f, self.branch_files(), "stopped tasks ran again; the job isn't done without them")
 
     def test_headless_job_stays_headless_when_resumed_inside_orca(self):
         self.orca_env()
@@ -1498,7 +1541,8 @@ class OrchestrateTest(unittest.TestCase):
         # bypasses found in review: option prefixes, the script behind a variable, `=` forms
         for cmd in (f"{S}/orchestrate.py resume j --appr advisor:plan", f"{S}/orchestrate.py resume j --ans 'ship it'",
                     f"O={S}/orchestrate.py; python3 $O resume j --approve x", f"{S}/orchestrate.py resume j --approve=x",
-                    f"{S}/orchestrate.py run plan.json --approve advisor:plan"):
+                    f"{S}/orchestrate.py run plan.json --approve advisor:plan",
+                    f'{S}/orchestrate.py resume j "--approve" advisor:final', f"{S}/orchestrate.py resume j '--answer' yes"):
             self.assertEqual(ask(cmd), "ask", cmd)
         p = subprocess.run([sys.executable, str(ORCH), "resume", "share", "--appr", "api"],
                            env=self.env, capture_output=True, text=True)

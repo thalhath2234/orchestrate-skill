@@ -534,8 +534,8 @@ def pump(job: O.Job, plan: dict) -> int:
                   f"--report-path <reportPath> (both from its Payload)")
             return WAITING
         statuses = {t: sts[t]["status"] for t in T}
-        if any(s in ("failed", "blocked") for s in statuses.values()):
-            bad = {t: s for t, s in statuses.items() if s in ("failed", "blocked")}
+        if any(s in ("failed", "blocked", "stopped") for s in statuses.values()):
+            bad = {t: s for t, s in statuses.items() if s in ("failed", "blocked", "stopped")}
             env = [t for t in bad if sts[t].get("result") == "environment"]
             return O.finish(job, plan, "environment" if env and len(env) == len(
                 [t for t in bad if bad[t] == "failed"]) else "failed",
