@@ -59,6 +59,20 @@ This installs five skills:
 
 Requirements: Python 3.9+ (stdlib only), macOS or Linux, and `git` and `claude` on PATH.
 
+## Update
+
+Update only when no job is running (`orchestrate.py status <job>`): a running job fingerprints the skill files and stops if they change.
+
+```bash
+# npx skills install (what `npx skills add ... -g` set up)
+npx skills update -g -y orchestrate orchestrate-grill orchestrate-plan orchestrate-manage orchestrate-review
+
+# Claude Code plugin install (restart Claude Code afterwards)
+claude plugin update orchestrate
+```
+
+Both pull the repo's default branch. An `npx skills` install doesn't include the approval hook: after updating, compare your settings with what `python3 ~/.agents/skills/orchestrate/scripts/orchestrate.py guard-hook` prints.
+
 ## Use
 
 In Claude Code, T3 Code and similar tools, type `/orchestrate` followed by what you want, for example:
