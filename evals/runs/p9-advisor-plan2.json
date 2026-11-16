@@ -1,0 +1,63 @@
+{
+  "overall_pass": 0.5,
+  "results": [
+    {
+      "role": "advisor",
+      "case": "plan-misses-route-wiring",
+      "config": "default",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 1.5146,
+      "trials": [
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.7592669999999999,
+          "detail": "[fable/medium] The plan's design matches the ADR and the user's definition of done, but as written the API endpoints are never reachable. `apps/api/internal/http/routes.go` is the only place routes are wired, and no task owns it, so `share.Register` is never called. The same gap leaves acceptance criterion 4 (405 through the real router) in no task's `done`, with `routes_test.go` unowned. Both are fixed by widening the api task's ownership and done criteria.\n\nBeyond that, the public payload likely won't match the `ScheduleView` contract, because `store.Entry` has no json tags and the web tests mock the client. That is medium confidence: the `c.JSON` implementation isn't in the repo to check. Storage, rand and clipboard failure paths are unspecified, and it is unclear how the web route supplies the token and `isOwner` in the live app.\n\nI could only read the code; shell commands were denied, so nothing was run. Task ordering and parallel ownership are otherwise fine, with no file collisions between api and web. | BLOCKS (blocker/high): No task owns the central route registration. `http.Register` only calls `schedules.Register(r)`, and the api task owns only `apps/api/internal/share/**`, so `share.Register` is never called. Handler tests inside the share package would pass while both endpoints are unreachable in the real server, so the Share button and the public page have nothing to call. | BLOCKS (blocker/high): Acceptance criterion 4 (POST /share/:token returns 405 through the real router) appears in no task's `done`, and the only real-router test file is owned by nobody. The api task's done items are all handler tests, so nothing tests wiring through `testutil.NewServer(t, Register)`. | BLOCKS (major/medium): The public payload probably won't match the web contract. `schedules.PublicView` puts `[]store.Entry` under `entries`, and `Entry{Start, End, Label}` has no json tags, so standard JSON encoding would emit `Start`/`End`/`Label`. `ScheduleView` in the contract expects `start`/`end`/`label`. The shared page would then render empty labels, and the web tests would still pass because they mock the client. I could not see the `c.JSON` implementation, so the encoding is assumed. | BLOCKS (major/medium): API failure paths are unspecified: `crypto/rand` failing, `KV.Put` failing, `KV.Get` returning an error other than `ErrNotFound`, and a token whose schedule no longer exists. As written, an implementer could map every error to 404 or return 201 for a link that was never stored.",
+          "secs": 61.8
+        },
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.7553491999999999,
+          "detail": "[fable/medium] The plan cannot reach done as written: nobody owns apps/api/internal/http/routes.go, so the share endpoints are never registered, and the 405 real-router acceptance criterion belongs to no task. Two further gaps would likely ship bugs: entry JSON keys may not match the web contract, and the routed SchedulePage has no source for isOwner. I could not run the baseline, and the test harness looks stubbed, so check that make lint and make test pass before starting. | BLOCKS (blocker/high): No task owns routes.go, the only place feature routes are wired (\"Add new features here\"). The api task owns only apps/api/internal/share/**, so share.Register is never called from http.Register. Both endpoints would pass their handler tests yet return 404 in the real server, so the Share button and the public page have nothing to call. | BLOCKS (blocker/high): The acceptance criterion \"POST to /share/:token returns 405 (api test through the real router)\" is in no task's done, and routes_test.go, where real-router tests live, is owned by nobody. The api task's done lists only handler tests, which pass without any wiring. | BLOCKS (major/medium): store.Entry has no json tags, so if c.JSON uses encoding/json, the entries in schedules.PublicView serialise as Start/End/Label. The web ScheduleView contract expects start/end/label, so the public page would render blank entries. The web tests mock the client, so nothing would catch it. No task owns store.go or schedules.go. I could not confirm how c.JSON serialises. | BLOCKS (major/medium): SchedulePage takes schedule and isOwner as props, but the route table renders <SchedulePage /> with neither, and ScheduleView carries no owner id. Nothing in the plan says where isOwner comes from in the running app. The Share button can pass its prop-driven tests and still never appear for a real owner.",
+          "secs": 66.5
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "plan-sound",
+      "config": "default",
+      "core": true,
+      "pass_rate": 0.0,
+      "consistency": 1.0,
+      "cost_usd": 2.6125,
+      "trials": [
+        {
+          "ok": false,
+          "label": "revise",
+          "fails": [
+            "revise != proceed (The plan covers what the user asked for: every acceptance criterion maps to a task, the router and route table are owned and tested, and the api and web tasks touch disjoint files. Nothing I'm confide)"
+          ],
+          "cost": 1.8685582,
+          "detail": "[fable/high escalated] The plan covers what the user asked for: every acceptance criterion maps to a task, the router and route table are owned and tested, and the api and web tasks touch disjoint files. Nothing I'm confident of blocks it, so the verdict is proceed. I could not run `make lint` or `make test` (shell access was denied), so everything here is from reading the code.\n\nTwo things to act on:\n- **Wire shape (major, medium confidence):** the public endpoint probably emits entries as Start/End/Label while the web expects start/end/label, and no test on either side would notice. The raw-JSON criterion in raise_bar closes this; the api task may need to map entries itself or own schedules.go.\n- **Baseline (blocker if real, low confidence):** the checkout looks abbreviated. testutil declares no NewServer, the router has no dispatch, and the web package has no dependencies. Run the verify commands on the base commit before dispatching; if they are red, no task owns the files needed to fix them.\n\nThe rest are minor: follow the schedules.Register interface pattern to avoid an import cycle, add `make lint` to the api and web verify lists, and handle a trailing slash or empty WEB_ORIGIN. The raise_bar items add the missing edge cases: signed-in viewer, deleted schedule, store failures, clipboard failure, and non-404 errors on the public page. | BLOCKS (major/medium): Nothing pins the JSON shape that crosses the API/web boundary, and it probably doesn't match. PublicView returns lowercase top-level keys, but `entries` is []store.Entry, which has no json tags (store.go:14), so standard encoding/json emits Start/End/Label. The web's ScheduleView expects start/end/label. The api criterion only says the body is \"schedules.PublicView\", and the web tests mock the client, so every test can pass while the public page renders blank entries. This depends on how Ctx.JSON serialises, which isn't in the repo. The fix may need schedules.go or store.go, which no task owns.",
+          "secs": 271.2
+        },
+        {
+          "ok": false,
+          "label": "revise",
+          "fails": [
+            "revise != proceed (The plan is sound and nothing blocks it. Every acceptance criterion maps to a task, routes.go, routes.tsx and the contract index each have one owner, the api and web tasks touch disjoint files, and ev)"
+          ],
+          "cost": 0.7439745,
+          "detail": "[fable/medium] The plan is sound and nothing blocks it. Every acceptance criterion maps to a task, routes.go, routes.tsx and the contract index each have one owner, the api and web tasks touch disjoint files, and everything the plan relies on exists in the repo (PublicView, Config.WebOrigin, store.KV, the router's 405 behaviour, the u1/u2 fixtures). I could not run `make lint` or `make test` because shell access was denied, so the findings come from reading the code.\n\nThe main risk is the JSON shape of the shared schedule: store.Entry has no json tags, so entries may reach the web page as Start/End/Label and render blank, and no test checks it. The second is a low-confidence gap in how isOwner reaches SchedulePage in the routed app. The raise_bar items cover both, plus the missing failure paths (KV failure, orphaned token, clipboard failure, non-404 errors). | BLOCKS (major/medium): schedules.PublicView passes store.Entry values through unchanged, and store.Entry (store/store.go:14) has no json tags. If Ctx.JSON uses encoding/json, entries serialise as Start/End/Label, while the contract's ScheduleView and the web page read start/end/label. The shared page would then render blank entries. No criterion checks the wire shape: the api tests only assert 'PublicView', and the web tests mock the client. The api task owns neither schedules.go nor store.go. I could not run the code (shell denied), so this is from reading only.",
+          "secs": 62.1
+        }
+      ]
+    }
+  ]
+}

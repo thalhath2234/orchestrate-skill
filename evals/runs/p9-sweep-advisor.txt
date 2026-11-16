@@ -1,0 +1,12 @@
+[orchestrate 00:36:40] advisor (final) found nothing blocking at fable/medium; asking again at high
+PASS  advisor    final-clean                                fable/medium  pass 1.00 consistent 1.00 $1.278
+PASS  advisor    final-route-not-registered                 fable/medium  pass 1.00 consistent 1.00 $0.517
+PASS  advisor    plan-misses-route-wiring                   fable/medium  pass 1.00 consistent 1.00 $0.788
+FAIL  advisor    plan-sound                                 fable/medium  pass 0.00 consistent 1.00 $0.786  <- ["revise != proceed (The plan is sound and reaches the user's definition of done; nothing blocks. Every file that needs to change has one owner, both routers are wired (routes.go and routes.tsx), the two parallel tasks do)"]
+PASS  advisor    final-clean                                fable/high    pass 1.00 consistent 1.00 $0.868
+PASS  advisor    final-route-not-registered                 fable/high    pass 1.00 consistent 1.00 $0.608
+PASS  advisor    plan-misses-route-wiring                   fable/high    pass 1.00 consistent 1.00 $0.992
+PASS  advisor    plan-sound                                 fable/high    pass 1.00 consistent 1.00 $1.180
+
+advisor    fable/high    pass 1.00  consistency 1.00  cost $3.65 (4 cases x 1 trials)
+advisor    fable/medium  pass 0.75  consistency 1.00  cost $3.37 (4 cases x 1 trials)

@@ -1,0 +1,5 @@
+PASS  advisor    plan-misses-route-wiring                   default       pass 1.00 consistent 1.00 $1.666
+[orchestrate 00:06:40] advisor (plan) found nothing blocking at fable/medium; asking again at high
+FAIL  advisor    plan-sound                                 default       pass 0.00 consistent 1.00 $2.541  <- ["revise != proceed (The plan is sound and reaches the user's definition of done; nothing blocks. Both endpoints, the router registration, the web route, the button and the owner-only rule are each owned and tested. The p)"]
+
+advisor    default       pass 0.50  consistency 1.00  cost $4.21 (2 cases x 2 trials)

@@ -12,7 +12,8 @@ run_task.classify) against the real `claude`, and grades the outcome, not the pa
   python3 evals/run.py --role classifier --config haiku/low --config sonnet/low
   python3 evals/run.py --json out.json --min-pass 0.9          # gate: exit 1 below 90%
 
-Costs real money: each manager/reviewer case is one Opus call per trial. Cases live in
+Costs real money: each manager/reviewer case is one Opus call per trial; advisor cases are one
+or two Fable calls, planner cases one Fable planning session, worker cases one Opus coding session. Cases live in
 evals/cases/<role>/<id>.json; see evals/README.md for the format. State is written to a
 scratch ORCHESTRATE_DIR, never to your real one.
 """
@@ -149,6 +150,11 @@ def run_reviewer(o, case: dict, tmp: Path, config: str | None) -> dict:
         miss = [n for n in exp["finding_mentions"] if n.lower() not in text]
         if miss:
             fails.append(f"no blocker/major finding mentions {miss}")
+    if exp.get("no_finding_mentions"):
+        text = json.dumps(serious).lower()
+        hit = [n for n in exp["no_finding_mentions"] if n.lower() in text]
+        if hit:
+            fails.append(f"a blocker/major finding mentions {hit} (re-argues a settled decision)")
     if exp.get("finding_file") and not any(exp["finding_file"] in str(f.get("file", "")) for f in serious):
         fails.append(f"no blocker/major finding on {exp['finding_file']}")
     return {"ok": not fails, "label": v.get("verdict"), "fails": fails, "cost": job.state["cost_usd"],
@@ -168,7 +174,130 @@ def run_classifier(rt, case: dict, tmp: Path, config: str | None) -> dict:
             "detail": out.get("evidence")}
 
 
-RUNNERS = {"manager": run_manager, "reviewer": run_reviewer, "classifier": run_classifier}
+def _from(case: dict) -> dict:
+    """`"from": "<role>/<id>"` reuses another case's fixture (files, plan, reports) and overrides it."""
+    if not case.get("from"):
+        return case
+    base = json.loads((CASES / f"{case['from']}.json").read_text())
+    merged = {**base, **{k: v for k, v in case.items() if k not in ("from", "plan_patch")}}
+    if case.get("plan_patch"):
+        merged["plan"] = _patch(copy.deepcopy(base.get("plan", {})), case["plan_patch"])
+    return merged
+
+
+def _patch(plan: dict, patch: dict) -> dict:
+    """plan_patch: top-level keys replace; "tasks": {id: {field: value}} edits tasks in place."""
+    for k, v in patch.items():
+        if k == "tasks" and isinstance(v, dict):
+            for t in plan.get("tasks", []):
+                t.update(v.get(t["id"], {}))
+        else:
+            plan[k] = v
+    return plan
+
+
+def run_advisor(o, case: dict, tmp: Path, config: str | None) -> dict:
+    case = _from(case)
+    stage = case.get("stage", "plan")
+    if stage == "final":
+        repo, sha = make_repo(tmp, case.get("base_files", {}), case.get("head_files", {}))
+    else:
+        repo, sha = make_repo(tmp, case.get("files") or case.get("base_files", {}))
+    plan = full_plan(case, repo)
+    if config:
+        plan.setdefault("models", {})["advisor"] = config
+    spent = []
+    body = (o.final_body(repo, sha, plan, case.get("verify_output", "$ make test\nok"))
+            if stage == "final" else o.plan_body(plan, plan.get("baseline", plan["verify"])
+                                                  if case.get("baseline_passed", True) else None))
+    a = o.advise(stage, plan, repo, body, on_call=lambda res, cfg: spent.append(res.get("total_cost_usd") or 0))
+    exp = case["expect"]
+    fails = []
+    if a is None:
+        return {"ok": False, "label": "error", "fails": ["advisor produced no usable advice"], "cost": sum(spent)}
+    blocking = o.advice_blocking(a)
+    label = "revise" if blocking else "proceed"
+    if exp.get("verdict") and label != exp["verdict"]:
+        fails.append(f"{label} != {exp['verdict']} ({a.get('summary', '')[:200]})")
+    if exp.get("finding_mentions"):
+        text = json.dumps(blocking + (a.get("raise_bar") or [])).lower()
+        miss = [n for n in exp["finding_mentions"] if n.lower() not in text]
+        if miss:
+            fails.append(f"no blocker/major finding or raised criterion mentions {miss}")
+    return {"ok": not fails, "label": label, "fails": fails, "cost": sum(spent),
+            "detail": f"[{a.get('config')}{' escalated' if a.get('escalated') else ''}] {a.get('summary')}"
+                      + "".join(f" | BLOCKS ({f.get('severity')}/{f.get('confidence')}): {f.get('issue')}" for f in blocking)}
+
+
+def run_planner(o, case: dict, tmp: Path, config: str | None) -> dict:
+    case = _from(case)
+    repo, _ = make_repo(tmp, case.get("files") or case.get("base_files", {}))
+    plan, errs, cost, raw = o.draft_plan(repo, case["goal"], case["done"], config)
+    exp = case["expect"]
+    if plan is None:
+        return {"ok": False, "label": "error", "fails": [f"no plan: {raw[-300:]}"], "cost": cost}
+    fails = [f"invalid plan: {errs}"] if errs else []
+    if plan.get("definition_of_done") != case["done"]:
+        fails.append("definition_of_done not verbatim")
+    owned = [p for t in plan.get("tasks", []) for p in t.get("owns", [])]
+    for f in exp.get("owned", []):
+        if not any(o.owned(f, pat) for pat in owned):
+            fails.append(f"no task owns {f}")
+    text = json.dumps({k: plan.get(k) for k in ("acceptance", "tasks")}).lower()
+    for n in exp.get("criteria_mention", []):
+        if n.lower() not in text:
+            fails.append(f"no criterion mentions {n!r}")
+    if len(plan.get("acceptance") or []) < exp.get("min_acceptance", 1):
+        fails.append(f"only {len(plan.get('acceptance') or [])} acceptance criteria")
+    n = len(plan.get("tasks") or [])
+    if not exp.get("min_tasks", 1) <= n <= exp.get("max_tasks", 99):
+        fails.append(f"{n} tasks, expected {exp.get('min_tasks', 1)}-{exp.get('max_tasks', 99)}")
+    return {"ok": not fails, "label": f"{n} tasks", "fails": fails, "cost": cost,
+            "detail": "; ".join(t.get("id", "?") for t in plan.get("tasks", []))}
+
+
+def run_worker(o, case: dict, tmp: Path, config: str | None) -> dict:
+    """One task through the real brief and run_task.py, on a tiny repo; graded on the repo and report."""
+    repo, sha = make_repo(tmp, case["files"])
+    plan = full_plan(case, repo)
+    task = plan["tasks"][0]
+    brief = o.build_brief(plan, task, repo, {})
+    cmd = [sys.executable, str(SCRIPTS / "run_task.py"), "--repo", str(repo), "--type", task["type"],
+           "--tier", task["tier"], "--report-schema", json.dumps(o.schemas.REPORT),
+           "--start", config or "/".join(o.models.role("worker", plan)), "--max-escalations", "0",
+           "--attempts", "1", "--no-baseline", "--done-ids", *o.done_ids(plan, task)]
+    for v in task["verify"]:
+        cmd += ["--verify", v]
+    cmd.append(brief)
+    p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=3600)
+    summary = o.extract_json(p.stdout) or {}
+    report = summary.get("report") or {}
+    cost = sum((x.get("cost_usd") or 0) + (x.get("classifier_cost_usd") or 0) for x in summary.get("steps", []))
+    exp = case["expect"]
+    fails = []
+    if exp.get("ok", True) and p.returncode != 0:
+        fails.append(f"task did not pass verify + done check: {summary.get('result')}")
+    for f, needle in (exp.get("file_contains") or {}).items():
+        if needle not in ((repo / f).read_text() if (repo / f).exists() else ""):
+            fails.append(f"{f} lacks {needle!r}")
+    for f, needle in (exp.get("file_lacks") or {}).items():
+        if (repo / f).exists() and needle in (repo / f).read_text():
+            fails.append(f"{f} still contains {needle!r} (out of scope change expected to be left)")
+    for f in exp.get("unchanged", []):
+        d = subprocess.run(["git", "diff", "--quiet", sha, "--", f], cwd=repo).returncode
+        if d:
+            fails.append(f"{f} changed, but it is out of scope")
+    if exp.get("issue_mentions"):
+        text = json.dumps(report.get("open_issues") or []).lower()
+        miss = [n for n in exp["issue_mentions"] if n.lower() not in text]
+        if miss:
+            fails.append(f"open_issues never mention {miss}")
+    return {"ok": not fails, "label": "ok" if p.returncode == 0 else "failed", "fails": fails, "cost": cost,
+            "detail": (report.get("summary") or summary.get("result") or "")[:200]}
+
+
+RUNNERS = {"manager": run_manager, "reviewer": run_reviewer, "classifier": run_classifier,
+           "advisor": run_advisor, "planner": run_planner, "worker": run_worker}
 
 
 def load_cases(roles, ids, core) -> list[tuple[str, dict]]:

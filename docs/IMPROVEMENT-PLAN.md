@@ -71,6 +71,101 @@ Sources: [choosing a model](https://platform.claude.com/docs/en/about-claude/mod
 
 **Cost to watch.** A fresh Fable session costs about $0.25 before doing anything, measured with CLI 2.1.325. Planner plus final review add an estimated $1–5 per job over Opus. T2 tasks now start on Opus at low, which Anthropic prices at about 7% more per solved task than sonnet/high, and their failures re-run on the same model.
 
+### P8: the user's model assignment, the advisor, and "what is done" first (2026-11-16)
+
+The user set the models and asked for an advisor before execution and before the final push, and for done to be asked first and kept in view.
+
+| Role | Before | Now |
+|---|---|---|
+| Advisor (new) | none | fable/medium; a pass that finds nothing is re-asked at fable/high |
+| Planner | opus/high | **fable/medium** (changed at the user's request, later the same day) |
+| Manager | opus/medium | opus/medium |
+| Worker | tier start (haiku/medium … opus/medium) | **opus/medium for every tier** (`models.worker`, `run_task.py --start`) |
+| Reviewer, area reviewers | fable/high, opus/high | **opus/medium**, told to check every edge case (`edge_cases` in the schema; an unhandled one becomes a major finding in code) |
+| Cleanup (new) | none | opus/medium, after review passes; reverted if it leaves the job's files or breaks verify |
+
+- **Done first.** The grill's Q1 is "what does done look like?". `definition_of_done` (verbatim) is required by `validate`, set from `plan --done`, and opens every brief, the manager, reviewer and advisor prompts, and `report.md`.
+- **Advisor before execution** (`plan_gate`): revise → `advisor_blocked`, exit 9. `--approve advisor:plan` overrides it, and the approval hook now also covers `run --approve`.
+- **Advisor before hand-over** (`final_gate`, after cleanup): blocking findings go through a fix round as `source: advisor` and become criteria. No usable answer → `review_failed`.
+- **Single tasks:** `orchestrate.py advise` (before) and `advise --final --base` (before the push).
+- Tests: 8 new e2e/unit tests. The routing tests pin the old tier starts with `--start` to keep exercising the ladder mechanics.
+
+**In-worker advisor tool** (`plan.advisor`, still opt-in), after [the advisor docs](https://code.claude.com/docs/en/advisor) and a guide on pairing Fable with Opus: the worker prompt now says when to consult (before an approach, on a repeated error, before the report), because the worker decides and Opus left unprompted rarely asked (−7 points on one Anthropic benchmark). `max_model` caps the advisor. A launch refused because of the advisor (Fable usage-credits consent exits at launch) re-runs without it as `advisor_off` instead of counting against the model. 3 new routing tests.
+
+**Not done yet:** `make eval-quick` against the real `claude` (the reviewer prompt and schema changed, and there are no advisor eval cases yet).
+
+### P10: Orca workers instead of a background process (2026-11-17)
+
+The user asked for the skill to start Orca workers instead of running as a background task, with the script keeping the brain (their choices: Orca workers; the script keeps planning, checks, merges, review and the advisor).
+
+- `scripts/orca_mode.py`: inside Orca (`ORCA_AGENT_SESSION_ID` set) `run` defaults to `--workers orca`. The parent agent is the Orca coordinator; the script runs one step per command and never waits. `run` and `resume` prepare the job and start workers; `worker-done` and `worker-lost` handle a worker's mail. Headless mode is unchanged and remains the default outside Orca.
+- Each task runs as an Orca worker: `worker-start --worktree new-child` (or `new-top-level --repo path:<repo>` when the coordinator isn't in the job's repo) from `orchestrate/<job>`, on the routed model (`models.MODEL_IDS`). The worker writes `.orchestrate/report.json` (excluded from git) and sends `worker_done --report-path`.
+- The checks and the ladder are run_task.py's: scope with claims, verify, every done id; first failure goes back to the same worker (`send`), then the classifier and the ladder, with a stronger model started in the same worktree. Route ledger entries as before. Merged workers are released and their worktrees removed (`--delete-branch`, which keeps any branch Orca can't prove merged); failed ones stay open.
+- `run_job` was split into `prepare_job` and `review_round`, shared by both modes. In Orca mode an owed review fix becomes a `review-fix-<n>` task run by a worker.
+- Spike (Orca 1.4.261): the worker-start receipt gives `dispatchId`, `taskId`, `runId` and the worktree path in `effects[kind=worktree].id` after `::`; the branch is `<git user>/<name>`; `worker_done` carries `taskId`, `dispatchId`, `outcome`, `filesModified`, `reportPath`.
+- Tests: a fake `orca` creates real worktrees and simulates workers; 10 Orca tests (full job, failed check sent back, out of scope, unmet done, escalation in the same worktree, lost worker, review fix task, gate and resume, other-repo placement, wait/status). Harness: 30 + 69 + 5 green.
+- **Live run** (`orca-e2e`, one docs task on this repo, real Orca and models, $3.35): advisor plan check (medium then high, three criteria raised), one Orca worker on opus/medium, checks, merge, release, worktree and branch removed, reviewer pass, cleanup. The first final advisor check hit a Fable rate limit and the job ended `review_failed` (fail closed, as designed); `resume` reviewed again and the advisor signed off: `done`. The failure message now names the cause (`advisor_failure`).
+- **Limits:** Orca workers' cost isn't visible to the script, so `budget_usd` covers only its own model calls; the in-worker advisor tool (`plan.advisor`) isn't passed to Orca workers.
+
+### P9: prompts brought in line with Anthropic's prompting guides (planned 2026-11-16, implemented 2026-11-17)
+
+**Status.** All 15 steps done. Harness tests: 30 + 60 + 5, all green. Eval runs are in `evals/runs/p9-*.{txt,json}`; they cost about $57, plus about $3 of one-off debugging calls and spikes.
+
+| # | State | What changed / what the evals showed |
+|---|---|---|
+| 0 | ✅ | New runners and cases: advisor (4: plan and final stage, each with a should-pass twin), planner (1), worker (2: a four-part task, and a pre-existing bug to leave alone). `draft_plan()` split out of `cmd_plan` so evals can call the planner. Baseline: core 18/19 (reviewer `clean-diff-passes` failed: every unhandled edge case was forced to major), new cases 7/7 |
+| 1–3 | ✅ | `run_task.worker_prompt` gains FINISH (unattended: don't end on a summary, an offer or non-blocking decisions), VERIFY (a real check; install declared deps from the lockfile without changing it), SCOPE (leave pre-existing bugs and report them as `fyi`; audit each report claim against a tool result). Worker cases 2/2 before and after, 2/2 at opus/low. Saturated: they guard against regressions but can't show the gain |
+| 4 | ✅ | Reviewers and the advisor report everything with `confidence`; `blocking_findings()` decides (blocker/major unless low confidence), and `settle_verdict()` sets the verdict from the findings (the model's is kept as `model_verdict`). Unhandled edge cases carry the reviewer's own `severity`. This fixed `clean-diff-passes` (0 → 1) |
+| 5 | ✅ | Reviewer playbook: two examples in `<example>` tags (changes requested, and a pass with a low-confidence doubt); advisor prompt: three (plan revise, final pass with a nit, final pass with a low-confidence risk), in a different domain from the eval fixtures |
+| 6 | ✅ | `REVIEW`, `AREA_REVIEW`, `ADVICE`, `FINDING`, `EDGE_CASE`: evidence fields first, `verdict` last |
+| 7 | ✅ | Reviewer, area, integration and advisor prompts: material first in tags (`<diff>`, `<task_reports>`, `<verify_output>`, `<plan>`), then playbook and `<definition_of_done>`, then the task. Not measured separately from 4–6 (one eval run covered them together) |
+| 8 | ✅ | `fence()` uses `<untrusted source=… id=…>` with a fresh random id per block; the diff is now fenced (`fence_code` keeps `<<<`/`>>>`); bidi controls are shown as `[U+202E]`, not dropped. `injection-in-open-issue` still passes |
+| 9 | ✅ | Bare "never" rules rewritten with a reason in our skill text (Matt Pocock's vendored sections left verbatim). The lessons extractor writes notes with scope and reason |
+| 10 | ✅ | Brief report section, manager `ask_human` questions and the parent's final summary: outcome first, plain words, no invented labels |
+| 11 | ✅ | `claude_cli`: `stop_reason: "refusal"` → `refusal` (category kept); `max_tokens` → `cut_off` with structured output dropped. `run_task` stops on refusal (exit 9, no routing evidence); the manager playbook asks the user. Spike: CLI 2.1.325's JSON has `stop_reason` and `safety_stops` |
+| 12 | ✅ measured, **defaults unchanged** | 1 trial per case. Reviewer opus/high 6/6 = opus/medium 6/6 (after regrading `decision-respected-passes`, below). Worker opus/low 2/2 = opus/medium. Advisor fable/high-only 4/4; default (medium, then high on a clean pass) 4/4 on the final stage, `plan-sound` 4/4, then 0/1 on a latent fixture bug (the router swallowed handler errors), then 3/3 after fixing the fixture. Suites are small and mostly saturated, so they can't separate the configs; the user's assignment stands |
+| 13 | ✅ | Manager events carry `elapsed_s` |
+| 14 | ✅ no change needed | Spike on Fable 5.2: a resumed session with different `--allowedTools`, `--settings` and an added `--advisor` worked (no prefix-check error) |
+
+**Eval changes made along the way, and why.**
+- `decision-respected-passes` is graded on its purpose (no blocking finding re-argues the opaque-token decision, `no_finding_mentions`) instead of `verdict: pass`. The stricter reviewer rightly flags that the fixture is half-wired (no web route, no store); `clean-diff-passes` remains the verdict check. 3/3 after the change.
+- The advisor plan-stage pair moved to a coherent fixture of their own (real Makefile targets, auth, store with JSON tags, config, ADR, router that returns 405 and 500). On the old skeleton fixture, the advisor correctly found that `make test` ran `true` and the ADR didn't exist, so "plan-sound" wasn't sound.
+- The advisor is told which baseline commands already passed (production runs them before the plan check), so it doesn't stop a plan on "the repo may not build".
+- With coverage reporting, "medium found nothing" means nothing that blocks; a missing criterion goes to `raise_bar` (adopted without stopping) rather than a major finding.
+
+**Known flaky, untouched by P9:** classifier `cannot-find-module-is-not-environment` passed 1/3 at haiku/low (the classifier prompt and schema didn't change).
+
+**Resuming a pre-v0.6 job** (hermes-phase6): validation names the missing `definition_of_done` and where to add it, and the plan check is skipped once tasks have run (the final check still runs).
+
+
+Sources: [prompting best practices](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices) **[BP]** and the per-model pages for the models this skill runs: [Fable 5.2](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-fable-5-2) **[F52]**, [Opus 5.5](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-opus-5-5) **[O55]**, [Sonnet 5.5](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-sonnet-5-5) **[S55]**, [Haiku 5.5](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-haiku-5-5) **[H55]**. The pages for older models (Fable 5, Fable 5.1, Opus 5, Opus 4.8, Sonnet 5) were read for techniques the newer pages still point to **[OLD]**.
+
+The overview page's precondition applies first: prompt changes need success criteria and a way to test them. Step 0 is therefore evals, and every later step ships with cases and a before/after run.
+
+| # | Change | Where | Why (source) |
+|---|---|---|---|
+| 0 | **Evals before prompts.** Add worker-prompt, advisor and planner eval cases; run `make eval-quick` as the baseline for everything below | `evals/` | [overview] "a clear definition of the success criteria" and "ways to empirically test" come before prompt engineering. Advisor and planner have no cases; the reviewer suite is saturated |
+| 1 | **Workers finish the whole task.** Add an unattended-run paragraph to the worker prompt: don't end the turn on a summary that announces the next step, an offer to continue, or a list of non-blocking decisions; work through ordinary obstacles (errors, timeouts); stop only for a deliberate blocker | `run_task.py worker_prompt` | [O55] "Unattended agentic runs": Opus 5.5 ends turns with progress reports, and an unattended loop stops there. [F52] "Finish the whole task": about half as many unfinished sessions, +30% output tokens. Workers run unattended at medium, where both pages say early stops are most common |
+| 2 | **Workers run a real check.** Add the verification paragraph: a check that exercises the change, a syntax-only check or one that failed to start doesn't count, say which check could not run | `run_task.py worker_prompt` | [S55] [H55] "Verification on coding tasks" (same text on both pages). Matters most for a `models.worker` override to Sonnet or Haiku; cheap on Opus |
+| 3 | **Workers keep to the task and report the rest.** A pre-existing bug or unmentioned behaviour goes to `open_issues` (`fyi`) instead of being fixed; state the reading chosen when the task is ambiguous. Before reporting, audit each claim against a tool result from this session | brief "Rules" and "Report" | [OLD] Fable 5.1 "Keep changes and tests to what the task asks for"; Fable 5 "Ground progress claims" ("nearly eliminated fabricated status reports"). Fable is the top rung of the worker ladder |
+| 4 | **Reviewer and advisor report everything; code filters.** Replace "use `changes_requested` only if…" style self-filtering with a coverage instruction, add `confidence` to findings, and keep the severity gate in code. State the reporting threshold concretely | `orchestrate-review/SKILL.md`, `ADVICE_TAIL`, `schemas.FINDING` | [OLD] "Code review harnesses": a prompt that says be conservative makes the model find bugs and then not report them; "it is better to surface a finding that later gets filtered out than to silently drop a real bug" |
+| 5 | **More and more varied examples.** The reviewer playbook has one output example, and it is `changes_requested`. Add a `pass` example and an advisor example; wrap them in `<example>` tags, 3–5 per role | review and manage skills, advisor prompt | [BP] "Use examples effectively": relevant, diverse, in `<example>` tags, 3–5; one-sided examples teach an unintended pattern |
+| 6 | **Verdict last in judgment schemas.** Order `REVIEW` and `ADVICE` as evidence fields first (acceptance, edge cases, findings), `verdict` last, as the classifier already does | `schemas.py` | [S55] "Reasoning tasks with JSON output": with structured output the model can only work things out in thinking; [H55]/the ticket-routing guide: evidence before label |
+| 7 | **Data at the top, question at the end, in XML tags.** Reviewer and advisor prompts: diff, reports and verify output first inside `<diff>`, `<task_reports>`, `<verify_output>`; instructions and the final ask after. Measure against the cached-prefix cost of moving the playbook | `review_once`, `review_by_area`, `advise` | [BP] "Long context prompting": long documents above the query, "queries at the end can improve response quality by up to 30 percent"; "Structure prompts with XML tags" |
+| 8 | **Untrusted text in tags with a random id.** Replace the fixed `<<<UNTRUSTED …>>>` fence with opening and closing tags that carry the same per-call random id, and wrap the diff too (it is subagent-written and currently unfenced) | `fence()` and its callers, the three playbooks | [O55] "Mark pasted text in user messages": matching random ids on both tags, one line of explanation in the prompt. A fixed fence can be imitated; `sanitize` strips look-alikes today, the id removes the need to guess them |
+| 9 | **Absolute rules get a scope and a reason.** 14 "never" lines across the skills. Keep the security ones; rewrite the rest as "do X because Y" or "ask before X". Tell the lessons extractor to write notes with their scope and reason, never bare prohibitions, because approved notes accumulate in AGENTS.md | skills, `extract_lessons` prompt | [F52] "Keep caution from piling up": Fable treats "never" as absolute, and cautions written into notes and instruction files build up, most visibly "when several agents worked together". [BP] "Add context": the reason generalises |
+| 10 | **Reports a low-context reader can follow.** Add the "communicating clearly" guidance to the brief's report section (the manager, reviewer and dependents read it cold), to the manager's `ask_human` questions, and to the parent's final summary: outcome first, plain words, no labels invented during the work | brief "Report", manage skill, `orchestrate/SKILL.md` step 5 | [F52] "Make reports easy to follow"; [OLD] Fable 5 "Lead with the outcome" |
+| 11 | **Refusals and cut-off replies are not model failures.** Map `stop_reason: "refusal"` to its own error kind (not routing evidence, reported with its category), and treat a `max_tokens` stop as a failed call to retry even when the JSON parses | `claude_cli._kind`, `run_task.classify` | [F52] [O55] "Safeguard refusals"; [S55] "treat any response whose `stop_reason` is `max_tokens` as failed, even if its text holds valid JSON". Needs a spike: confirm the CLI's JSON exposes both |
+| 12 | **Effort chosen by sweep.** Sweep advisor (fable medium / high), reviewer (opus medium / high) and worker (opus low / medium) on the new eval cases; keep the user's assignment unless a sweep shows a clear gap, and show the user the numbers | `Makefile` sweeps | [F52] "rerun your effort sweep rather than carrying over a setting"; the medium→high step "raised scores on most" evals. [O55] start at medium |
+| 13 | **Elapsed time in manager events** (low priority): add `elapsed 340s` to each event | `render_event` | [O55] "Time signals for multiagent harnesses": Opus 5.5 paces work on elapsed time; teams finished sooner at similar quality |
+| 14 | **Spike: resumed sessions with changed flags.** A resumed worker attempt that drops `--advisor`, or a resume after a skill update, changes the session's tools or system prompt. Confirm Claude Code handles the prefix check on Fable 5.2; otherwise start a fresh session in those cases | `run_task.py`, manager resume | [F52] note on the prefix check and "Harness code that edits earlier turns": a changed `system` or `tools` invalidates later thinking blocks (400 by default) |
+
+**Checked and already in line (no change):** no token budget is shown to any model ([F52]: a visible budget changes spend); no "think step by step", "double-check" or "think less" lines ([O55], [OLD] Opus 5 over-verification; effort is the control); effort is set explicitly on every call; workers can't spawn subagents ([F52], [OLD] subagent overuse); the classifier writes evidence before its label; continuation after an unfinished attempt names the open items and is capped at 2 ([O55]: stop after two or three automatic continuations).
+
+**Deliberately not adopted:** the code-ownership sentence ([F52]). It raised consolidation from under 10% to about 75% of runs, with 70–80% more output tokens and unrequested behaviour changes, and a scope rule did not cancel it. Workers are held to file ownership and a scope check, so it works against the design.
+
+**Order:** 0, then 1–3 (worker prompt, one eval run), 4–6 (review and advice, one eval run), 8 and 11 (harness, unit tests), 7 (needs a cost measurement), 9–10 (wording), 12–14.
+
 ### P7: the bar, a definition of done that only rises (2026-11-16)
 
 The user asked that every step define what done looks like, improve it from what other models find, and always set the bar high.

@@ -19,6 +19,7 @@
  },
  "plan": {
   "goal": "Users can share a schedule via a public read-only link",
+  "definition_of_done": "Users can share a schedule via a public read-only link: done when every acceptance criterion holds, each shown by a test or file:line",
   "acceptance": [
    "POST /schedules/:id/share returns a token (test)",
    "GET /share/:token returns the schedule read-only; unknown tokens are 404 (test)",

@@ -9,7 +9,13 @@
 * Every call returns `metrics` (turns, tokens incl. cache reads, duration) so jobs can be
   measured.
 
+* A safety-classifier decline (stop_reason "refusal") is error_kind "refusal", with its category in
+  `refusal_category`: not evidence about the model. A reply cut off at max_tokens is "cut_off" and
+  its structured output is dropped even if it parses (Sonnet 5.5 prompting guide: "treat any
+  response whose stop_reason is max_tokens as failed, even if its text holds valid JSON").
+
 error_kind: None | timeout | budget | max_turns | overloaded | rate_limit | api | exec | unparseable
+            | refusal | cut_off
 """
 from __future__ import annotations
 
@@ -55,6 +61,10 @@ def _metrics(data: dict, wall: float) -> dict:
 
 
 def _kind(data: dict) -> str | None:
+    if data.get("stop_reason") == "refusal":
+        return "refusal"
+    if data.get("stop_reason") == "max_tokens":
+        return "cut_off"
     if not data.get("is_error") and data.get("subtype", "success") == "success":
         return None
     sub = str(data.get("subtype") or "")
@@ -123,4 +133,11 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
     data["metrics"] = _metrics(data, time.time() - t0)
     so = data.get("structured_output")
     data["structured"] = so if isinstance(so, dict) else extract_json(str(data.get("result", "")))
+    if kind == "cut_off":
+        data["structured"] = None  # a truncated reply is never a verdict
+    if kind == "refusal":
+        sd = data.get("stop_details") or {}
+        data["refusal_category"] = sd.get("category") if isinstance(sd, dict) else None
+        if not data["refusal_category"] and data.get("safety_stops"):
+            data["refusal_category"] = str(data["safety_stops"])[:200]
     return data

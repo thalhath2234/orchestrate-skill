@@ -16,8 +16,8 @@ import re
 import sys
 
 RULES = [
-    (re.compile(r"orchestrate\.py\b[^|;&]*\bresume\b[^|;&]*--approve\b"),
-     "approves a gated orchestrate task"),
+    (re.compile(r"orchestrate\.py\b[^|;&]*\b(resume|run)\b[^|;&]*--approve\b"),
+     "approves a gated orchestrate task or overrides the advisor"),
     (re.compile(r"router\.py\b[^|;&]*\bapprove\b"),
      "approves an orchestrate routing or AGENTS.md proposal"),
     (re.compile(r"orchestrate\.py\b[^|;&]*\bresume\b[^|;&]*--answer\b"),

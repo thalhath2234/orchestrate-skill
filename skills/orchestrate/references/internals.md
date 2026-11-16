@@ -12,6 +12,16 @@ Reference for the parent when a user asks how something works, or when a job beh
 | **Integrator / reviewers** | fresh sessions | resolve merge conflicts; review the merged result (per area plus an integration reviewer when the diff is large) |
 | `orchestrate.py` | script | capacity caps, worktrees, briefs, merging, file claims, rule-based triage, and validating and applying the manager's actions |
 
+## Orca mode
+
+`scripts/orca_mode.py`. The parent agent is the Orca coordinator; the script is called once per event and never waits:
+
+- `run` (or `resume`): `prepare_job` (setup, baseline, the manager's pending answer, the advisor's plan check), an Orca Run (`run-create`), then `pump`.
+- `pump`: settle queued manager events synchronously, start a worker for each ready task up to the parallel cap (`worker-start --spec-file <brief> --worktree new-child|new-top-level --base-branch orchestrate/<job> --model <id> --effort <e>`), and return exit 10 while workers run. When nothing runs and every task is done, `review_round` runs; if the manager queues nothing for blocking findings, they become a `review-fix-<n>` task that depends on every other task and runs as a worker too.
+- `worker-done`: the checks run_task.py runs, on the worker's worktree: scope (with claims), verify, the report at `.orchestrate/report.json` (kept out of git by `info/exclude`), and every done id. Pass: route ledger, `commit_and_merge`, `worker-release`, `worktree rm --delete-branch`, raised criteria, open-issue triage. Fail: the first failure at a model goes back to the same worker with `send`; the second is classified, and the ladder picks the next model, started in the same worktree with a note that a weaker attempt left changes. Out of escalations, or an environment cause: the task fails, its worker stays open, and the manager gets the event.
+- `worker-lost`: a worker that stopped without `worker_done` counts as a failed attempt; it is replaced in the same worktree.
+- One step at a time per job (`.orca-step.lock`); the skill-files fingerprint is retaken on start and resume and checked at every `worker-done`.
+
 ## The manager
 
 It is woken only when judgment is needed:
@@ -22,7 +32,7 @@ It is woken only when judgment is needed:
 
 It decides in a background thread. The scheduler keeps launching tasks the decision can't affect, and events that arrive meanwhile reach it as one `batch`. It replies (as schema-checked structured output) with actions: `retry`, `split`, `add_task`, `amend`, `skip`, `fix_round`, `accept`, `ask_human` or `abort`. The script validates them as one batch (ownership, the dependency graph, verify not weakened, migrations gated, limits) and applies all or none. A reply that can't be parsed is re-asked once, then turned into a question for the user. Defaults: at most 12 interventions per job and 2 manager retries per task. Every decision is listed in `report.md`. `"manager": {"enabled": false}` falls back to plain stop-on-failure and one generic fix round.
 
-Subagent-written text (reports, open issues, log tails) reaches the manager, reviewer and integrator only inside `<<<UNTRUSTED ...>>>` fences, sanitized and size-capped.
+Subagent-written text (reports, open issues, log tails, the diff) reaches the manager, reviewer, advisor and integrator only inside `<untrusted source="..." id="...">` tags. The opening and closing tags carry the same random id, generated per block, so text inside can't close the fence early. Prose is sanitized and size-capped; code and diffs keep `<<<` and `>>>` as written, and bidi control characters are shown as `[U+202E]` instead of being dropped.
 
 ## The parallelism cap
 
@@ -44,15 +54,21 @@ Its verify steps start with a scope check. A change to a path another task owns,
 
 After every task has merged: the job's final verify, then a reviewer with a fresh context. When the diff exceeds `review_diff_chars`, one reviewer per area runs in parallel and an integration reviewer judges acceptance and cross-area wiring from their verdicts. Every acceptance criterion needs evidence (`file:line` or a test); a criterion that is unassessed, unmet or unevidenced becomes a blocker. A reviewer that returns no verdict ends the job as `review_failed`, never `done`.
 
+Reviewers and the advisor report every finding with a `severity` and a `confidence`, and the harness decides what blocks (`blocking_findings`): blocker or major, unless the model marked it low confidence. The model's own `verdict` is kept as `model_verdict`, but the findings set the verdict. This follows Anthropic's code-review harness guidance: a reviewer told to be selective finds bugs and then leaves them out. An unhandled edge case the reviewer didn't list as a finding is added at the severity it gave the case. Judgment schemas put the evidence fields first and the verdict last, because structured output is generated in field order. Reviewer and advisor prompts put the material first (diff, reports, verify output, each fenced), then the playbook and the definition of done, then the task.
+
 ## Routing and escalation (inside every task)
 
 Type is `<category>:<area>`: categories `rename docs config bugfix feature refactor test migration review research`; area is the package's area from `scan`, or `cross`.
 
-The tier sets the starting model and effort on the ladder `haiku/low → haiku/medium → sonnet/medium → sonnet/high → opus/low → opus/medium → opus/high → opus/xhigh → fable/high` (T0 haiku/medium, T1 sonnet/medium, T2 opus/low, T3 opus/medium). An effort failure, or any failure below the model's default effort, re-runs on the same model at `high`; a capability failure moves to the next model at its default effort, with Opus going to `xhigh` before Fable. `plan.max_model` caps it. Fable calls carry `--fallback-model opus`, and a call that fell back is not routing evidence. `router.py ladder` prints the ladder and role defaults; `router.py route --type bugfix:api --tier T1` checks one decision.
+Every task starts at the worker role (Opus 5.5 at medium) on the ladder `haiku/low → haiku/medium → sonnet/medium → sonnet/high → opus/low → opus/medium → opus/high → opus/xhigh → fable/high`, whatever its tier; the tier sets how many done criteria it needs. `run_task.py --start` (from `models.worker`) moves the start, and learned floors only matter above it. An effort failure, or any failure below the model's default effort, re-runs on the same model at `high`; a capability failure moves to the next model at its default effort, with Opus going to `xhigh` before Fable. `plan.max_model` caps it. Fable calls carry `--fallback-model opus`, and a call that fell back is not routing evidence. `router.py ladder` prints the ladder and role defaults; `router.py route --type bugfix:api --tier T1` checks one decision.
 
 **The bar.** Briefs number the definition of done: `[D#]` for the task's `done`, `[U#]` for `UNIVERSAL_BAR` plus `plan.quality_bar`. `run_task.py --done-ids` checks the report's `done_check` after verify passes, and any gap is a failed attempt. `raise_bar()` adopts criteria from subagent reports, the manager's `raise_bar` action, reviewers' `raise_bar` and blocking findings. Each goes into a not-started task's `done`, otherwise into `acceptance`; additions are deduplicated and capped. `apply_actions` rejects any change that drops a `done` or `acceptance` criterion. Every addition is logged in `job.json` → `bar`.
 
-Role models live in `scripts/models.py`, each with its Anthropic source: planner Opus 5.5 at high, final reviewer Fable 5.2 at high, manager Opus 5.5 at medium, area reviewers Opus at high, integrator Sonnet at high, failure classifier Haiku 5.5 at low, lessons Haiku at medium. Override per plan with `models`.
+Role models live in `scripts/models.py`: advisor Fable 5.2 at medium (asked again at high when medium finds nothing), planner Fable 5.2 at medium, manager, worker, reviewer, area reviewers and cleanup Opus 5.5 at medium, integrator Sonnet at high, failure classifier Haiku 5.5 at low, lessons Haiku at medium. Override per plan with `models`.
+
+The advisor runs at two points. `plan_gate` asks it about `plan.json` before any task starts; a blocker/major finding or a `revise` verdict ends the job as `advisor_blocked` (exit 9), and `--approve advisor:plan` (through the approval hook) overrides it. After a review round passes, `final_gate` runs the cleanup subagent on the integration branch (kept only if it edits just the job's files and verify still passes), then asks the advisor for the final check; its blocking findings go to the manager as `review_changes_requested` with `source: advisor` and become criteria the next round must meet. An advisor with no usable answer fails closed. Outside a job, `orchestrate.py advise` runs the same checks for a single task.
+
+Separately, `plan.advisor` turns on Claude Code's advisor tool inside each worker (`run_task.py --advisor`). The worker decides when to call it, so the prompt tells it when: before committing to an approach, when an error repeats, and before the final report (on an Anthropic benchmark Opus rarely consulted unprompted and scored 7 points below Opus alone). `max_model` caps the advisor, and an advisor ranked below the worker isn't passed. A launch refused because of the advisor (for example Fable's usage-credits consent) is re-run without it and recorded as `advisor_off`, not as a model failure. Each advisor call re-reads the whole worker session uncached, which is why it stays opt-in.
 
 Each config gets 2 attempts. API overloads and rate limits are retried with backoff first and never count against a model. Then the failure is classified:
 

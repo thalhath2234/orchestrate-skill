@@ -18,32 +18,47 @@ opus -> claude-opus-5-5, fable -> claude-fable-5-2 (checked with CLI 2.1.325).
 from __future__ import annotations
 
 import os
+import re
 
 MODEL_ORDER = ["haiku", "sonnet", "opus", "fable"]          # cheapest -> most capable
 EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"]
 # Each model's API default effort [EFFORT]: "Opus 5.5 and Haiku 5.5 default to medium",
 # Sonnet 5.5 and Fable 5.2 to high. "Start at the default and adjust on evals" [CHOOSE].
 DEFAULT_EFFORT = {"haiku": "medium", "sonnet": "high", "opus": "medium", "fable": "high"}
+# Provider model ids, for launchers that take an exact id (Orca's worker-start --model).
+MODEL_IDS = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5",
+             "fable": "claude-fable-5-2"}
 # Fable needs account access (and on some plans a usage-credits consent); without it the
 # call falls back instead of failing the job.
 FALLBACK = {"fable": "opus"}
 
 ROLES: dict[str, tuple[str, str]] = {
+    # The user's model assignment (2026-11-16): advisor Fable/medium (high when medium finds
+    # nothing), planner Fable/medium, manager, worker, reviewer and cleanup Opus/medium.
+    #
+    # Second opinion at the two points of no return: before the plan executes and before the
+    # job is handed over. Fable 5.2 at medium first; a clean medium pass is re-checked at high
+    # (ADVISOR_ESCALATE), so "nothing found" is only believed after the stronger look.
+    # [CHOOSE] Fable 5.2 is the most capable model; [ADVISOR] an advisor ranks above the workers.
+    "advisor": ("fable", "medium"),
     # One call that decides the whole job: decomposition, ownership, the definition of done.
-    # Opus 5.5 (the user's choice): [CHOOSE] "complex agentic coding and enterprise work ...
-    # large-scale refactoring, complex systems engineering". high, not the default medium: the
-    # plan sets the bar for every later step, and [COST] measured high above medium on coding.
-    "planner": ("opus", "high"),
+    # Fable 5.2 at medium (the user's choice, 2026-11-16). [CHOOSE] Fable 5.2 is the most capable
+    # model; the Fable 5.2 prompting guide: "early testers had good results with Claude Fable 5.2
+    # as the planner and orchestrator for other models". Falls back to Opus without Fable access.
+    "planner": ("fable", "medium"),
     # Small decisions in a long job. [COST] "For most agent workloads, start with Claude
     # Opus 5.5 at its default effort (medium)". Our sweep: opus/medium 13/13 (= opus/high).
     "manager": ("opus", "medium"),
-    # The final review gates the merge, so it gets the strongest model. [COST] defect search:
-    # Fable 5.2 alone scored 1.6-5.9 points above Opus 5.5 at high, for 1.5-2.4x the cost.
-    "reviewer": ("fable", "high"),
+    # Every subagent starts here, whatever its tier, and escalates on failure
+    # (opus/high -> opus/xhigh -> fable/high). Opus 5.5 at its default effort.
+    "worker": ("opus", "medium"),
+    # Final reviewer, told to hunt every edge case. Opus 5.5 at its default effort; the
+    # advisor's final check (Fable) runs after it.
+    "reviewer": ("opus", "medium"),
     # Per-area reviewers on big diffs (the final reviewer still sees everything).
-    # [COST] defect search: Opus 5.5 lost 34 points at low vs medium; [LEGAL] Opus 5.5 where
-    # accuracy is required. high, not the default medium: review is where effort pays.
-    "area_reviewer": ("opus", "high"),
+    "area_reviewer": ("opus", "medium"),
+    # Tidies the merged diff before the final check: dead code, debug output, stray TODOs.
+    "cleanup": ("opus", "medium"),
     # Merge-conflict resolution: everyday coding [CHOOSE] at Sonnet's default effort.
     "integrator": ("sonnet", "high"),
     # Failure-cause classification. [ROUTE] "Claude Haiku 5.5 ... at low effort handles
@@ -52,6 +67,8 @@ ROLES: dict[str, tuple[str, str]] = {
     # Extract AGENTS.md notes from reports: extraction is Haiku's job [CHOOSE], default effort.
     "lessons": ("haiku", "medium"),
 }
+# When the advisor at its role effort finds nothing, ask again at this effort before believing it.
+ADVISOR_ESCALATE = "high"
 
 
 def rank(model: str) -> int:
@@ -89,13 +106,26 @@ def fallback_args(model: str) -> list[str]:
     return ["--fallback-model", fb] if fb else []
 
 
-def advisor_args(model: str, advisor: str | None) -> list[str]:
-    """`--advisor X` when the pairing is valid: an advisor must rank at or above the main
-    model [ADVISOR]. Off by default: [COST] measured an advisor buying about what more effort
-    buys (+1.7 points for 2.1x), so it is opt-in per plan, for long tasks hard in spots."""
-    if not advisor or advisor not in MODEL_ORDER or advisor == "haiku" or rank(advisor) < rank(model):
+def advisor_args(model: str, advisor: str | None, max_model: str | None = None) -> list[str]:
+    """`--advisor X` for a worker running `model`, or [] when the pairing can't work.
+
+    The advisor tool (claude --advisor) is off by default: [COST] measured it buying about what
+    more effort buys (+1.7 points for 2.1x), and on another benchmark Opus rarely consulted it
+    and scored 7 points lower. It is opt-in per plan, for long tasks that are hard in spots.
+    `max_model` caps the advisor like any role (Fable capped at Opus -> an Opus advisor).
+    [ADVISOR] An advisor must rank at or above the main model, else Claude Code silently drops it."""
+    if not advisor or advisor not in MODEL_ORDER or advisor == "haiku":
+        return []
+    if max_model and rank(advisor) > rank(max_model):
+        advisor = max_model
+    if advisor == "haiku" or rank(advisor) < rank(model):
         return []
     return ["--advisor", advisor]
+
+
+# A launch that fails because of the advisor, not the model: Fable's usage-credits consent not
+# accepted, an advisor the account or allowlist can't use, or an invalid pairing [ADVISOR].
+ADVISOR_LAUNCH_FAIL = re.compile(r"advisor|usage[- ]credits|/model fable|availableModels", re.I)
 
 
 def fell_back(model: str, model_id: str | None) -> bool:

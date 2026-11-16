@@ -28,7 +28,11 @@ FAKE_CLAUDE = textwrap.dedent('''\
                              "classifier": prompt.startswith("FAILURE_CLASSIFIER"),
                              "resume": "--resume" in a, "hint": "Note from a previous" in prompt,
                              "fallback": a[a.index("--fallback-model") + 1] if "--fallback-model" in a else None,
-                             "advisor": a[a.index("--advisor") + 1] if "--advisor" in a else None}) + "\\n")
+                             "advisor": a[a.index("--advisor") + 1] if "--advisor" in a else None,
+                             "consult": "consult the advisor" in prompt.lower()}) + "\\n")
+    if "--advisor" in a and cfg.get("advisor_launch_fail"):
+        sys.stderr.write("Error: Fable as the advisor needs your consent to bill usage credits. Run /model fable.\\n")
+        sys.exit(1)
     if prompt.startswith("FAILURE_CLASSIFIER"):
         res = json.dumps({"cause": cfg.get("cause", "capability"), "evidence": "fake evidence",
                           "agents_md": cfg.get("agents_md")})
@@ -36,11 +40,22 @@ FAKE_CLAUDE = textwrap.dedent('''\
         if f"{model}/{effort}" in cfg.get("pass", []):
             pathlib.Path("target.txt").write_text("fixed")
         res = "done"
+    if cfg.get("refuse") and not prompt.startswith("FAILURE_CLASSIFIER"):
+        print(json.dumps({"result": "", "session_id": "sess-1", "total_cost_usd": 0.001, "is_error": False,
+                          "subtype": "success", "stop_reason": "refusal", "stop_details": {"category": "cyber"},
+                          "modelUsage": {"claude-opus-5-5": {}}}))
+        sys.exit(0)
     ver = cfg.get("ver", "5-5")
     used = "opus" if model == "fable" and cfg.get("no_fable") else model
     print(json.dumps({"result": res, "session_id": "sess-1", "total_cost_usd": 0.01, "is_error": False,
                       "modelUsage": {f"claude-{used}-{ver}": {}}}))
 ''')
+
+
+# The ladder mechanics (effort restore, escalation, floors, probes) are tested from the cheap
+# rungs, so these tests pin the v0.6 per-tier starts explicitly. Production starts every tier at
+# the worker role (opus/medium): see test_every_tier_starts_at_the_worker_role.
+LEGACY_START = {"T0": "haiku/medium", "T1": "sonnet/medium", "T2": "opus/low", "T3": "opus/medium"}
 
 
 class RoutingTest(unittest.TestCase):
@@ -74,11 +89,15 @@ class RoutingTest(unittest.TestCase):
         env = {**self.env, "ROUTER_PROBE_RATE": probe_rate}
         p = subprocess.run([sys.executable, str(SCRIPTS / "run_task.py"), "--repo", str(self.repo),
                             "--type", ttype, "--tier", tier, "--verify", verify,
-                            "--baseline", "test -f target.txt", *extra, "do the thing"],
+                            "--baseline", "test -f target.txt", *extra,
+                            *([] if "--start" in extra else ["--start", LEGACY_START[tier]]), "do the thing"],
                            env=env, capture_output=True, text=True)
         summary = json.loads(p.stdout) if p.stdout.strip() else {}
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         return p.returncode, summary, calls, p.stderr
+
+    def route(self, ttype, tier, **kw):
+        return self.router.route(ttype, tier, start=LEGACY_START[tier], **kw)
 
     def ledger(self):
         return [json.loads(line) for line in (self.state / "ledger.jsonl").read_text().splitlines()]
@@ -106,11 +125,11 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(len(s["proposals"]), 1)
         self.assertEqual(s["proposals"][0]["kind"], "raise_floor")
         # proposal only: routing unchanged until approved
-        self.assertEqual(self.router.route("bugfix:api", "T1")["model"], "sonnet")
+        self.assertEqual(self.route("bugfix:api", "T1")["model"], "sonnet")
         self.assertEqual([p["kind"] for p in self.router.pending()], ["raise_floor"])
 
         self.router.approve(s["proposals"][0]["id"])
-        d = self.router.route("bugfix:api", "T1")
+        d = self.route("bugfix:api", "T1")
         self.assertEqual((d["model"], d["effort"], d["source"]), ("sonnet", "high", "learned"))
         self.assertEqual(self.router.pending(), [])
         self.assertEqual(json.loads((self.state / "routing.json").read_text())["bugfix:api"]["floor_cfg"],
@@ -217,11 +236,74 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(models.advisor_args("opus", "opus"), ["--advisor", "opus"])
         self.assertEqual(models.advisor_args("sonnet", None), [])
 
+    def test_every_tier_starts_at_the_worker_role(self):
+        for tier in ("T0", "T1", "T2", "T3"):
+            d = self.router.route("feature:web", tier)
+            self.assertEqual((d["model"], d["effort"], d["source"]), ("opus", "medium", "tier-default"), tier)
+        code, s, calls, err = self.run_task("rename:web", "T0", {"pass": ["opus/medium"]},
+                                            extra=("--start", "opus/medium"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(c["model"], c["effort"]) for c in calls], [("opus", "medium")])
+        # a failure at the worker start re-runs at opus/high (effort) before a stronger model
+        code, s, calls, err = self.run_task("bugfix:web", "T1", {"pass": ["opus/high"], "cause": "effort"},
+                                            extra=("--start", "opus/medium"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(c["model"], c["effort"]) for c in calls if not c["classifier"]][-1], ("opus", "high"))
+        os.environ["ORCHESTRATE_MODEL_WORKER"] = "sonnet/high"
+        try:
+            self.assertEqual(self.router.route("feature:web", "T1")["model"], "sonnet")
+        finally:
+            del os.environ["ORCHESTRATE_MODEL_WORKER"]
+
+    def test_advisor_workers_are_told_when_to_consult(self):
+        code, s, calls, err = self.run_task("feature:web", "T1", {"pass": ["opus/high"], "cause": "effort"},
+                                            extra=("--start", "opus/medium", "--advisor", "fable"))
+        self.assertEqual(code, 0, err)
+        workers = [c for c in calls if not c["classifier"]]
+        self.assertTrue(all(c["advisor"] == "fable" and c["consult"] for c in workers), workers)
+        self.assertEqual({st["advisor"] for st in s["steps"]}, {"fable"})
+        # no advisor: no consult line
+        _, _, calls, _ = self.run_task("feature:web", "T1", {"pass": ["opus/medium"]}, extra=("--start", "opus/medium"))
+        self.assertFalse(any(c["consult"] for c in calls))
+
+    def test_max_model_caps_the_advisor(self):
+        import models
+        self.assertEqual(models.advisor_args("opus", "fable", "opus"), ["--advisor", "opus"])
+        self.assertEqual(models.advisor_args("opus", "fable", None), ["--advisor", "fable"])
+        self.assertEqual(models.advisor_args("opus", "sonnet", None), [], "an advisor below the worker is dropped")
+
+    def test_advisor_refused_at_launch_runs_on_without_it(self):
+        code, s, calls, err = self.run_task("feature:web", "T1", {"pass": ["opus/medium"], "advisor_launch_fail": True},
+                                            extra=("--start", "opus/medium", "--advisor", "fable"))
+        self.assertEqual(code, 0, err)
+        workers = [c for c in calls if not c["classifier"]]
+        self.assertEqual([(c["advisor"], c["consult"]) for c in workers], [("fable", True), (None, False)])
+        self.assertIn("usage credits", s["advisor_off"])
+        self.assertEqual([(st["config"], st["ok"]) for st in s["steps"]], [("opus/medium", True)],
+                         "the refused launch is not a failed attempt for the model")
+        self.assertTrue(self.ledger()[-1]["ok"])
+
+    def test_refusal_stops_the_task_and_is_not_evidence(self):
+        code, s, calls, err = self.run_task("feature:web", "T1", {"refuse": True}, extra=("--start", "opus/medium"))
+        self.assertEqual(code, 9, err)
+        self.assertEqual((s["result"], s["refusal_category"]), ("refused", "cyber"))
+        self.assertEqual(len([c for c in calls if not c["classifier"]]), 1, "no retry, no escalation")
+        self.assertFalse(any(c["classifier"] for c in calls), "nothing to classify")
+        self.assertFalse((self.state / "ledger.jsonl").exists() and self.ledger(), "no routing evidence")
+
+    def test_cut_off_reply_is_never_a_verdict(self):
+        import claude_cli
+        d = {"stop_reason": "max_tokens", "is_error": False, "subtype": "success",
+             "structured_output": {"verdict": "pass"}}
+        self.assertEqual(claude_cli._kind(d), "cut_off")
+        self.assertEqual(claude_cli._kind({"stop_reason": "refusal", "subtype": "success"}), "refusal")
+        self.assertIsNone(claude_cli._kind({"stop_reason": "end_turn", "subtype": "success"}))
+
     def test_floors_from_the_old_ladder_still_route(self):
         # v1 stored floors as indexes into haiku/low..opus/xhigh; 4 was opus/high
         (self.state / "routing.json").write_text(json.dumps({"bugfix:api": {
             "floor": 4, "approved_at": __import__("time").time(), "model_alias": "sonnet"}}))
-        d = self.router.route("bugfix:api", "T1")
+        d = self.route("bugfix:api", "T1")
         self.assertEqual((d["model"], d["effort"], d["source"]), ("opus", "high", "learned"))
         (self.state / "ledger.jsonl").write_text(json.dumps({
             "t": 0, "task_id": "x", "type": "bugfix:api", "tier": "T1", "rung": 4, "model": "opus",
@@ -232,9 +314,14 @@ class RoutingTest(unittest.TestCase):
         import models
         self.assertEqual(models.role("classifier"), ("haiku", "low"))
         self.assertEqual(models.role("manager"), ("opus", "medium"))
-        self.assertEqual(models.role("planner"), ("opus", "high"))
-        self.assertEqual(models.role("reviewer"), ("fable", "high"))
-        self.assertEqual(models.role("reviewer", {"max_model": "opus"}), ("opus", "high"))
+        self.assertEqual(models.role("planner"), ("fable", "medium"))
+        self.assertEqual(models.role("planner", {"max_model": "opus"}), ("opus", "high"))
+        # the user's assignment (2026-11-16)
+        self.assertEqual(models.role("advisor"), ("fable", "medium"))
+        self.assertEqual(models.ADVISOR_ESCALATE, "high")
+        self.assertEqual(models.role("advisor", {"max_model": "opus"}), ("opus", "high"))
+        for r in ("manager", "worker", "reviewer", "area_reviewer", "cleanup"):
+            self.assertEqual(models.role(r), ("opus", "medium"), r)
         self.assertEqual(models.role("manager", {"models": {"manager": "sonnet/high"}}), ("sonnet", "high"))
         self.assertEqual(models.role("lessons", {"models": {"lessons": "sonnet"}}), ("sonnet", "high"))
         self.assertTrue(models.validate_plan({"models": {"planer": "opus"}}))
@@ -246,9 +333,9 @@ class RoutingTest(unittest.TestCase):
         self.run_task("bugfix:mobile", "T1", cfg)
         _, s, *_ = self.run_task("bugfix:mobile", "T1", cfg)
         self.router.approve(s["proposals"][0]["id"])
-        self.assertEqual(self.router.route("bugfix:mobile", "T1")["source"], "learned")
+        self.assertEqual(self.route("bugfix:mobile", "T1")["source"], "learned")
         self.router.note_alias("sonnet", "claude-sonnet-5-6")  # new Sonnet ships
-        d = self.router.route("bugfix:mobile", "T1")
+        d = self.route("bugfix:mobile", "T1")
         self.assertEqual((d["model"], d["source"]), ("sonnet", "tier-default"))
         self.assertIn("expired", d["rule"])
 
@@ -267,7 +354,7 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(len(props), 1)
         self.assertEqual(props[0]["kind"], "lower_floor")
         self.router.approve(props[0]["id"])
-        d = self.router.route("refactor:web", "T1")
+        d = self.route("refactor:web", "T1")
         self.assertEqual((d["model"], d["effort"]), ("opus", "low"))
 
     def test_failed_probe_returns_to_floor(self):
@@ -283,10 +370,10 @@ class RoutingTest(unittest.TestCase):
 
     def test_bad_task_type_rejected(self):
         with self.assertRaises(SystemExit):
-            self.router.route("stuff:api", "T1")
+            self.route("stuff:api", "T1")
         with self.assertRaises(SystemExit):
-            self.router.route("bugfix:Not A Slug", "T1")
-        self.assertEqual(self.router.route("bugfix:billing-service", "T1")["model"], "sonnet")
+            self.route("bugfix:Not A Slug", "T1")
+        self.assertEqual(self.route("bugfix:billing-service", "T1")["model"], "sonnet")
 
     def test_default_state_dir_is_outside_the_skill(self):
         env = {k: v for k, v in os.environ.items() if k not in ("ORCHESTRATE_DIR", "XDG_DATA_HOME")}

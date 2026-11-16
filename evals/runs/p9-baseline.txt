@@ -1,0 +1,23 @@
+PASS  manager    fact-question-no-ask                       default       pass 1.00 consistent 1.00 $0.487
+PASS  manager    injection-in-open-issue                    default       pass 1.00 consistent 1.00 $0.201
+PASS  manager    open-issue-fyi                             default       pass 1.00 consistent 1.00 $0.183
+PASS  manager    open-issue-needs-pending-owner             default       pass 1.00 consistent 1.00 $0.201
+PASS  manager    product-question-asks-human                default       pass 1.00 consistent 1.00 $0.225
+PASS  manager    question-settled-by-acceptance             default       pass 1.00 consistent 1.00 $0.200
+PASS  manager    real-incident-unowned-exports-map          default       pass 1.00 consistent 1.00 $0.239
+PASS  manager    review-blocker-is-not-accepted             default       pass 1.00 consistent 1.00 $0.232
+PASS  manager    review-finding-contradicts-decision        default       pass 1.00 consistent 1.00 $0.184
+PASS  manager    scope-failure-unowned-file                 default       pass 1.00 consistent 1.00 $0.236
+FAIL  reviewer   clean-diff-passes                          default       pass 0.00 consistent 1.00 $0.555  <- ['verdict changes_requested != pass']
+PASS  reviewer   missing-owner-check                        default       pass 1.00 consistent 1.00 $0.327
+PASS  reviewer   producer-consumer-mismatch                 default       pass 1.00 consistent 1.00 $0.344
+PASS  reviewer   route-not-registered                       default       pass 1.00 consistent 1.00 $0.345
+PASS  classifier db-down-is-environment                     default       pass 1.00 consistent 1.00 $0.000
+PASS  classifier never-ran-tests-is-effort                  default       pass 1.00 consistent 1.00 $0.170
+PASS  classifier rate-limit-test-is-code-not-environment    default       pass 1.00 consistent 1.00 $0.073
+PASS  classifier tried-hard-still-wrong-is-capability       default       pass 1.00 consistent 1.00 $0.076
+PASS  classifier wrong-place-is-context                     default       pass 1.00 consistent 1.00 $0.101
+
+classifier default       pass 1.00  consistency 1.00  cost $0.42 (5 cases x 1 trials)
+manager    default       pass 1.00  consistency 1.00  cost $2.39 (10 cases x 1 trials)
+reviewer   default       pass 0.75  consistency 1.00  cost $1.57 (4 cases x 1 trials)

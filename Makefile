@@ -1,4 +1,4 @@
-.PHONY: test eval-quick eval eval-sweep-manager eval-sweep-classifier eval-sweep-reviewer validate-plugin
+.PHONY: test eval-quick eval eval-sweep-manager eval-sweep-classifier eval-sweep-reviewer eval-sweep-advisor eval-sweep-worker validate-plugin
 
 # Harness tests: fake `claude`, no tokens spent.
 test:
@@ -23,10 +23,20 @@ eval-sweep-classifier:
 	env -u ORCHESTRATE_DIR python3 evals/run.py --role classifier --trials 3 \
 	  --config haiku/low --config sonnet/low
 
-# Final reviewer: Fable 5.2 (default) against cheaper settings.
+# Advisor: Fable 5.2 at medium (default; re-asked at high when nothing blocks) against high only.
+eval-sweep-advisor:
+	env -u ORCHESTRATE_DIR python3 evals/run.py --role advisor --trials 2 \
+	  --config fable/medium --config fable/high
+
+# Worker prompt: Opus 5.5 at medium (default) against low.
+eval-sweep-worker:
+	env -u ORCHESTRATE_DIR python3 evals/run.py --role worker --trials 2 \
+	  --config opus/medium --config opus/low
+
+# Final reviewer: Opus 5.5 at medium (default) against stronger settings.
 eval-sweep-reviewer:
 	env -u ORCHESTRATE_DIR python3 evals/run.py --role reviewer --trials 2 \
-	  --config fable/high --config fable/medium --config opus/high
+	  --config opus/medium --config opus/high --config fable/high
 
 validate-plugin:
 	claude plugin validate .

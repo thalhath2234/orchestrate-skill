@@ -29,6 +29,8 @@ FAKE = textwrap.dedent(r'''
         r = {"verdict": "pass", "summary": "fine", "findings": [],
              "acceptance": [{"criterion": l[2:], "met": True, "evidence": "x_test.go:1"}
                             for l in block.splitlines() if l.startswith("- ")]}
+    elif prompt.startswith("ORCHESTRATE_ADVISE"):
+        r = {"done_restated": "x", "findings": [], "summary": "fine", "verdict": "proceed"}
     else:
         r = {}
     print(json.dumps({"result": json.dumps(r), "structured_output": r, "is_error": False,
@@ -73,6 +75,15 @@ class EvalRunnerTest(unittest.TestCase):
         self.assertEqual(r["open-issue-needs-pending-owner"]["pass_rate"], 0.0)
         self.assertEqual(r["clean-diff-passes"]["pass_rate"], 1.0, r["clean-diff-passes"])
         self.assertEqual(r["producer-consumer-mismatch"]["pass_rate"], 0.0)
+
+    def test_advisor_cases_run_against_the_real_builders(self):
+        p, res = self.run_evals("--role", "advisor")
+        self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+        r = self.rows(res)
+        self.assertEqual(r["plan-sound"]["pass_rate"], 1.0, r["plan-sound"])
+        self.assertEqual(r["final-clean"]["pass_rate"], 1.0, r["final-clean"])
+        self.assertEqual(r["plan-misses-route-wiring"]["pass_rate"], 0.0, "fake always proceeds")
+        self.assertEqual(r["plan-sound"]["cost_usd"], 0.04, "nothing blocking at medium -> asked again at high")
 
     def test_min_pass_gates(self):
         p, _ = self.run_evals("--role", "classifier", "--case", "never-ran", "--min-pass", "0.9")

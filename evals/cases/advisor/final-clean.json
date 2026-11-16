@@ -1,0 +1,11 @@
+{
+ "id": "final-clean",
+ "core": false,
+ "pair": "final-route-not-registered",
+ "stage": "final",
+ "from": "reviewer/clean-diff-passes",
+ "about": "false-positive check: finished work that meets the bar should be handed over",
+ "expect": {
+  "verdict": "proceed"
+ }
+}

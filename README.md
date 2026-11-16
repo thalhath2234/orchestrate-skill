@@ -1,12 +1,14 @@
 # orchestrate
 
-A multi-agent coding orchestrator for Claude Code, for single repos and monorepos. It starts by **grilling you about what you actually want** (Matt Pocock's grill-with-docs), and writes the glossary and ADRs as decisions settle. Then the parent agent triages the request. Small tasks run as one routed task. Big ones become a **job**:
+A multi-agent coding orchestrator for Claude Code, for single repos and monorepos. It starts by **asking you what done looks like**, then **grills you about what you actually want** (Matt Pocock's grill-with-docs), and writes the glossary and ADRs as decisions settle. Your definition of done, in your words, goes into every prompt of the run. Then the parent agent triages the request. Small tasks run as one routed task. Big ones become a **job**:
 
 1. Plan the job.
-2. Split it into subtasks, each with its own files.
-3. Run Claude subagents in parallel, with the count capped by what the machine can handle.
-4. Merge their work.
-5. Have a fresh Fable reviewer check it, and fix what it finds.
+2. Ask the **advisor** (Fable 5.2) whether the plan reaches done, before anything runs.
+3. Split it into subtasks, each with its own files.
+4. Run Claude subagents in parallel, with the count capped by what the machine can handle.
+5. Merge their work.
+6. Have a fresh reviewer check every edge case, and fix what it finds.
+7. Clean up the diff, and ask the advisor for a final check before the branch is handed over.
 
 A **manager agent** (one persistent Opus session per job) supervises the subagents throughout. Open issues that a rule can settle (an FYI, or a file that a not-yet-started task owns) are handled without it. When a task fails, a subagent reports something else outside its scope, or the reviewer requests changes, the manager reads the logs and code and decides what to do. It thinks in the background while other tasks keep running, and events that arrive meanwhile reach it as one batch:
 - retry with better instructions or corrected ownership
@@ -20,15 +22,16 @@ The script validates and applies its actions. Every model judgment (manager, rev
 Every subagent starts on the cheapest model likely to work and escalates on failure. Routing learns per task type, but only through proposals that you approve.
 
 ```
-request ─► grill (rounds of questions → glossary/ADRs → you confirm) ─► triage
+request ─► grill (Q1: what does done look like? → rounds → glossary/ADRs → you confirm) ─► triage
                    ┌──────────┘
-                   ├─ T0/T1 ─► run_task (route → attempt ×2 → classify → escalate) ─► done
-                   └─ T2/T3 ─► plan.json ─► validate (DAG + file ownership) ─► run
+                   ├─ T0/T1 ─► advise ─► run_task (route → attempt ×2 → classify → escalate) ─► advise --final ─► done
+                   └─ T2/T3 ─► plan.json ─► validate (DAG + file ownership) ─► run ─► advisor: plan ok?
                                  ┌──────────── waves, ≤ cap in parallel ────────────┐
                                  │ worktree + setup ─► brief ─► run_task ─► scope ✓ │ per task
                                  └──────────────────────┬───────────────────────────┘
                                    commit ─► merge into orchestrate/<job> (integrator on conflict)
-                                 ─► final verify ─► Fable review (Opus per area + Fable integration when big) ─► report
+                                 ─► final verify ─► review, every edge case (per area + integration when big)
+                                 ─► cleanup ─► advisor: final check ─► report
         rules ◄── open issues: fyi → report · needs a pending task's file → amend it
         manager (Opus, background, batched) ◄── task failed · other open issues · review findings · your answers
                                    ──► retry · split · add_task · amend · skip · accept · ask you
@@ -71,11 +74,14 @@ To run the scripts by hand (`S=skills/orchestrate/scripts`):
 ```bash
 python3 $S/orchestrate.py scan --repo .                 # packages/areas, verify cmds, hotspots, setup
 python3 $S/orchestrate.py capacity                      # how many subagents this machine can take
-python3 $S/orchestrate.py plan --repo . --goal "..."    # optional: Opus drafts plan.json
+python3 $S/orchestrate.py plan --repo . --goal "..." --done "..."   # optional: Fable drafts plan.json
+python3 $S/orchestrate.py advise plan.json              # advisor's second opinion (exit 9 = revise)
 python3 $S/orchestrate.py validate plan.json            # waves, ownership conflicts, cap
 python3 $S/orchestrate.py brief plan.json <task-id>     # exact handoff a subagent will get
-python3 $S/orchestrate.py run plan.json --detach        # then:
-python3 $S/orchestrate.py wait <job> --timeout 540      # 0 done · 5 approval · 8 manager asks you · 4 failed · 3 env · 6 review
+python3 $S/orchestrate.py run plan.json                 # inside Orca: starts Orca workers, exit 10
+python3 $S/orchestrate.py worker-done <job> --payload '<json>'   # when Orca wakes you with a worker_done
+python3 $S/orchestrate.py run plan.json --detach        # outside Orca: headless, then:
+python3 $S/orchestrate.py wait <job> --timeout 540      # 0 done · 5 approval · 8 manager asks you · 9 advisor says revise · 10 workers running (Orca) · 4 failed · 3 env · 6 review
 python3 $S/orchestrate.py resume <job> --answer "..."   # answer the manager's question
 python3 $S/orchestrate.py resume <job> --approve <task> # after gates or fixes; done tasks are kept
 python3 $S/orchestrate.py metrics <job>                 # cost by role, cache reads, turns, first-pass rate, manager load
@@ -85,6 +91,12 @@ python3 $S/orchestrate.py guard-hook                    # the approval hook, for
 python3 $S/run_task.py --repo . --type bugfix:api --tier T1 --verify "make test" "Fix …"   # single task
 python3 $S/router.py proposals | approve <id> | reject <id> | status                       # routing (you)
 ```
+
+## Workers: Orca or headless
+
+**Inside Orca** (the default when the agent runs in an Orca session), the agent that runs `/orchestrate` becomes the Orca coordinator, and each task runs as an **Orca worker**: its own child worktree branched from `orchestrate/<job>`, its own chat you can watch and talk to, started on the model routing picked. The script keeps the brain and never waits. `run` prepares the job and starts the ready workers, then the agent ends its turn. When a worker sends `worker_done`, Orca wakes the agent, which runs `orchestrate.py worker-done`. The script checks that worker's worktree (scope, verify, every done criterion). If the work passes, it commits, merges and releases the worker. If not, it sends the failure back to the same worker, or starts a stronger model in the same worktree. Then it starts whatever became ready, and after the last merge it runs the review. A failed task's worker stays open so you can see what happened. In this mode `budget_usd` only covers the script's own model calls (manager, reviewer, advisor, classifier), because Orca workers' cost isn't visible to it, and the plan's `advisor` option (the advisor tool inside workers) isn't passed to Orca workers.
+
+**Headless** (outside Orca, or `--workers headless`), one detached process runs every task as `claude -p` itself, as in earlier versions.
 
 ## Watch a job
 
@@ -151,30 +163,34 @@ Validation rejects plans where tasks that can run at the same time own overlappi
 
 Defaults follow Anthropic's model guidance ([choosing a model](https://platform.claude.com/docs/en/about-claude/models/choosing-a-model), [cost and intelligence](https://platform.claude.com/docs/en/about-claude/models/optimizing-for-cost-and-intelligence), the use-case guides) and this repo's evals:
 
-| Role | Model / effort | Why |
+| Role | Model / effort | What it does |
 |---|---|---|
-| Planner | Opus 5.5 / high | One call decides the whole job and sets its definition of done; Opus 5.5 is Anthropic's pick for complex agentic coding, at high because everything after builds on the plan |
-| Final reviewer | Fable 5.2 / high | Gates the merge. On Anthropic's defect-search benchmark Fable 5.2 beat Opus 5.5 at high by 1.6–5.9 points |
-| Area reviewers (big diffs) | Opus 5.5 / high | Accuracy-critical reading; Opus lost 34 points at low effort on defect search |
-| Manager | Opus 5.5 / medium | "For most agent workloads, start with Opus 5.5 at its default effort"; scored 13/13 on our evals, same as high |
-| Integrator (conflicts) | Sonnet 5.5 / high | Everyday coding at Sonnet's default |
-| Failure classifier | Haiku 5.5 / low | The ticket-routing guide's pick for classification; tied Sonnet on our evals |
-| Lessons extractor | Haiku 5.5 / medium | Extraction |
+| Advisor | Fable 5.2 / medium, then high if medium finds nothing | Second opinion before the plan executes and before hand-over. A clean pass at medium is only believed after a second look at high |
+| Planner | Fable 5.2 / medium | One call decides the whole job and writes the checkable proof of your definition of done |
+| Manager | Opus 5.5 / medium | Supervises the subagents: retries, splits, follow-up tasks, questions to you |
+| Worker | Opus 5.5 / medium | Every subtask, whatever its tier; failures re-run at high, then xhigh, then Fable 5.2 |
+| Reviewer | Opus 5.5 / medium | Fresh-context review that lists every edge case of the diff and how each is handled (area reviewers too) |
+| Cleanup | Opus 5.5 / medium | Removes debug output, dead code and stray TODOs from the job's own files; reverted if verify fails |
+| Integrator (conflicts) | Sonnet 5.5 / high | Merge conflicts between subagent branches |
+| Failure classifier | Haiku 5.5 / low | Sorts a failed attempt into environment / context / effort / capability |
+| Lessons extractor | Haiku 5.5 / medium | Proposes AGENTS.md notes after a job |
 
-Fable calls fall back to Opus when your account has no Fable access. `"max_model": "opus"` in the plan keeps everything at or below Opus; `"models": {"<role>": "model/effort"}` overrides one role.
+`"advisor": "fable"` in the plan (off by default) also gives each worker Claude Code's [advisor tool](https://code.claude.com/docs/en/advisor), with instructions on when to consult it; it pays off on long tasks that are hard in spots, and each call re-reads the whole session. Fable calls fall back to Opus when your account has no Fable access. `"max_model": "opus"` in the plan keeps everything at or below Opus (the advisor becomes Opus at high); `"models": {"<role>": "model/effort"}` overrides one role.
 
 ## The bar: what done looks like
 
 Every step works against an explicit definition of done, and the definition only gets stricter:
 
-- **The planner writes it.** `acceptance` (required) for the job and `done` for each task, as checkable criteria: at least 1/2/3/3 per T0/T1/T2/T3 task, with vague words flagged. Every task is also held to a fixed bar: tests that fail without the change, including an error path; verify run by the agent; no TODOs or dead code; errors handled at the boundaries it touched; repo conventions; everything wired up. `quality_bar` adds repo-wide standards.
+- **You say it first.** The grill's first question is what done looks like. Your answer is kept verbatim as `definition_of_done` (required) and opens every brief, the manager's, reviewer's and advisor's prompts, and the report.
+- **The advisor checks it twice.** Before the plan runs it asks whether the plan reaches your definition of done (exit 9 stops the job until the plan is fixed or you override with `--approve advisor:plan`); before hand-over it checks the finished work against it. Its missing criteria raise the bar; its blocker and major findings go through a fix round.
+- **The planner writes it out.** `acceptance` (required) for the job and `done` for each task, as checkable criteria: at least 1/2/3/3 per T0/T1/T2/T3 task, with vague words flagged. Every task is also held to a fixed bar: tests that fail without the change, including an error path; verify run by the agent; no TODOs or dead code; errors handled at the boundaries it touched; repo conventions; everything wired up. `quality_bar` adds repo-wide standards.
 - **Subagents prove it.** The brief numbers every criterion (`[D1]…`, `[U1]…`). The report's `done_check` must show each one met with evidence (file:line, a test, command output); a gap sends the task back like a failing test.
 - **Other models raise it.** A subagent that finds something missing proposes a criterion for a later task or the job. The manager can `raise_bar`. Reviewers add criteria they find missing, and every blocker or major finding becomes a criterion the next review must show fixed. Additions are checked for duplicates and capped (3 per source, 40 per job).
 - **Nothing lowers it.** Any manager action that drops or rewords a criterion is rejected, and a retry with new `done` items adds them to the old ones. Only you lower the bar, by editing the plan. `report.md` lists every criterion added during the job, who added it and why, and the lessons step can turn recurring ones into AGENTS.md rules.
 
 ## How routing learns
 
-The ladder is `haiku/low → haiku/medium → sonnet/medium → sonnet/high → opus/low → opus/medium → opus/high → opus/xhigh → fable/high`. Tasks start low (T0 haiku/medium, T1 sonnet/medium, T2 opus/low, T3 opus/medium) and re-run failures higher: Anthropic measured Opus 5.5 at low with failures re-run at high solving about 97% of SWE-bench Pro tasks for $0.17 each, against 95.3% for $0.29 with everything at high. Each config gets 2 attempts. A failure is classified as one of:
+The ladder is `haiku/low → haiku/medium → sonnet/medium → sonnet/high → opus/low → opus/medium → opus/high → opus/xhigh → fable/high`. Every task starts at the worker role, Opus 5.5 at medium (`"models": {"worker": ...}` or `ORCHESTRATE_MODEL_WORKER` moves it), and re-runs failures higher. Each config gets 2 attempts. A failure is classified as one of:
 
 | Cause | This task | Future tasks |
 |---|---|---|

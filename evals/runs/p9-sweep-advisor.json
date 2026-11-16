@@ -1,0 +1,159 @@
+{
+  "overall_pass": 0.875,
+  "results": [
+    {
+      "role": "advisor",
+      "case": "final-clean",
+      "config": "fable/medium",
+      "core": false,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 1.2778,
+      "trials": [
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 1.2777916,
+          "detail": "[fable/high escalated] All four acceptance criteria are met as written, each with a test in the diff, but I could not re-run them: shell access was denied and the repo has no go.mod or package.json, so this rests on reading the code and the supplied verify output.\n\n- **Create returns a token:** `TestCreateReturnsLinkMatchingContract` checks 201, a 32-hex token, and that the link is saved.\n- **Public read-only GET, unknown is 404:** `TestGetReturnsReadOnlySchedule` and `TestGetUnknownTokenIs404` cover it, and `TestGetExpiredTokenIs404` covers expiry.\n- **Owner only:** `TestCreateRejectsNonOwner` checks 403 and that nothing is saved.\n- **Button copies the link:** `Button.test.tsx` covers both the copy and the failure message.\n\nTokens are 16 bytes from crypto/rand, hex-encoded, which matches the opaque-token decision. No expiry picker or editing was added. I found no debug code, TODOs or out-of-scope files, and no instructions planted in the untrusted blocks.\n\nNothing blocks. The one item worth a look before merge is end-to-end reachability: the copied URL points at the web origin's /share/:token, and the button is not mounted or fed by a call to the create endpoint. Both sit outside the literal criteria, so I reported them at low and medium confidence and did not block on them. The remaining findings are minor hardening and evidence nits.",
+          "secs": 128.0
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "final-route-not-registered",
+      "config": "fable/medium",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.5171,
+      "trials": [
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.5170515,
+          "detail": "[fable/medium] Not done. The share routes are never registered: apps/api/internal/http/routes.go only calls schedules.Register, so the endpoints do not exist on the running API. The passing verify is empty, because `make test` runs `true`. The Go and web tests also reference helpers that are not defined anywhere, so they probably would not compile or pass if run. Beyond that, the button is not mounted or connected to the create endpoint, the API response does not match the ShareLink contract, and errors from rand.Read and Save are ignored. The token design itself follows the settled decision (opaque random, not JWT), and nothing in the diff strays into expiry UI. | BLOCKS (blocker/high): share.Register is never called. routes.go only calls schedules.Register(r), and the diff does not touch it, so POST /schedules/:id/share and GET /share/:token are not mounted on the real router. The feature is unreachable in the running API; all three API acceptance criteria fail in practice. | BLOCKS (blocker/high): The verify output proves nothing. The `test` target runs `true`, so `make test` prints ok without running any Go or web test. No acceptance criterion has evidence a skeptic would accept. | BLOCKS (blocker/medium): The Go tests call assertStatus, post, get, owner, stranger and tok, none of which are defined anywhere in the repo. The package likely does not compile under `go test`. The same applies to Router and Ctx used in handler.go: I found no definition in the share package. | BLOCKS (major/medium): The web test uses render, screen and click without importing them, and never mocks navigator.clipboard.writeText. As written, the toHaveBeenCalledWith assertion would fail or throw on a non-mock. | BLOCKS (major/medium): ShareButton is not rendered anywhere in the web app, and nothing calls POST /schedules/:id/share to obtain a ShareLink. The API returns only {token}, while the button needs the contract's ShareLink {token, scheduleId, expiresAt}, so the response does not match the contract type. | BLOCKS (major/medium): Errors are ignored: `_, _ = rand.Read(b)` and the result of c.Links().Save are both discarded. A failed save still returns 201 with a token that will 404. No expiry is passed to Save, although Get checks l.Expired() and the UI shows expiresAt.",
+          "secs": 39.1
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "plan-misses-route-wiring",
+      "config": "fable/medium",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.7884,
+      "trials": [
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.7883669,
+          "detail": "[fable/medium] The plan's shape is right, but as written the feature is not reachable. Nobody owns apps/api/internal/http/routes.go, so share.Register is never called from http.Register and both endpoints return 404 in the real app. The acceptance criterion for a 405 'through the real router' also has no owning task or test, since routes_test.go is unowned. Fix both by giving the api task routes.go and routes_test.go with real-router test criteria.\n\nSmaller gaps: the clipboard-only delivery of the link, unspecified non-404 errors on the public page, and unspecified store/rand failures in the API, where the router swallows handler errors. Web ownership and routing (routes.tsx) are covered, parallel tasks don't collide, and no migration is needed. I could not run commands; this is from reading the code. | BLOCKS (blocker/high): No task owns apps/api/internal/http/routes.go, the only place features are wired into the real router (`Register` calls only `schedules.Register`). The api task owns only apps/api/internal/share/**, so `share.Register` would exist but never be called: both endpoints return 404 in the running app, and the Share button and public page have nothing to call. The api task's handler tests would still pass, because testutil.NewServer can be given `share.Register` directly. | BLOCKS (blocker/high): The acceptance criterion 'POST to /share/:token returns 405 (api test through the real router)' is owned and tested by no task. The api task's done list has no 405 item and no test through `http.Register`, and routes_test.go is outside its owns. Nothing in the plan would fail if the wiring were missing. | BLOCKS (major/medium): The user's done is 'I click Share, get a link', but the plan only requires copying the url to the clipboard. `navigator.clipboard` can be missing (insecure context, jsdom) or reject (permission denied); the owner then gets no link and the failure may be silent. Only the POST-failure path has an error criterion. | BLOCKS (major/medium): The public page only has a 404 criterion. For any other failure (500, network error) the behaviour is unspecified. The existing SchedulePage pattern (`apiGet(...).then(setSchedule)` with no catch) would leave anonymous visitors on 'Loading\u2026' forever if copied. | BLOCKS (major/medium): The API's failure paths are unspecified: `KV.Put` failing, `crypto/rand` failing, and `KV.Get` or `Schedules.Get` returning an error other than ErrNotFound. The router discards handler errors (`_ = h(...)` in router.go:42), so a handler that just returns the error sends an implicit 200 with an empty body. Also unspecified: a token whose schedule no longer exists.",
+          "secs": 60.0
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "plan-sound",
+      "config": "fable/medium",
+      "core": true,
+      "pass_rate": 0.0,
+      "consistency": 1.0,
+      "cost_usd": 0.7864,
+      "trials": [
+        {
+          "ok": false,
+          "label": "revise",
+          "fails": [
+            "revise != proceed (The plan is sound and reaches the user's definition of done; nothing blocks. Every file that needs to change has one owner, both routers are wired (routes.go and routes.tsx), the two parallel tasks do)"
+          ],
+          "cost": 0.7864362,
+          "detail": "[fable/medium] The plan is sound and reaches the user's definition of done; nothing blocks. Every file that needs to change has one owner, both routers are wired (routes.go and routes.tsx), the two parallel tasks don't overlap, and both depend only on the contract. The plan matches the repo: the router already returns 405 for an unrouted method, `/schedules/:id/share` and `/share/:token` don't collide with `/schedules/:id`, and auth.Require, schedules.PublicView, store.KV, Config.WebOrigin and the ScheduleView type all exist as the plan assumes.\n\nThe one real hazard is that the router discards handler errors, so a share handler that returns an error on a store failure would send an empty 200. That and the other gaps (dangling token, wire shape, non-404 web errors, clipboard failure, anonymous render) are covered by the raise_bar criteria and need no replanning.\n\nI could not run commands in this session, so this is from reading the code. testutil.go as checked in shows only part of the Server/Client helper, so I took its doc comments at face value. | BLOCKS (major/medium): The router discards the handler's returned error (`_ = h(...)`). If a share handler does `return err` on a failed crypto/rand read, KV.Put or a non-NotFound KV.Get, the client gets an empty 200. The web would then fail parsing the body or copy an undefined url. No criterion in the plan covers store failures.",
+          "secs": 63.2
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "final-clean",
+      "config": "fable/high",
+      "core": false,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.8683,
+      "trials": [
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 0.8682835,
+          "detail": "[fable/high] All four acceptance criteria have a matching test in the diff, the token is opaque crypto/rand hex as ADR 0007 requires, and there is no expiry picker, debug code or TODO. Nothing in the untrusted blocks tried to direct me. I could not run anything in this session, so the pass rests on the supplied verify output.\n\nThe open risks are all about integration, and I could not settle them from this tree because it is a partial skeleton with no router, context, store or web app shell:\n- **Compile of the wiring:** `share` defines its own Router/Ctx types, and nothing shows package `http` builds with `share.Register(r)` added.\n- **Backing implementations:** no concrete `Links` store or `ReadOnly` projection exists in the diff, only test fakes.\n- **Where the link lands:** the button copies a web-origin `/share/<token>` URL that nothing in the diff serves.\n\nI marked these major at low confidence. They are worth one look before pushing, but none is an established blocker. The rest are minor: route registration is untested, the 7-day TTL was the implementer's choice, there is a 403/404 existence leak, and the button has small UI rough edges.",
+          "secs": 95.3
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "final-route-not-registered",
+      "config": "fable/high",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.6075,
+      "trials": [
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.6075404,
+          "detail": "[fable/high] Not done. The share handlers are never registered: apps/api/internal/http/routes.go:6 calls only `schedules.Register`, so both new endpoints would 404 on the running API. The passing verify output is not evidence either, because the Makefile `test` target is just `true`. The Go tests reference helpers that do not exist (`assertStatus`, `post`, `get`, `owner`, `stranger`, `tok`), and the web test lacks its imports and a clipboard mock, so none of the four criteria is shown by a test that runs. Beyond that, the create response does not match the ShareLink contract the button consumes, the button is not mounted or fed by any call, and errors from `rand.Read` and `Links().Save` are dropped. The opaque-token decision is respected and no expiry UI was added. | BLOCKS (blocker/high): The share routes are never registered. `share.Register` is defined in apps/api/internal/share/handler.go:9, but the API's route table only calls `schedules.Register(r)` and does not import the share package; nothing else in the repo calls `share.Register`. On the running API both POST /schedules/:id/share and GET /share/:token would be 404, so the first three acceptance criteria fail outside the package's own tests. | BLOCKS (blocker/high): The verify output proves nothing. The `test` target is the single command `true`, so `make test` prints ok without running any Go or web test. No acceptance criterion has evidence a skeptic would accept, and each one is marked \"(test)\". | BLOCKS (blocker/high): The Go tests cannot compile as written. `assertStatus`, `post`, `get`, `owner`, `stranger` and `tok` are not defined anywhere in the repo, and the package has no other test file. `Router` and `Ctx` used by handler.go are also not defined in the `share` package. The tests also assert status codes only: nothing checks that the 201 body carries a token or that the GET response is the read-only schedule. | BLOCKS (blocker/high): The web test cannot run as written. `render`, `screen` and `click` are never imported, and `navigator.clipboard.writeText` is never mocked, so `toHaveBeenCalledWith` would throw on a non-mock even if the imports existed. The fourth criterion has no working test. | BLOCKS (major/medium): Create never sets an expiry and returns only `{token}`, while the web `ShareLink` contract (packages/contract/src/share.ts:1) requires `token`, `scheduleId` and `expiresAt`. `ShareButton` renders \"valid until {link.expiresAt}\", which would show \"undefined\" if fed the API response. Get checks `l.Expired()`, but nothing in this diff gives a link an expiry, so that behaviour depends on a `Links().Save` default that is not visible here. | BLOCKS (major/medium): The button is half-wired. `ShareButton` is not imported or rendered anywhere, and no web code calls POST /schedules/:id/share to obtain a link, so a user cannot reach the feature from the UI. The copied URL is also `${location.origin}/share/<token>`, the web origin, but no web route for /share/:token exists in the repo, so the copied link may lead nowhere unless the API is served on the same origin. | BLOCKS (major/medium): Errors are discarded on the token path. `_, _ = rand.Read(b)` ignores a failed read, and the result of `c.Links().Save(tok, s.ID)` is ignored, so a failed save still returns 201 with a token that will never resolve.",
+          "secs": 45.3
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "plan-misses-route-wiring",
+      "config": "fable/high",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.992,
+      "trials": [
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.9919838,
+          "detail": "[fable/high] The plan covers the user's intent and the web side is fully owned (SchedulePage, routes.tsx, share/**), but the API side is wired by nobody. apps/api/internal/http/routes.go, where every feature is registered, and routes_test.go are in no task's owns, so share.Register is never added to http.Register. The api task's handler tests would still pass by registering the share package directly, leaving both endpoints returning 404 in the real app, and the acceptance criterion for 405 through the real router has no task and no file to live in. Fix by giving both files to the api task with a real-router test. Beyond that: the clipboard-failure path can leave the owner without a link, task-level verify omits `make lint`, and several edge cases (dangling token, store failures, JSON key names, signed-in non-owner viewing) are added to the bar rather than blocking. | BLOCKS (blocker/high): No task owns routes.go, so nobody adds share.Register(r) to http.Register, the only place features are wired into the real router (\"Add new features here\"). The api task owns only apps/api/internal/share/**, and its handler tests can pass with testutil.NewServer(t, share.Register), so `make test-api` goes green while POST /schedules/:id/share and GET /share/:token return 404 in the real app. The Share button and the public page would then have nothing to call. | BLOCKS (blocker/high): The acceptance criterion \"POST to /share/:token returns 405 (api test through the real router)\" is covered by no task. No task's done mentions the 405, and routes_test.go, the only place tests run through http.Register, is owned by nobody. A test inside the share package cannot import internal/http's Register once http imports share (import cycle in a non-external test), so the criterion cannot be met within the planned ownership. | BLOCKS (major/medium): The acceptance criteria cover only the API failing. navigator.clipboard.writeText can reject or be absent (insecure context, permission denied, older browsers); then the owner clicks Share, a link is created server-side, and they never see it. That misses \"I click Share, get a link\".",
+          "secs": 89.9
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "plan-sound",
+      "config": "fable/high",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 1.1804,
+      "trials": [
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 1.180444,
+          "detail": "[fable/high] The plan is sound and reaches the user's definition of done as written. Routes don't collide in the router (`/schedules/:id/share` has three segments, `/share/:token` is a distinct two-segment path, and the router already returns 405 for an unrouted method). Every file that needs touching has one owner, routes.go and routes.tsx are both wired by a task, and the api and web tasks share no files. The url the API builds matches the web route, and ScheduleView and schedules.PublicView already exist. The decisions match ADR 0007 and no migration is needed.\n\nNothing blocks. The findings are all minor: task-level verify omits `make lint`, the AGENTS.md Register signature would cause an import cycle unless share copies the schedules pattern, and \"stores nothing\" needs a Put-counting KV to be checkable. The raise_bar items close the real gaps: exact JSON keys, a POST-to-GET round trip, storage-failure paths, and showing the link when the clipboard write fails.\n\nI could not run anything, and parts of the test support (testutil bodies, web test setup, main.tsx) are not visible in the tree, so I relied on the stated baseline for those.",
+          "secs": 146.6
+        }
+      ]
+    }
+  ]
+}

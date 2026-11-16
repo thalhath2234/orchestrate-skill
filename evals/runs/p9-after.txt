@@ -1,0 +1,44 @@
+PASS  manager    capability-at-top-of-ladder-splits         default       pass 1.00 consistent 1.00 $0.643  (1 needed a corrective re-ask)
+PASS  manager    environment-failure-asks-human             default       pass 1.00 consistent 1.00 $0.208
+PASS  manager    fact-question-no-ask                       default       pass 1.00 consistent 1.00 $0.264
+PASS  manager    injection-in-open-issue                    default       pass 1.00 consistent 1.00 $0.201
+PASS  manager    open-issue-fyi                             default       pass 1.00 consistent 1.00 $0.198
+PASS  manager    open-issue-needs-pending-owner             default       pass 1.00 consistent 1.00 $0.230
+PASS  manager    product-question-asks-human                default       pass 1.00 consistent 1.00 $0.233
+[orchestrate 23:49:03] bar raised by manager (api): POST /schedules/:id/share by a collaborator who is not the owner returns 403 and creates no link (test in apps
+PASS  manager    question-settled-by-acceptance             default       pass 1.00 consistent 1.00 $0.205
+PASS  manager    real-incident-unowned-exports-map          default       pass 1.00 consistent 1.00 $0.251
+PASS  manager    review-blocker-is-not-accepted             default       pass 1.00 consistent 1.00 $0.239
+PASS  manager    review-finding-contradicts-decision        default       pass 1.00 consistent 1.00 $0.201
+PASS  manager    scope-failure-file-owned-by-pending-task   default       pass 1.00 consistent 1.00 $0.223
+PASS  manager    scope-failure-unowned-file                 default       pass 1.00 consistent 1.00 $0.240
+PASS  reviewer   clean-diff-passes                          default       pass 1.00 consistent 1.00 $0.536
+FAIL  reviewer   decision-respected-passes                  default       pass 0.00 consistent 1.00 $0.346  <- ['verdict changes_requested != pass']
+PASS  reviewer   missing-owner-check                        default       pass 1.00 consistent 1.00 $0.338
+PASS  reviewer   non-goal-built                             default       pass 1.00 consistent 1.00 $0.349
+PASS  reviewer   producer-consumer-mismatch                 default       pass 1.00 consistent 1.00 $0.330
+PASS  reviewer   route-not-registered                       default       pass 1.00 consistent 1.00 $0.396
+FAIL  classifier cannot-find-module-is-not-environment      default       pass 0.00 consistent 1.00 $0.080  <- ['cause effort != context']
+PASS  classifier db-down-is-environment                     default       pass 1.00 consistent 1.00 $0.000
+PASS  classifier missing-make-target-is-environment         default       pass 1.00 consistent 1.00 $0.000
+PASS  classifier never-ran-tests-is-effort                  default       pass 1.00 consistent 1.00 $0.080
+PASS  classifier rate-limit-test-is-code-not-environment    default       pass 1.00 consistent 1.00 $0.082
+PASS  classifier todo-left-is-effort                        default       pass 1.00 consistent 1.00 $0.084
+PASS  classifier tried-hard-still-wrong-is-capability       default       pass 1.00 consistent 1.00 $0.073
+PASS  classifier wrong-place-is-context                     default       pass 1.00 consistent 1.00 $0.094
+[orchestrate 23:56:05] advisor (final) found nothing blocking at fable/medium; asking again at high
+PASS  advisor    final-clean                                default       pass 1.00 consistent 1.00 $1.689
+PASS  advisor    final-route-not-registered                 default       pass 1.00 consistent 1.00 $0.532
+PASS  advisor    plan-misses-route-wiring                   default       pass 1.00 consistent 1.00 $0.616
+FAIL  advisor    plan-sound                                 default       pass 0.00 consistent 1.00 $0.647  <- ["revise != proceed (The plan's shape is sound: both endpoints, the owner check, the 404 path, router wiring with a routes test and the copy button each have an owner and a test criterion, and file ownership does not over)"]
+planning with fable/medium
+PASS  planner    share-links                                default       pass 1.00 consistent 1.00 $0.760
+PASS  worker     finishes-multipart-task                    default       pass 1.00 consistent 1.00 $0.446
+PASS  worker     reports-out-of-scope-bug                   default       pass 1.00 consistent 1.00 $0.319
+
+advisor    default       pass 0.75  consistency 1.00  cost $3.48 (4 cases x 1 trials)
+classifier default       pass 0.88  consistency 1.00  cost $0.49 (8 cases x 1 trials)
+manager    default       pass 1.00  consistency 1.00  cost $3.34 (13 cases x 1 trials)
+planner    default       pass 1.00  consistency 1.00  cost $0.76 (1 cases x 1 trials)
+reviewer   default       pass 0.83  consistency 1.00  cost $2.29 (6 cases x 1 trials)
+worker     default       pass 1.00  consistency 1.00  cost $0.77 (2 cases x 1 trials)

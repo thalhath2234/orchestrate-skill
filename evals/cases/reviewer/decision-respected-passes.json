@@ -2,7 +2,7 @@
  "id": "decision-respected-passes",
  "core": false,
  "pair": "missing-owner-check",
- "about": "opaque tokens follow the settled decision; flagging them would re-litigate it (work that meets the raised bar: tests incl. error paths, errors handled, response matches the contract)",
+ "about": "a settled decision (opaque tokens, not JWTs) must not be re-argued. Graded on the findings, not the verdict: the fixture is deliberately partial (no web route, no store), and a reviewer that checks wiring end to end rightly flags that. clean-diff-passes is the verdict check.",
  "base_files": {
   "Makefile": "lint:\n\tgolangci-lint run ./apps/api/... && pnpm --filter web lint\ntest:\n\tcd apps/api && go test ./...\n\tpnpm --filter web test\n",
   "packages/contract/src/share.ts": "export type ShareLink = { token: string; scheduleId: string; expiresAt: string }\n",
@@ -20,6 +20,7 @@
  },
  "plan": {
   "goal": "Users can share a schedule via a public read-only link",
+  "definition_of_done": "Users can share a schedule via a public read-only link: done when every acceptance criterion holds, each shown by a test or file:line",
   "acceptance": [
    "POST /schedules/:id/share returns a token (test)",
    "GET /share/:token returns the schedule read-only; unknown tokens are 404 (test)",
@@ -86,7 +87,10 @@
   }
  },
  "expect": {
-  "verdict": "pass"
+  "no_finding_mentions": [
+   "jwt",
+   "opaque"
+  ]
  },
- "verify_output": "$ make lint\nok\n$ make test\ncd apps/api && go test ./...\nok  \texample.com/api/internal/share\t0.012s\npnpm --filter web test\n \u2713 src/share/Button.test.tsx (2 tests)\n Test Files  1 passed (1)\n      Tests  2 passed (2)\n"
+ "verify_output": "$ make lint\nok\n$ make test\ncd apps/api && go test ./...\nok  \texample.com/api/internal/share\t0.012s\npnpm --filter web test\n ✓ src/share/Button.test.tsx (2 tests)\n Test Files  1 passed (1)\n      Tests  2 passed (2)\n"
 }

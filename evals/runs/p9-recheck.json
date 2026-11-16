@@ -1,0 +1,79 @@
+{
+  "overall_pass": 0.6666666666666666,
+  "results": [
+    {
+      "role": "reviewer",
+      "case": "decision-respected-passes",
+      "config": "default",
+      "core": false,
+      "pass_rate": 1.0,
+      "consistency": 0.6666666666666666,
+      "cost_usd": 1.0778,
+      "trials": [
+        {
+          "ok": true,
+          "label": "pass",
+          "fails": [],
+          "cost": 0.3666823,
+          "detail": "All four acceptance criteria are met and tested. The API mints opaque 128-bit crypto/rand tokens as ADR 0007 requires. Create is owner-only (403 for others, 404 for an unknown schedule), and Get returns the read-only view or 404 for unknown or expired tokens, with the expiry boundary tested. The routes are registered, and the API's JSON matches the contract's ShareLink type, which the web button imports. The button handles clipboard failure, including a missing clipboard API, by showing the URL to copy by hand. Remaining issues are minor: every lookup error is mapped to 404, a schedule deleted after its link was made isn't detected, the web route for the link isn't shown in this repo, and the expiry date is displayed unformatted.",
+          "secs": 46.8
+        },
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.3481077,
+          "detail": "All four acceptance criteria are met and tested. Tokens are opaque, 128-bit and from crypto/rand, as ADR 0007 decided. Routes are registered, the Link JSON matches the ShareLink type in packages/contract, and the button handles a failed clipboard copy. Main gap: GET for a link whose schedule was deleted cannot return 404 (major, medium confidence; also added to raise_bar). The button is not mounted in any page, reported at low confidence because the repo has no pages to mount it in. Minor issues: store errors are reported as 404, the 500 paths have no tests, there is no explicit anonymous check, and the expiry is shown as a raw timestamp.",
+          "secs": 46.4
+        },
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.36296609999999996,
+          "detail": "The API side meets its criteria. Tokens are opaque, 128-bit from crypto/rand, not JWTs (respects ADR 0007). Create checks ownership, the 404 and expiry cases are tested, and the routes are registered. The web button copies the link and reports copy failures, with tests. Two problems remain. Across tasks, nothing in the web app serves /share/:token, calls POST to create a link, or mounts the button, so the copied link doesn't lead to a read-only view. In the API, a link to a deleted schedule doesn't return 404, and storage errors on create are reported as 404.",
+          "secs": 54.6
+        }
+      ]
+    },
+    {
+      "role": "classifier",
+      "case": "cannot-find-module-is-not-environment",
+      "config": "default",
+      "core": false,
+      "pass_rate": 0.3333333333333333,
+      "consistency": 0.6666666666666666,
+      "cost_usd": 0.2418,
+      "trials": [
+        {
+          "ok": false,
+          "label": "effort",
+          "fails": [
+            "cause effort != context"
+          ],
+          "cost": 0.0800997,
+          "detail": "The agent assumed zod would be hoisted to apps/web without checking apps/web/package.json; the verify output shows web has no zod dependency and that @app/contract re-exports zod as `z`. The task said \"existing zod dependency in packages/contract\", which pointed to the contract package, and the agent never looked at how workspace deps or exports are set up.",
+          "secs": 6.3
+        },
+        {
+          "ok": true,
+          "label": "context",
+          "fails": [],
+          "cost": 0.0850467,
+          "detail": "Verify shows apps/web has no zod dependency; zod lives in @app/contract, which re-exports it as `z`. The agent assumed hoisting and never checked apps/web/package.json or contract's exports, but the task wording (\"existing zod dependency in packages/contract\") misleadingly implied direct import and the re-export convention isn't documented in AGENTS.md.",
+          "secs": 6.5
+        },
+        {
+          "ok": false,
+          "label": "effort",
+          "fails": [
+            "cause effort != context"
+          ],
+          "cost": 0.07661970000000001,
+          "detail": "The agent says it only \"assumed\" zod is hoisted to web and never checked apps/web/package.json or ran the tests. Verify shows apps/web has no zod dependency and that @app/contract re-exports it as `z`. Both facts were discoverable by reading the repo, and the task itself pointed at packages/contract.",
+          "secs": 14.5
+        }
+      ]
+    }
+  ]
+}

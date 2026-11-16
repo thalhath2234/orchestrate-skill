@@ -279,8 +279,8 @@ pre{background:#070a0f;border:1px solid var(--line);border-radius:10px;padding:1
 const DEFAULT_JOB = __DEFAULT_JOB__;
 const COLORS = {pending:'--pending',running:'--running',done:'--done',failed:'--failed',blocked:'--blocked',
   awaiting_approval:'--awaiting_approval',skipped:'--skipped',split:'--split',stopped:'--failed',awaiting_human:'--awaiting_approval',
-  environment:'--failed',review_failed:'--failed',budget:'--blocked',interrupted:'--blocked'};
-const LABEL = {awaiting_approval:'needs approval',awaiting_human:'needs you',review_failed:'review failed'};
+  environment:'--failed',review_failed:'--failed',budget:'--blocked',advisor_blocked:'--awaiting_approval',interrupted:'--blocked'};
+const LABEL = {awaiting_approval:'needs approval',awaiting_human:'needs you',review_failed:'review failed',advisor_blocked:'advisor: revise plan'};
 let JOB = new URLSearchParams(location.search).get('job') || DEFAULT_JOB;
 let D = null, SEL = null, TAB = 'overview', sig = '';
 const $ = s => document.querySelector(s);

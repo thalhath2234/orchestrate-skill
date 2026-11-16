@@ -20,7 +20,8 @@ Flow
      Policy for FUTURE tasks never changes here: router.py only files
      proposals, which you approve/reject.
 API overload and rate limits are retried with backoff (claude_cli), never blamed on a model.
-Exit codes: 0 ok, 2 bad usage, 3 environment broken, 4 gave up (needs a human), 7 budget.
+Exit codes: 0 ok, 2 bad usage, 3 environment broken, 4 gave up (needs a human), 7 budget,
+9 refused by a safety classifier (see refusal_category; not routing evidence).
 """
 from __future__ import annotations
 
@@ -51,7 +52,7 @@ ENV_PATTERNS = re.compile(
 # How a claude error (after claude_cli's own retries) is counted.
 ERROR_CAUSE = {"timeout": "unknown", "max_turns": "effort", "overloaded": "environment",
                "rate_limit": "environment", "api": "environment", "exec": "unknown",
-               "unparseable": "unknown"}
+               "unparseable": "unknown", "cut_off": "unknown"}
 
 
 def log(msg: str) -> None:
@@ -206,14 +207,68 @@ def done_gaps(report, ids: list[str]) -> list[str]:
     return gaps
 
 
-def worker_prompt(task: str, repo: Path, verify_cmds: list[str], hint: str = "") -> str:
+# The advisor tool only helps when the worker actually calls it: Claude decides when, and on one
+# Anthropic benchmark Opus rarely did and scored 7 points below Opus alone. So say when [ADVISOR].
+CONSULT = ("\nYou have an advisor (a stronger model) available as a tool. Consult the advisor: "
+           "before you commit to an approach, when the same error comes back a second time, and "
+           "before you write your final report. Apply its guidance unless the code or a test "
+           "contradicts it; then say so in your report.")
+CONSULT_RETRY = " If this is the same failure as before, consult the advisor before changing course."
+
+
+# Worker instructions adapted from Anthropic's prompting guides (P9). Each paragraph names its
+# source; measure a change with `evals/run.py --role worker` before keeping it.
+#
+# [Opus 5.5 "Unattended agentic runs", Fable 5.2 "Finish the whole task"] Workers run unattended
+# at medium effort, where both guides see turns end early on a progress note or an offer to go on.
+FINISH = """Nobody is watching this session to answer questions: a message without a tool call ends your
+work, and the task is then judged as you left it. So carry the whole task through. Don't end on a
+summary that announces the next step, an offer to continue, or a list of decisions that don't
+block you; do the next step instead. Ordinary obstacles (a failing command, a timeout, an empty
+result) are yours to diagnose and work through. Stop early only for something deliberately
+withheld from you, such as a path you don't own, and then say plainly what it was."""
+# [Sonnet 5.5 and Haiku 5.5 "Verification on coding tasks"] for a worker override to a smaller
+# model, and cheap on Opus.
+VERIFY = """Before you report the work done, run a real check that exercises the change: the commands below
+and the tests nearest to what you changed. A syntax-only check, or a command that failed to start,
+doesn't count. If the project's declared dependencies are missing, install them with its own
+package manager from the existing lockfile, without changing the lockfile and never with sudo or
+the system package manager. If no real check can run, say which one and why instead of reporting
+the change as done."""
+# [Fable 5.1 "Keep changes and tests to what the task asks for"; Fable 5 "Ground progress claims"]
+SCOPE = """Do what the task asks, completely, and no more. If you find a pre-existing bug, a performance
+problem or behaviour the task doesn't mention, leave it unless the task can't work without the
+fix, and report it (in a job, as an `fyi` open issue). Where the task is ambiguous, implement the
+reading its wording and the surrounding code support best, and say which reading you chose. Delete
+scratch scripts you made to check your work. Before you write your report, check each claim in it
+against a command result or a file you saw in this session: report only what you can point to, and
+say plainly what isn't verified."""
+
+
+# The advisor tool only helps when the worker actually calls it: Claude decides when, and on one
+# Anthropic benchmark Opus rarely did and scored 7 points below Opus alone. So say when [ADVISOR].
+CONSULT = ("\nYou have an advisor (a stronger model) available as a tool. Consult the advisor: "
+           "before you commit to an approach, when the same error comes back a second time, and "
+           "before you write your final report. Apply its guidance unless the code or a test "
+           "contradicts it; then say so in your report.")
+CONSULT_RETRY = " If this is the same failure as before, consult the advisor before changing course."
+
+
+def worker_prompt(task: str, repo: Path, verify_cmds: list[str], hint: str = "",
+                  advisor: bool = False) -> str:
     v = "\n".join(f"  {c}" for c in verify_cmds)
     return f"""{task}
 
 Working directory: {repo}. Read the nearest AGENTS.md before editing.
 Done means these commands pass (run them yourself before finishing):
 {v}
-Do not commit. Keep changes minimal and in scope.{hint}"""
+Do not commit.
+
+{FINISH}
+
+{VERIFY}
+
+{SCOPE}{hint}{CONSULT if advisor else ""}"""
 
 
 def main(argv=None) -> int:
@@ -260,6 +315,8 @@ def main(argv=None) -> int:
                     help="never route or escalate above this model (e.g. opus: no Fable)")
     ap.add_argument("--advisor", choices=["sonnet", "opus", "fable"],
                     help="let the worker consult this model at decision points (claude --advisor)")
+    ap.add_argument("--start", metavar="MODEL/EFFORT",
+                    help="start config before learned floors (default: the worker role, opus/medium)")
     ap.add_argument("--dry-run", action="store_true", help="only print the routing decision")
     a = ap.parse_args(argv)
     repo = a.repo.expanduser().resolve()
@@ -270,7 +327,7 @@ def main(argv=None) -> int:
     report_schema = json.loads(a.report_schema) if a.report_schema else None
     extra = ["--exclude-dynamic-system-prompt-sections"] if a.exclude_dynamic_prompt else []
 
-    decision = router.route(a.type, a.tier, max_model=a.max_model)
+    decision = router.route(a.type, a.tier, max_model=a.max_model, start=a.start)
     log(f"task {task_id} {a.type} {a.tier} -> {decision['model']}/{decision['effort']} ({decision['source']})")
     if a.dry_run:
         print(json.dumps(decision))
@@ -290,6 +347,7 @@ def main(argv=None) -> int:
         settings["sandbox"] = {"enabled": True, "autoAllowBashIfSandboxed": True}
     rung, probe, hint = decision["rung"], decision["probe"], ""
     summary = {"task_id": task_id, "type": a.type, "tier": a.tier, "steps": [], "proposals": []}
+    advisor_off = None  # set when a launch failed because of the advisor: run on without it
     escalations, spent = 0, 0.0
 
     def remaining():
@@ -301,15 +359,29 @@ def main(argv=None) -> int:
         cost = 0.0
         metrics: dict = {}
         for attempt in range(1, a.attempts + 1):
-            prompt = worker_prompt(a.task, repo, a.verify, hint) if attempt == 1 else (
-                "Verification still fails. Fix it, then end with your full JSON report again. "
-                "Output:\n" + vout[-5000:])
-            log(f"attempt {attempt}/{a.attempts} at {model}/{effort}")
-            worker = claude(prompt, model, effort, repo, perm=a.permission_mode,
-                            tools=a.allowed_tools, resume=session, timeout=a.claude_timeout,
-                            settings=settings, schema=report_schema, budget_usd=remaining(),
-                            extra_args=extra + models.fallback_args(model)
-                            + models.advisor_args(model, a.advisor))
+            adv = [] if advisor_off else models.advisor_args(model, a.advisor, a.max_model)
+            prompt = worker_prompt(a.task, repo, a.verify, hint, bool(adv)) if attempt == 1 else (
+                "Verification still fails. Fix it, then end with your full JSON report again."
+                + (CONSULT_RETRY if adv else "") + " Output:\n" + vout[-5000:])
+            log(f"attempt {attempt}/{a.attempts} at {model}/{effort}"
+                + (f" (advisor {adv[1]})" if adv else ""))
+            kw = dict(perm=a.permission_mode, tools=a.allowed_tools, resume=session,
+                      timeout=a.claude_timeout, settings=settings, schema=report_schema)
+            worker = claude(prompt, model, effort, repo, budget_usd=remaining(),
+                            extra_args=extra + models.fallback_args(model) + adv, **kw)
+            if adv and worker.get("error_kind") in ("exec", "unparseable") \
+                    and not worker.get("total_cost_usd") \
+                    and models.ADVISOR_LAUNCH_FAIL.search(str(worker.get("result"))):
+                # The launch failed on the advisor (e.g. Fable usage-credits consent), before the
+                # model did anything: not evidence about the model. Run again without it.
+                advisor_off = f"{adv[1]} advisor refused at launch: {str(worker.get('result'))[-300:]}"
+                summary["advisor_off"] = advisor_off
+                log(f"advisor off for this task: {advisor_off}")
+                if attempt == 1:
+                    prompt = worker_prompt(a.task, repo, a.verify, hint, False)
+                worker = claude(prompt, model, effort, repo, budget_usd=remaining(),
+                                extra_args=extra + models.fallback_args(model), **kw)
+                adv = []
             session = worker.get("session_id") or session
             c = worker.get("total_cost_usd") or 0.0
             cost += c
@@ -332,7 +404,9 @@ def main(argv=None) -> int:
             if ok:
                 break
         step = {"config": f"{model}/{effort}", "probe": probe, "ok": ok, "cost_usd": round(cost, 6),
-                "metrics": metrics}
+                "metrics": metrics,
+                "advisor": (models.advisor_args(model, a.advisor, a.max_model) or [None, None])[1]
+                if not advisor_off else None}
         if models.fell_back(model, worker.get("model_id")):
             # Fable unavailable -> Claude Code ran the fallback. Not evidence about either model.
             step["fell_back_to"] = worker.get("model_id")
@@ -352,6 +426,15 @@ def main(argv=None) -> int:
             step.update(cause="budget", evidence="budget reached")
             summary["result"] = "budget"
             log("budget reached -> stopping")
+            break
+
+        if worker.get("error_kind") == "refusal":
+            # A safety classifier declined the request: not the model's capability, and a
+            # stronger model of the same family would decline too. Stop and say why.
+            cat = worker.get("refusal_category") or "uncategorised"
+            step.update(cause="refusal", evidence=f"declined by a safety classifier ({cat})")
+            summary["result"], summary["refusal_category"] = "refused", cat
+            log(f"refused at {model}/{effort} ({cat}); not routing evidence")
             break
 
         c = classify(a.task, rung, worker, vout, repo, a.claude_timeout, a.verify)
@@ -404,7 +487,7 @@ def main(argv=None) -> int:
     print(json.dumps(summary, indent=2))
     if summary["proposals"]:
         log(f"{len(summary['proposals'])} proposal(s) pending: router.py proposals")
-    return {"ok": 0, "environment": 3, "budget": 7}.get(summary["result"], 4)
+    return {"ok": 0, "environment": 3, "budget": 7, "refused": 9}.get(summary["result"], 4)
 
 
 if __name__ == "__main__":

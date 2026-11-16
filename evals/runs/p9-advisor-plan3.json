@@ -1,0 +1,61 @@
+{
+  "overall_pass": 0.75,
+  "results": [
+    {
+      "role": "advisor",
+      "case": "plan-misses-route-wiring",
+      "config": "default",
+      "core": true,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 1.5938,
+      "trials": [
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.8032760999999999,
+          "detail": "[fable/medium] Revise: executed as written, the share endpoints are never registered in the real API router, so the feature 404s in the running app while all planned tests pass. No task owns apps/api/internal/http/routes.go or routes_test.go, and acceptance criterion 4 (405 through the real router) is assigned to no task. Fix by giving both files to the api task with the wiring and real-router tests as done criteria. The web side is wired correctly (routes.tsx is owned and tested through the route table), with no ownership collisions between tasks. Remaining gaps are failure paths: clipboard failure, non-404 errors on the public page, and KV or rand failures in the API. I could not run `make test` or `make lint` (shell access was denied), so the baseline, including whether the web test environment has a DOM, is unverified. | BLOCKS (blocker/high): No task owns apps/api/internal/http/routes.go, the only place features are wired (`http.Register` calls only `schedules.Register`). The api task owns just apps/api/internal/share/**, so `share.Register` is never called by the real router. Both endpoints would 404 in the running app while every handler test passes, because testutil.NewServer accepts `share.Register` directly. | BLOCKS (blocker/high): Acceptance criterion 4 (POST /share/:token returns 405 through the real router) is in no task's done list, and no task owns routes_test.go, the only place that tests through `http.Register`. No test anywhere proves the share routes are reachable via `http.Register`, so the missing wiring would go undetected by `make test`. | BLOCKS (major/medium): The web done criteria say the button 'copies the returned url' but never require the link to be shown. navigator.clipboard is undefined in insecure contexts and in the test DOM, and writeText can reject. If the copy fails silently, the owner clicks Share and gets no link. Only POST failure has an error criterion. | BLOCKS (major/medium): SharedSchedulePage is only specified for success and 404. A 500 or network failure is unspecified; the existing SchedulePage pattern (`apiGet(...).then(setSchedule)` with no catch) would leave it on 'Loading\u2026' forever with an unhandled rejection. | BLOCKS (major/medium): API failure paths are unspecified: crypto/rand error, KV.Put failure (must not return 201 with a dead link), KV.Get error other than ErrNotFound, and a token whose schedule no longer resolves. Each could fail silently or return the wrong status.",
+          "secs": 72.0
+        },
+        {
+          "ok": true,
+          "label": "revise",
+          "fails": [],
+          "cost": 0.7905044999999999,
+          "detail": "[fable/medium] The plan covers the user's goal well in its acceptance criteria, but the tasks do not reach it: nobody owns apps/api/internal/http/routes.go, so the share endpoints are never registered on the real router, and the real-router 405 test in the acceptance list belongs to no task. Fix that by giving routes.go and routes_test.go to the api task. The remaining points are smaller: unhandled storage errors turn into empty 200s because the router drops handler errors, and the clipboard-only delivery of the link is fragile. I could not run make lint or make test here, so the baseline is unconfirmed and should be checked before work starts. | BLOCKS (blocker/high): No task owns apps/api/internal/http/routes.go, so share.Register is never called from http.Register (it only calls schedules.Register). The api task owns only apps/api/internal/share/**, and its handler tests can pass with testutil.NewServer(t, share.Register) while both endpoints return 404 in the real server. The Share button and the public page would then have nothing to call. | BLOCKS (major/high): The acceptance criterion 'POST to /share/:token returns 405 (api test through the real router)' is in no task's done list, and the only file where a real-router test belongs is owned by no task. Nobody will write that test. | BLOCKS (major/medium): The router discards the handler's returned error (`_ = h(...)`), so a handler that returns an error from KV.Put, KV.Get or crypto/rand without writing a status answers 200 with an empty body. The plan has no criterion for storage failures or for a token whose schedule no longer exists, so a failed share could look successful.",
+          "secs": 68.0
+        }
+      ]
+    },
+    {
+      "role": "advisor",
+      "case": "plan-sound",
+      "config": "default",
+      "core": true,
+      "pass_rate": 0.5,
+      "consistency": 0.5,
+      "cost_usd": 2.7941,
+      "trials": [
+        {
+          "ok": false,
+          "label": "revise",
+          "fails": [
+            "revise != proceed (The plan is sound against the code. Every acceptance criterion maps to a task, and file ownership does not overlap between the parallel api and web tasks. routes.go, routes_test.go and routes.tsx are )"
+          ],
+          "cost": 0.8653787,
+          "detail": "[fable/medium] The plan is sound against the code. Every acceptance criterion maps to a task, and file ownership does not overlap between the parallel api and web tasks. routes.go, routes_test.go and routes.tsx are owned and wired; the router already returns 405 for unrouted methods and the new paths don't collide with existing ones. schedules.PublicView, ScheduleView, store.KV and Config.WebOrigin all exist as the plan assumes, so no migration is needed. Owner-only creation is enforced server-side (auth.Require plus an owner check), which covers \"nobody else can create links\".\n\nThe one thing to check before dispatch: I could not run `make lint` or `make test` (shell denied). The checked-in testutil.go looks incomplete and is owned by no task, so confirm the baseline is green or give testutil to the api task. The remaining gaps are edge cases (clipboard failure, storage errors, JSON key match, anonymous rendering) that the work can be held to through raise_bar. | BLOCKS (major/medium): I could not run anything (shell access was denied), so the baseline is unverified. As checked in, testutil.go calls newServer and its doc comment promises Client.GET/POST, Response.ExpectStatus/JSON and Server.KV, but none of these are defined in the package's only file. If that is really the whole package, `make test-api` cannot compile today, every api `done` criterion depends on these helpers, and no task owns apps/api/internal/testutil/**. The repo otherwise looks like a trimmed skeleton (no main.tsx, tsconfig or go.sum), so this may be a fixture artefact rather than a plan defect.",
+          "secs": 75.5
+        },
+        {
+          "ok": true,
+          "label": "proceed",
+          "fails": [],
+          "cost": 1.9287135000000002,
+          "detail": "[fable/high escalated] The plan is sound and I recommend proceeding: nothing in it blocks reaching done. I checked it by reading every file in the repo; I could not run `make lint` or `make test` because shell access was denied.\n\n- **Coverage:** the three tasks cover every acceptance criterion, with disjoint ownership and no collision between the parallel api and web tasks.\n- **Routing:** the router returns 405 for an unrouted method on a known path, and the new paths do not clash with `/schedules/:id`.\n- **Auth:** `auth.Require` plus the owner check gives the 401, 404, 403 behaviour, and `schedules.PublicView` and contract `ScheduleView` already exist for the public response.\n- **Storage:** `store.KV` needs no migration, consistent with ADR 0007.\n\nTwo low-confidence risks are worth a check before dispatch:\n- **Baseline:** the tree as checked out looks abridged. The testutil helpers are documented but not defined, and there is no tsconfig, vitest config or `main.tsx`. If that is the real repo, the verify commands fail before any task starts and no task owns the fix.\n- **Sign-in gate:** `main.tsx` is absent, so I could not confirm the public route is reachable anonymously.\n\nThe rest are minor tightenings, and five criteria are added to the bar.",
+          "secs": 221.5
+        }
+      ]
+    }
+  ]
+}

@@ -59,17 +59,22 @@ LADDER_VERSION = 2
 # v1 ladder, for floors and proposals written before v0.6 (they store a rung index).
 LEGACY_LADDER = [("haiku", "low"), ("haiku", "medium"), ("sonnet", "medium"), ("sonnet", "high"),
                  ("opus", "high"), ("opus", "xhigh")]
-# Where each tier STARTS. Every task has a checkable outcome (its verify commands), so the
-# policy is Anthropic's "run at a low setting and re-run only the failures at a higher one":
-# on Opus 5.5, low then high on failures solved ~97% for $0.17/task, against 95.3% for $0.29
-# with everything at high. next_rung() does the re-run step.
-TIER_START = {
-    "T0": ("haiku", "medium"),   # Haiku 5.5 at its default: "high-volume work with outputs you can check"
-    "T1": ("sonnet", "medium"),  # everyday coding, one step below Sonnet's default
-    "T2": ("opus", "low"),       # matches Sonnet's default for ~7% more, and re-runs at opus/high
-    "T3": ("opus", "medium"),    # Opus 5.5 default: "multihour autonomous coding ... large refactoring"
-}
-TIER_DEFAULT = {t: LADDER.index(c) for t, c in TIER_START.items()}
+# Where a task STARTS: the worker role (models.ROLES["worker"], Opus 5.5 at medium) for every
+# tier; the tier still sets how many done criteria a task needs. Failures re-run higher
+# (next_rung): opus/high, opus/xhigh, then fable/high. A plan can move the start with
+# "models": {"worker": "..."} (run_task.py --start), a machine with ORCHESTRATE_MODEL_WORKER.
+TIERS = ("T0", "T1", "T2", "T3")
+
+
+def start_rung(start: str | None = None) -> int:
+    m, e = models.parse(start) if start else models.role("worker")
+    r = rung_of(m, e)
+    if r is None:
+        raise SystemExit(f"worker start {m}/{e} is not on the ladder: {[label(i) for i in range(len(LADDER))]}")
+    return r
+
+
+TIER_DEFAULT = {t: None for t in TIERS}  # tier names; the start rung comes from start_rung()
 CATEGORIES = {"rename", "docs", "config", "bugfix", "feature", "refactor",
               "test", "migration", "review", "research"}
 AREA_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")  # your own areas: api, web, mobile, cross...
@@ -219,10 +224,12 @@ def rule_state(rule: dict, now: float | None = None) -> tuple[bool, str]:
 
 # ----------------------------------------------------------------- route ---
 def route(task_type: str, tier: str, rng: random.Random | None = None,
-          max_model: str | None = None) -> dict:
+          max_model: str | None = None, start: str | None = None) -> dict:
     validate_type(task_type)
     rng = rng or random.Random()
-    default = TIER_DEFAULT[tier]
+    if tier not in TIER_DEFAULT:
+        raise SystemExit(f"tier must be one of {list(TIER_DEFAULT)}")
+    default = start_rung(start)
     rule = _read(ROUTING, {}).get(task_type)
     out = {"task_type": task_type, "tier": tier, "rung": default, "source": "tier-default",
            "probe": False}
@@ -455,9 +462,9 @@ def main(argv=None) -> None:
     if args.cmd == "route":
         print(json.dumps(route(args.type, args.tier, max_model=args.max_model)))
     elif args.cmd == "ladder":
-        starts = {v: k for k, v in TIER_DEFAULT.items()}
+        start = start_rung()
         for i, (m, e) in enumerate(LADDER):
-            print(f"  {i}  {m}/{e:7} {'<- ' + starts[i] + ' starts here' if i in starts else ''}")
+            print(f"  {i}  {m}/{e:7} {'<- every tier starts here (worker role)' if i == start else ''}")
         print("\nRoles: " + ", ".join(f"{r} {m}/{e}" for r, (m, e) in models.ROLES.items()))
     elif args.cmd == "status":
         _status()

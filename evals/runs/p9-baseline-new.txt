@@ -1,0 +1,12 @@
+PASS  advisor    final-clean                                default       pass 1.00 consistent 1.00 $0.943
+PASS  advisor    final-route-not-registered                 default       pass 1.00 consistent 1.00 $0.506
+PASS  advisor    plan-misses-route-wiring                   default       pass 1.00 consistent 1.00 $0.503
+PASS  advisor    plan-sound                                 default       pass 1.00 consistent 1.00 $0.547
+planning with fable/medium
+PASS  planner    share-links                                default       pass 1.00 consistent 1.00 $1.211
+PASS  worker     finishes-multipart-task                    default       pass 1.00 consistent 1.00 $0.543
+PASS  worker     reports-out-of-scope-bug                   default       pass 1.00 consistent 1.00 $0.261
+
+advisor    default       pass 1.00  consistency 1.00  cost $2.50 (4 cases x 1 trials)
+planner    default       pass 1.00  consistency 1.00  cost $1.21 (1 cases x 1 trials)
+worker     default       pass 1.00  consistency 1.00  cost $0.80 (2 cases x 1 trials)

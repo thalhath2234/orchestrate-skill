@@ -74,40 +74,80 @@ MANAGER = {
     },
 }
 
+# Field order is generation order under structured output: the evidence comes before the
+# judgment (Sonnet 5.5 prompting guide, "Reasoning tasks with JSON output"). Reviewers report every
+# finding with a confidence; the harness filters (blocking_findings), not the model.
 FINDING = {
     "type": "object",
-    "required": ["severity", "issue"],
+    "required": ["issue", "confidence", "severity"],
     "properties": {
-        "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
         "file": {"type": "string"}, "line": {"type": "integer"},
-        "issue": {"type": "string"}, "suggestion": {"type": "string"},
+        "issue": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+        "suggestion": {"type": "string"},
     },
+}
+
+# One edge case the reviewer checked. Every reviewer enumerates the edge cases of what changed
+# (empty, null, boundaries, errors, concurrency, auth...) and says how each is handled; one marked
+# unhandled without a matching finding becomes a finding in code, at the severity the
+# reviewer gave it (major when it gave none).
+EDGE_CASE = {
+    "type": "object",
+    "required": ["case", "evidence", "handled"],
+    "properties": {"case": {"type": "string"}, "file": {"type": "string"},
+                   "evidence": {"type": "string"}, "handled": {"type": "boolean"},
+                   # for an unhandled case: how much it matters (default major)
+                   "severity": {"type": "string", "enum": ["blocker", "major", "minor"]}},
 }
 
 REVIEW = {
     "type": "object",
-    "required": ["verdict", "summary", "acceptance", "findings"],
+    "required": ["acceptance", "edge_cases", "findings", "summary", "verdict"],
     "properties": {
-        "verdict": {"type": "string", "enum": ["pass", "changes_requested"]},
-        "summary": {"type": "string"},
         "acceptance": {"type": "array", "items": {
-            "type": "object", "required": ["criterion", "met", "evidence"],
-            "properties": {"criterion": {"type": "string"}, "met": {"type": "boolean"},
-                           "evidence": {"type": "string"}}}},
+            "type": "object", "required": ["criterion", "evidence", "met"],
+            "properties": {"criterion": {"type": "string"}, "evidence": {"type": "string"},
+                           "met": {"type": "boolean"}}}},
+        "edge_cases": {"type": "array", "items": EDGE_CASE},
         "findings": {"type": "array", "items": FINDING},
         "raise_bar": {"type": "array", "items": BAR_ITEM},
+        "summary": {"type": "string"},
+        "verdict": {"type": "string", "enum": ["pass", "changes_requested"]},
     },
 }
 
 AREA_REVIEW = {
     "type": "object",
-    "required": ["verdict", "summary", "findings"],
+    "required": ["edge_cases", "findings", "summary", "verdict"],
     "properties": {
-        "verdict": {"type": "string", "enum": ["pass", "changes_requested"]},
-        "summary": {"type": "string"},
+        "edge_cases": {"type": "array", "items": EDGE_CASE},
         "findings": {"type": "array", "items": FINDING},
         "raise_bar": {"type": "array", "items": BAR_ITEM},
+        "summary": {"type": "string"},
+        "verdict": {"type": "string", "enum": ["pass", "changes_requested"]},
     },
+}
+
+# The advisor's second opinion, before the plan runs ("plan") and before hand-over ("final").
+# done_restated: the definition of done in the advisor's own words, so a misreading shows.
+ADVICE = {
+    "type": "object",
+    "required": ["done_restated", "findings", "summary", "verdict"],
+    "properties": {
+        "done_restated": {"type": "string"},
+        "findings": {"type": "array", "items": FINDING},
+        "raise_bar": {"type": "array", "items": BAR_ITEM},
+        "summary": {"type": "string"},
+        "verdict": {"type": "string", "enum": ["proceed", "revise"]},
+    },
+}
+
+CLEANUP = {
+    "type": "object",
+    "required": ["changed", "removed", "notes"],
+    "properties": {"changed": {"type": "boolean"}, "removed": _STRS, "notes": {"type": "string"}},
 }
 
 CLASSIFIER = {
@@ -172,10 +212,11 @@ LESSONS = {
 
 PLAN = {
     "type": "object",
-    "required": ["job", "goal", "acceptance", "verify", "tasks"],
+    "required": ["job", "goal", "definition_of_done", "acceptance", "verify", "tasks"],
     "properties": {
         "job": {"type": "string", "pattern": ID_PATTERN},
         "goal": {"type": "string"},
+        "definition_of_done": {"type": "string"},
         "acceptance": {**_STRS, "minItems": 1}, "non_goals": _STRS, "decisions": _STRS,
         "quality_bar": _STRS,
         "setup": _STRS, "verify": {**_STRS, "minItems": 1}, "baseline": _STRS,
