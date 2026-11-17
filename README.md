@@ -185,7 +185,7 @@ Defaults follow Anthropic's model guidance ([choosing a model](https://platform.
 | Worker | Opus 5.5 / medium | Every subtask, whatever its tier; failures re-run at high, then xhigh, then Fable 5.2 |
 | Reviewer | Opus 5.5 / medium | Fresh-context review that lists every edge case of the diff and how each is handled (area reviewers too) |
 | Cleanup | Opus 5.5 / medium | Removes debug output, dead code and stray TODOs from the job's own files; reverted if verify fails |
-| Integrator (conflicts) | Sonnet 5.5 / high | Merge conflicts between subagent branches |
+| Integrator (conflicts) | Opus 5.5 / medium | Merge conflicts between subagent branches |
 | Failure classifier | Haiku 5.5 / low | Sorts a failed attempt into environment / context / effort / capability |
 | Lessons extractor | Haiku 5.5 / medium | Proposes AGENTS.md notes after a job |
 

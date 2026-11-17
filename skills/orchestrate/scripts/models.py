@@ -59,8 +59,9 @@ ROLES: dict[str, tuple[str, str]] = {
     "area_reviewer": ("opus", "medium"),
     # Tidies the merged diff before the final check: dead code, debug output, stray TODOs.
     "cleanup": ("opus", "medium"),
-    # Merge-conflict resolution: everyday coding [CHOOSE] at Sonnet's default effort.
-    "integrator": ("sonnet", "high"),
+    # Merge-conflict resolution. Opus 5.5 at its default effort (the user's choice, 2026-11-18:
+    # no Sonnet in the defaults).
+    "integrator": ("opus", "medium"),
     # Failure-cause classification. [ROUTE] "Claude Haiku 5.5 ... at low effort handles
     # simple, high-volume requests such as classification". Our sweep: haiku/low = sonnet/low.
     "classifier": ("haiku", "low"),

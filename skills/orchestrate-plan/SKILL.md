@@ -88,8 +88,8 @@ Be as narrow as practical but include everything the task must create, including
   "models": {"reviewer": "opus/high"},        // optional per-role override, "<model>/<effort>". Roles and
                                               //   defaults: advisor fable/medium (then high if it finds
                                               //   nothing), planner fable/medium, manager, worker, reviewer,
-                                              //   area_reviewer and cleanup opus/medium, integrator
-                                              //   sonnet/high, classifier haiku/low, lessons haiku/medium
+                                              //   area_reviewer, cleanup and integrator opus/medium,
+                                              //   classifier haiku/low, lessons haiku/medium
                                               //   (scripts/models.py has the sources)
   "max_model": "opus",                        // optional: nothing above this model, roles or ladder
                                               //   (no Fable: the advisor becomes opus/high)
