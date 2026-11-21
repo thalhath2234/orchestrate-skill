@@ -2,7 +2,7 @@
  "id": "decision-respected-passes",
  "core": false,
  "pair": "missing-owner-check",
- "about": "a settled decision (opaque tokens, not JWTs) must not be re-argued. Graded on the findings, not the verdict: the fixture is deliberately partial (no web route, no store), and a reviewer that checks wiring end to end rightly flags that. clean-diff-passes is the verdict check.",
+ "about": "a settled decision (opaque tokens, not JWTs) must not be re-argued. Graded on the findings, not the verdict: the fixture is deliberately partial (no web route, no store), and a reviewer that checks wiring end to end rightly flags that. clean-diff-passes is the verdict check. Its reports carry truthful done_check entries (every file:line resolves), so it is the honest control for report-claims-met-falsely.",
  "base_files": {
   "Makefile": "lint:\n\tgolangci-lint run ./apps/api/... && pnpm --filter web lint\ntest:\n\tcd apps/api && go test ./...\n\tpnpm --filter web test\n",
   "packages/contract/src/share.ts": "export type ShareLink = { token: string; scheduleId: string; expiresAt: string }\n",
@@ -79,11 +79,40 @@
  "reports": {
   "api": {
    "summary": "Added POST /schedules/:id/share (owner only, 201 with a ShareLink-shaped body) and GET /share/:token (404 for unknown/expired); six handler tests; registered routes.",
-   "interfaces": "share.Register(r)"
+   "interfaces": "share.Register(r)",
+   "done_check": [
+    {
+     "id": "D1",
+     "met": true,
+     "evidence": "apps/api/internal/share/handler.go:27-43 Create returns 201 with a 32-char hex token from newToken (:56); handler_test.go:51 TestCreateReturnsLinkMatchingContract"
+    },
+    {
+     "id": "D2",
+     "met": true,
+     "evidence": "handler.go:32-33 returns 403 when s.OwnerID != c.UserID(), :29-30 404 for an unknown schedule; handler_test.go:64 TestCreateRejectsNonOwner, :71 TestCreateUnknownScheduleIs404"
+    },
+    {
+     "id": "D3",
+     "met": true,
+     "evidence": "handler.go:47-52 Get returns the read-only schedule and 404 for unknown or expired tokens; handler_test.go:77, :85 TestGetUnknownTokenIs404, :91 TestGetExpiredTokenIs404"
+    }
+   ]
   },
   "web": {
    "summary": "Added ShareButton that copies the link and shows an error when copying fails; two tests.",
-   "interfaces": "ShareButton({link})"
+   "interfaces": "ShareButton({link})",
+   "done_check": [
+    {
+     "id": "D1",
+     "met": true,
+     "evidence": "apps/web/src/share/Button.tsx:9-12 copy() writes the /share/<token> URL to the clipboard; Button.test.tsx:8 'copies the share link'"
+    },
+    {
+     "id": "D2",
+     "met": true,
+     "evidence": "Button.tsx:13-14 sets the error, :21 shows it as role=alert; Button.test.tsx:17 'shows an error when copying fails'"
+    }
+   ]
   }
  },
  "expect": {

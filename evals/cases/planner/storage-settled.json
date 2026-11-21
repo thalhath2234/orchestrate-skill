@@ -1,0 +1,20 @@
+{
+ "id": "storage-settled",
+ "core": false,
+ "pair": "storage-left-open",
+ "from": "reviewer/route-not-registered",
+ "about": "Twin of storage-left-open: the user settled storage in the grill (passed as --decision). The planner must keep that decision verbatim and must not list storage as an assumption of its own.",
+ "goal": "Users can share a schedule via a public read-only link: POST /schedules/:id/share creates an opaque token for the schedule's owner, GET /share/:token returns the schedule read-only, and the web app gets a copy-link button.",
+ "done": "I can create a link for my own schedule, open it while logged out and see the schedule read-only, and nobody else can create links for my schedules.",
+ "decisions": [
+  "Share links live in an in-memory map in package share (token -> schedule id); losing them on restart is fine in this job"
+ ],
+ "expect": {
+  "no_assumption_matches": [
+   "stor|persist|database|\\btable\\b|\\bkv\\b|in-memory|\\bmap\\b|redis|sqlite|postgres"
+  ],
+  "min_acceptance": 3,
+  "min_tasks": 1,
+  "max_tasks": 5
+ }
+}

@@ -1,0 +1,31 @@
+{
+ "id": "error-overlay-is-blocker",
+ "core": false,
+ "pair": "clean-share-page-passes",
+ "about": "The dev server's error overlay (a syntax error in ShareCard.tsx) covers the page. The page still returns HTTP 200, so the harness adds no finding of its own: the reviewer must call it a blocker.",
+ "from": "ui_reviewer/clean-share-page-passes",
+ "head_files": {
+  "web/share.html": "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Team schedule</title><link rel=\"stylesheet\" href=\"base.css\"></head><body><header>Planner</header><main><div class=\"card\"><h1>Team schedule</h1><p>Week of 16 November</p><ul><li><span>Standup</span><span class=\"time\">Mon 09:00</span></li><li><span>Design review</span><span class=\"time\">Tue 14:00</span></li><li><span>Release</span><span class=\"time\">Thu 16:00</span></li></ul></div><div class=\"card\"><h1>Share</h1><p>Anyone with the link can view this schedule. They cannot edit it.</p><div class=\"link\">https://planner.example.com/share/3f9c2a7e1b6d4c08a5e2f71d9b30c6aa</div><button>Copy link</button></div></main></body></html>\n",
+  "web/src/share/ShareCard.tsx": "import { useState } from 'react'\n\nexport function ShareCard({ url }: { url: string }) {\n  const [copied, setCopied] = useState(false)\n\n  async function copy() {\n    await navigator.clipboard.writeText(url)\n    setCopied(true)\n  }\n\n  // the card under the schedule\n  return (\n    <div className=\"card\">\n      <h1>Share</h1\n      <p>Anyone with the link can view this schedule. They cannot edit it.</p>\n      <div className=\"link\">{url}</div>\n      <button onClick={copy}>{copied ? 'Copied' : 'Copy link'}</button>\n    </div>\n  )\n}\n"
+ },
+ "shots": [
+  {
+   "png": "share-error-overlay--desktop.png",
+   "name": "share",
+   "path": "/share.html",
+   "viewport": "desktop",
+   "title": "Team schedule",
+   "tasks": [
+    "web"
+   ],
+   "console": [
+    "[error] [vite] Internal server error: /src/share/ShareCard.tsx: Unexpected token, expected \",\" (14:7)"
+   ]
+  }
+ ],
+ "expect": {
+  "verdict": "changes_requested",
+  "finding_shot": "share--desktop",
+  "finding_severity": "blocker"
+ }
+}

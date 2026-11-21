@@ -9,7 +9,7 @@ A good plan makes subagents independent. Each one gets a clear goal, its own fil
 
 ## Process
 
-1. **Start from the confirmed grilling summary** (the **orchestrate-grill** skill). The user's definition of done goes into `definition_of_done` exactly as they said it; its goal, acceptance criteria, non-goals and decisions go into `goal`, `acceptance`, `non_goals` and `decisions`, word for word. If a product decision turns up missing while you plan, go back and ask; don't guess one.
+1. **Start from the confirmed grilling summary** (the **orchestrate-grill** skill). The user's definition of done goes into `definition_of_done` exactly as they said it; its goal, acceptance criteria, non-goals and decisions go into `goal`, `acceptance`, `non_goals` and `decisions`, word for word. If a product decision turns up missing while you plan, go back and ask; don't guess one. A planner subagent can't ask, so it lists each choice it had to make that touches the architecture, a public interface or route, a new dependency, or stored data in `assumptions` (what it chose and the alternative), never in `decisions`. Validate warns until the user has confirmed each one and it has moved into `decisions`.
 2. **Map the repo:** `orchestrate.py scan --repo <repo>`. It lists packages and their areas, suggested verify commands, hotspots (lockfiles and root configs), AGENTS.md files and the setup command. Read the root AGENTS.md and the AGENTS.md of every package you'll touch. Skim the code you'll change (entry points, an existing similar feature) so the plan follows existing patterns.
 3. **Split by ownership, not by step.** Each task owns a set of paths that nobody running at the same time owns:
    - **Contract first.** Shared types, API schemas or a contract package come first (wave 1). Consumers depend on them.
@@ -44,7 +44,7 @@ Type is `<category>:<area>`. Categories: `rename docs config bugfix feature refa
 - **Verify per package:** use the package's own commands from `scan.packages[].verify_suggestions` (for example `make test-api`, `pnpm --filter web run typecheck`). Use the repo-wide suite only in job-level `verify`.
 - **Setup:** set `setup` from `scan.suggested_setup` (for example `pnpm install --frozen-lockfile --prefer-offline`). It runs in every worktree.
 - **Resource weight:** if verify runs heavy builds (tsc on a large app, Gradle, Go race tests), set `"mem_per_agent_gb": 2.5` (or more) so the parallel cap stays safe.
-- **Ports:** keep dev-server commands out of verify, because parallel worktrees would fight over the same ports. If an e2e check needs a server, give it its own port offset with `$ORCHESTRATE_SLOT`.
+- **Ports:** keep dev-server commands out of verify, because parallel worktrees would fight over the same ports. If an e2e check needs a server, give it its own port offset with `$ORCHESTRATE_SLOT`. The plan's `ui.dev` is the exception: the harness runs it alone, in the integration worktree, one dev server per state dir (`$ORCHESTRATE_DIR`) at a time.
 
 ## Ownership patterns
 
@@ -53,7 +53,18 @@ Type is `<category>:<area>`. Categories: `rename docs config bugfix feature refa
 - `dir/*.go` matches only direct children.
 - An exact path owns one file.
 
-Be as narrow as practical but include everything the task must create, including its tests and any docs it should update. `reads` lists context to read, which can't be edited.
+Be as narrow as practical but include everything the task must create, including its tests and any docs it should update. `reads` lists context to read, which can't be edited. A `reads` path must exist now or be owned by a task this one depends on; validate warns otherwise.
+
+## UI pages (web apps)
+
+When `scan` returns a `ui_suggestion` and the job changes the UI, add a `ui` block so the review screenshots the running app and a UI reviewer checks the shots. Start from the suggestion (`dev`, `url`, `paths`) and check it against the repo: `dev` must serve the app from the repo root without prompts, and `url` must be what it serves. Validation rejects a task `ui` list when the plan has no `ui` block.
+
+- **Each task that changes the UI lists the pages that show its change** in its own `ui` field. Pages declared by several tasks are captured once, and the reviewer sees which tasks declared each. Job-level `ui.pages` are for pages no single task owns (a home page that every change must not break). With no pages anywhere, only `/` is captured.
+- **Pick pages that prove done.** Use the flows settled in the grill: the page where the new thing appears, plus the states acceptance names (empty, error, logged out). A page needs a URL that works on a fresh dev server: seed data the app ships with, or a fixture route. If a page needs login or data the dev server doesn't have, say so in `decisions` or add a task that provides it.
+- **Steps exercise the flow,** not just load the page: click Share, then `wait_for` the toast, then `screenshot` it. A selector that never becomes visible (no box, `display:none`, `visibility:hidden` or opacity 0) is a failed step, and so is a click on an element that is covered or off-screen: the harness reports it as a major finding unless the UI reviewer lists it as expected, with a reason. A failed step stops that page's flow: the remaining steps (and their `screenshot`s) are skipped, and only the page's final shot is taken. An `alert`, `confirm` or `prompt` the flow opens is accepted, so a confirm-before-delete step works. Prefer stable selectors (`[data-testid=...]`, roles, ids) and put them in the task's `done` so the worker adds them. The page's main shot shows the state after its last step; to keep the page as it first loads, start the steps with `{"screenshot": "before"}`.
+- **`paths`** skips the UI review when the job's diff touches no UI file and no finished task declared `ui` pages. Leave it out to always run. Validation warns when `paths` overlaps no task's `owns` (a typo, or a UI change made through a shared package outside `paths`).
+- **`url`'s port must be free:** before any work, the job starts `dev` once and stops as `environment` if something already listens there, the app doesn't come up, or Chrome can't take a screenshot.
+- **Viewports:** keep both unless the app is not meant for one.
 
 ## Done criteria and verify
 
@@ -75,6 +86,8 @@ Be as narrow as practical but include everything the task must create, including
   "non_goals": ["no expiry UI in this job"],  // optional, from grilling: subagents must not build these
   "decisions": ["Tokens are opaque random strings, not JWTs (docs/adr/0007-share-tokens.md)"],
                                               // optional, from grilling: settled, not to be revisited
+  "assumptions": ["Links live in store.KV, not a new table"],  // planner subagent only: choices nobody
+                                              //   confirmed; validate warns until each is in decisions
   "quality_bar": ["Every API error response uses the shared ErrorBody type"],  // optional: repo-wide
                                               //   standards added to the fixed bar for every task
   "setup": ["pnpm install --frozen-lockfile --prefer-offline"],   // per worktree
@@ -88,7 +101,8 @@ Be as narrow as practical but include everything the task must create, including
   "models": {"reviewer": "opus/high"},        // optional per-role override, "<model>/<effort>". Roles and
                                               //   defaults: advisor fable/medium (then high if it finds
                                               //   nothing), planner fable/medium, manager, worker, reviewer,
-                                              //   area_reviewer, cleanup and integrator opus/medium,
+                                              //   area_reviewer, ui_reviewer, cleanup and integrator
+                                              //   opus/medium,
                                               //   classifier haiku/low, lessons haiku/medium
                                               //   (scripts/models.py has the sources)
   "max_model": "opus",                        // optional: nothing above this model, roles or ladder
@@ -115,6 +129,18 @@ Be as narrow as practical but include everything the task must create, including
   "sandbox": false,                           // optional OS sandbox for subagents' shell (bwrap/
                                               //   seatbelt); safest, but tools that write caches
                                               //   outside the repo (Go, Gradle) may break
+  "ui": {                                     // optional: screenshot the running app (before the code
+                                              //   review) and have the UI reviewer check the shots after it
+    "dev": "pnpm --filter web dev",           // required: serves the app; run in the integration worktree
+    "url": "http://127.0.0.1:5173",           // required: http(s) base URL that command serves; must be
+                                              //   free before it starts (else the review fails closed)
+    "ready_timeout_s": 180,                   // optional: how long to wait for url to answer
+    "paths": ["apps/web/**"],                 // optional: run only if the diff touches these (owns-style
+                                              //   patterns); default: every round
+    "viewports": ["desktop", "mobile"],       // optional subset; default both. desktop 1440x900,
+                                              //   mobile 390x844 (DPR 2, touch, mobile user agent)
+    "pages": [{"path": "/", "name": "home"}]  // optional job-level pages; with no pages anywhere, "/"
+  },
   "tasks": [
     {
       "id": "contract-share-types",
@@ -128,6 +154,28 @@ Be as narrow as practical but include everything the task must create, including
       "interfaces": "Export ShareLink {token, scheduleId, expiresAt} and shareLinkCreateSchema.",
       "done": ["Types and schemas exported from the package index", "Unit test for schema validation"],
       "verify": ["pnpm --filter @app/contract run test"]
+    },
+    {
+      "id": "web-share",
+      "title": "Share button on the schedule page",
+      "type": "feature:web",
+      "tier": "T1",
+      "goal": "A Share button on the schedule page creates a link and copies it, with a toast.",
+      "owns": ["apps/web/src/share/**", "apps/web/src/schedule/SchedulePage.tsx"],
+      "depends_on": ["contract-share-types"],
+      "done": ["Clicking [data-testid=share] copies the link and shows a 'Link copied' toast (test)",
+               "The button fits on a 390px-wide screen without wrapping (UI review)"],
+      "verify": ["pnpm --filter web run test"],
+      "ui": [                                 // optional: pages that show this task's change; needs plan "ui"
+        {"path": "/schedules/demo",           // starts with "/", relative to ui.url
+         "name": "schedule-share",            // optional slug for the screenshot files (default: from path);
+                                              //   a-z0-9 words, single dashes, max 41 chars (no "--")
+         "steps": [                           // optional, run in order before/between screenshots:
+           {"click": "[data-testid=share]"},  //   click a CSS selector; fails if covered or off-screen
+           {"wait_for": "[role=status]"},     //   wait up to 10 s for it to be visible
+           {"screenshot": "after-share"}      //   extra named screenshot mid-flow
+         ]}                                   //   also {"type": ["css", "text"]}, {"press": "Enter"},
+      ]                                       //   {"wait_ms": 500}
     },
     {
       "id": "api-share",
@@ -146,11 +194,11 @@ Be as narrow as practical but include everything the task must create, including
 }
 ```
 
-Every subagent's brief includes `non_goals`, `decisions` and the repo glossary (`GLOSSARY.md` or `CONTEXT.md`), and so does the reviewer's prompt. Write decisions so a subagent can act on them alone.
+Every subagent's brief includes `non_goals`, `decisions` and the repo glossary (`GLOSSARY.md` or `CONTEXT.md`), and so does the reviewer's prompt. Write decisions so a subagent can act on them alone. When the grill weighed an alternative, write the decision as 'X, not Y, because Z', so a retry or a later subagent doesn't reach for Y again.
 
 Each subagent reports `open_issues` as `{issue, kind: needs_file | needs_decision | fyi, blocks_acceptance, files}`. `fyi` issues and `needs_file` issues whose files belong to one not-started task are handled by rule; only the rest wake the manager.
 
-Comments above are for explanation only. Real `plan.json` must be plain JSON. Required per task: `id, title, goal, type, tier, owns, done, verify`. Optional: `reads, depends_on, interfaces, gate, baseline`.
+Comments above are for explanation only. Real `plan.json` must be plain JSON. Required per task: `id, title, goal, type, tier, owns, done, verify`. Optional: `reads, depends_on, interfaces, gate, baseline, ui`.
 
 ## Anti-patterns that validation or reality will punish
 

@@ -34,7 +34,8 @@ You get the task definition, its model path and failure causes (`steps`), the er
 | `OUT OF SCOPE` on a file **another task owns** | Leave the file with its owner. If the owner hasn't started, `amend` it with what's needed; otherwise `add_task` for that change (depending on the owner). `retry` the original with an instruction to leave that file alone. |
 | Its `verify` is wrong (a typo, a command that can't pass, a check of the wrong thing) | `retry` with a corrected `verify`. Keep every original check, or replace it with a command from the plan or the repo's scan; a retry may add checks, never drop them. A `done` criterion that is wrong goes to the user (`ask_human`): only they lower the bar. |
 | It failed its own definition of done (`done check: … gap(s)` in the log) | `retry` with `instructions` on the unmet items. Don't loosen them. |
-| Cause `capability` at the top of the ladder, a timeout, or a task that is plainly too big | `split` it into 2–4 smaller tasks with disjoint `owns`. Every original verify command **and every original `done` criterion, word for word,** must stay in at least one piece; add new criteria for each piece on top. |
+| Cause `capability` at the top of the ladder, a timeout, or a task that is plainly too big | `split` it into 2–4 smaller tasks with disjoint `owns`. Every original verify command **and every original `done` criterion, word for word,** must stay in at least one piece; add new criteria for each piece on top. A task with `ui` pages keeps them: leave `ui` out of every piece and each piece inherits them, or give each page (same `path` and `steps`) to the piece that changes it. |
+| `integrator resolution fails verify` (its work passed, but the merge conflict's resolution broke a verify command; the output tail follows) | The integration branch didn't move. Read the tail: a flaky test is worth one `retry`; a real break means the two tasks' intents clash, so `retry` with `instructions` naming the other task's change it must keep. |
 | Cause `environment` (services down, missing tool) | `ask_human`. You can't fix the machine. |
 | Result `refused` (a safety classifier declined the request; its category is in the step) | `ask_human`: say which task was declined and why, and recommend how to reword it. A retry or a stronger model of the same family is declined the same way. |
 | The task turns out to be unnecessary, or another task already did it | `skip` with the reason. Dependents proceed. |
@@ -50,6 +51,7 @@ A finished subagent reported something it couldn't do inside its scope. Issues m
 ### `review_changes_requested`
 The reviewer found blocker or major issues on the merged result, or (`source: advisor`) the reviewer passed but the advisor's final check before hand-over did not. Judge both against the user's definition of done at the top of your prompt.
 - Prefer **targeted fix tasks**: one `add_task` per area, owning exactly the files to fix, depending on the task that owns them, with the finding and its suggested fix in `goal`. They run, then the reviewer looks again.
+- A **stale doc** finding (a doc the job didn't change still names a file it deleted or renamed): `add_task` of type `docs:<area>` that owns just that doc. Cleanup can't fix it: it only edits the job's own files.
 - `fix_round` hands the findings to one generic fix subagent. Use it for small cross-cutting fixes.
 - `accept` only when the remaining findings are wrong or contradict the user's decisions. Explain why. Blockers go to the user with `ask_human`. Accepting reviewer findings doesn't skip the advisor: its final check still runs, and if it objects the job ends `review_failed` for the user.
 
@@ -70,7 +72,7 @@ Your last reply wasn't a valid decision object. Reply again with only the object
 | Action | Fields | Valid when |
 |---|---|---|
 | `retry` | `task`, `instructions`, optional `tier`, `owns`, `reads`, `verify`, `done` | Task is failed or blocked. At most 2 manager retries per task. |
-| `split` | `task`, `into`: list of full task objects | Task is not done or running. Its dependents are rewired to the new tasks. Each original `done` criterion and verify command appears verbatim in at least one piece. |
+| `split` | `task`, `into`: list of full task objects | Task is not done or running. Its dependents are rewired to the new tasks. Each original `done` criterion and verify command appears verbatim in at least one piece, and so does each `ui` page (when no piece has `ui`, every piece inherits the old task's pages). |
 | `add_task` | `task`: a full task object | Always. The id must be new. |
 | `amend` | `task`, `note`, optional `reads` | Task hasn't started. |
 | `raise_bar` | `scope` (`"job"` or a task id), `criteria` (1–3 checkable strings), `why` | `"job"` always (the final review checks it); a task id only before that task starts. |

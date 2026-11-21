@@ -14,6 +14,11 @@
   its structured output is dropped even if it parses (Sonnet 5.5 prompting guide: "treat any
   response whose stop_reason is max_tokens as failed, even if its text holds valid JSON").
 
+* ORCHESTRATE_HERMETIC=1 runs the call without the user's MCP servers and hooks
+  (`--strict-mcp-config` with an empty `--mcp-config`, `disableAllHooks` merged into `--settings`).
+  The evals set it so a pass rate does not depend on whose machine runs them. CLAUDE.md and other
+  setting sources still load: the user's rules can be part of their definition of done.
+
 error_kind: None | timeout | budget | max_turns | overloaded | rate_limit | api | exec | unparseable
             | refusal | cut_off
 """
@@ -83,14 +88,31 @@ def _kind(data: dict) -> str | None:
     return "exec"
 
 
+def _parse(stdout: str):
+    """The CLI's JSON reply: all of stdout, else its last line. Lines split on LF only: Node writes
+    U+2028/U+2029 raw inside strings, and str.splitlines() would cut the JSON there."""
+    try:
+        d = json.loads(stdout)
+    except json.JSONDecodeError:
+        d = json.loads(stdout.strip().split("\n")[-1])
+    if not isinstance(d, dict):
+        raise ValueError(f"the reply is JSON but not an object: {type(d).__name__}")
+    return d
+
+
 def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: list[str],
          resume: str | None = None, timeout: int = 3600, settings: dict | None = None,
          schema: dict | None = None, budget_usd: float | None = None,
          extra_args: list[str] | None = None, retries: int | None = None) -> dict:
     cmd = [claude_bin(), "-p", prompt, "--model", model, "--effort", effort,
            "--output-format", "json", "--permission-mode", perm]
+    hermetic = os.environ.get("ORCHESTRATE_HERMETIC") == "1"
+    if hermetic:
+        settings = {**(settings or {}), "disableAllHooks": True}
     if settings:
         cmd += ["--settings", json.dumps(settings)]
+    if hermetic:
+        cmd += ["--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": {}})]
     if tools:
         cmd += ["--allowedTools", *tools]
     if resume:
@@ -114,8 +136,8 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
                     "result": f"claude timed out after {timeout}s", "structured": None,
                     "metrics": {"wall_s": round(time.time() - t0, 1)}}
         try:
-            data = json.loads(p.stdout.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError):
+            data = _parse(p.stdout)
+        except (ValueError, IndexError):
             data = {"is_error": True, "result": (p.stdout + p.stderr)[-2000:], "subtype": "unparseable"}
             kind = ("overloaded" if OVERLOAD_RE.search(data["result"]) else
                     "rate_limit" if RATE_RE.search(data["result"]) else "unparseable")

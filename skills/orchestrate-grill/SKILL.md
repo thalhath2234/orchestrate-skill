@@ -9,7 +9,7 @@ description: "Use at the start of every orchestrate run, before planning. Grills
 > - Source: https://github.com/mattpocock/skills at commit `5863806dd4e15c63174bee4e7515a4256792ecfa`
 > - License: MIT, © 2026 Matt Pocock (see [LICENSE-mattpocock](./LICENSE-mattpocock))
 >
-> The **Grilling** and **Domain modeling** sections below are his text, verbatim except for heading levels. [GLOSSARY-FORMAT.md](./GLOSSARY-FORMAT.md) and [ADR-FORMAT.md](./ADR-FORMAT.md) are his files, unchanged. Sections marked *(orchestrate)* are additions.
+> The **Grilling** and **Domain modeling** sections below are his text, verbatim except for heading levels. [GLOSSARY-FORMAT.md](./GLOSSARY-FORMAT.md) and [ADR-FORMAT.md](./ADR-FORMAT.md) are his files, unchanged. Sections marked *(orchestrate)* are additions. One departure: orchestrate's Q1 (what done looks like) carries no recommended answer, although **Grilling** says to give one for every question.
 
 ## How this fits an orchestrate run *(orchestrate)*
 
@@ -18,9 +18,9 @@ description: "Use at the start of every orchestrate run, before planning. Grills
 
    ```
    ❓ **Q1** - **What does done look like?**: When this is finished, what will you check to say "yes, that's done"? Describe it in your own words: what you'll see, run or be able to do.
-
-   ➡️ <your recommended definition, written as what the user would observe>
    ```
+
+   This is the one question with **no recommended answer**: don't write a definition for the user, and don't offer finished sentences to pick from. The whole run is judged against this sentence, so it must be theirs. You may name what a good answer covers (what they'll see, run, or be able to do), never the answer itself. If the reply only accepts ("yes", "all recommended", "sounds good"), it doesn't answer Q1: ask it again in the next round.
 
    Keep their answer **verbatim**: it becomes `definition_of_done` in the plan, and every subagent, the manager, the reviewer and the advisor see it word for word. If the answer is vague ("it works"), ask a follow-up in the next round until it describes something observable. The acceptance criteria you derive later must prove this definition, and none may contradict it.
 3. **Then grill** with the rules in **Grilling**, applying **Domain modeling** as you go. Work through the design tree until the frontier is empty, and visit every branch below that applies:
@@ -33,14 +33,14 @@ description: "Use at the start of every orchestrate run, before planning. Grills
    - **Security and permissions:** who may do what.
    - **Done and verify:** which existing commands prove it works, and which new tests should exist.
    - **Risk:** what needs a human gate (migrations, deletes, auth, payments), the budget, and the rollout.
-4. **Scale the session to the request.** A rename or a typo gets one short round ("here's what done looks like, here's what I'll do and how I'll verify it, yes?"); ask the done question every time, because the whole run is judged against the answer. A cross-package feature gets as many rounds as its tree needs. If the user says *skip grilling* or *no grill*, skip the rest, but still ask what done looks like (one question) unless they already said it.
+4. **Scale the session to the request.** A rename or a typo gets one short round ("what will you check to call this done? Here's what I'll do and how I'll verify it"); ask the done question every time, with no suggested answer, because the whole run is judged against the answer. A cross-package feature gets as many rounds as its tree needs. If the user says *skip grilling* or *no grill*, skip the rest, but still ask what done looks like (one question) unless they already said it.
 5. **Find the glossary.** Use `GLOSSARY.md` / `GLOSSARY-MAP.md` if they exist. If not, use `CONTEXT.md` / `CONTEXT-MAP.md` if they exist (the older name for the same file). If neither exists, create `GLOSSARY.md` lazily. Wherever **Domain modeling** says `GLOSSARY.md`, read it as the file this step found.
 6. **Close the session.** When the frontier is empty, post a summary and ask the user to confirm it:
    - **Definition of done:** the user's own words, quoted exactly.
    - **Goal:** one sentence.
    - **Acceptance:** 3–7 testable bullets.
    - **Non-goals.**
-   - **Decisions:** one line each, citing ADR files where they exist.
+   - **Decisions:** one line each, as "X, not Y, because Z" when an alternative was weighed, citing ADR files where they exist.
    - **Terms added or changed** in the glossary.
    - **Proposed route:** single task or job, and why.
 

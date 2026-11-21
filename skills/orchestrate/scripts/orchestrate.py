@@ -6,20 +6,30 @@ orchestrate-plan skill. This script does everything mechanical and deterministic
 
   capacity                 how many subagents this machine can run in parallel, and why
   scan     --repo R        monorepo map: packages, areas, verify commands, hotspots, setup
-  plan     --repo R --goal "..." --done "..."   (optional) have a Fable planner write plan.json
+  plan     --repo R --goal "..." --done "..."   (optional) have a Fable planner write plan.json;
+           [--acceptance A] [--decision D] [--non-goal N]   (repeatable) what the user settled, kept verbatim
   validate PLAN            schema + DAG + file-ownership checks; prints waves and the cap
   brief    PLAN TASK       print the exact handoff a subagent will receive
   run      PLAN [--detach] [--approve ID ...] [--max-parallel N]
   resume   JOB  [--detach] [--approve ID ...]
-  status   JOB             progress table (JOB may be omitted: latest job)
+  status   JOB             progress table (JOB may be omitted: latest job, or --repo R's)
+  status   --repo R --open this repo's jobs that are not done or cleaned, with the next step
   wait     JOB [--timeout S]   block until the job finishes or S seconds pass
   clean    JOB [--branches]    remove worktrees (and task branches)
   guard-hook               print the Claude Code hook that routes approvals to the user
-  metrics  JOB [--json]     cost split by role, cache use, turns, first-pass rate, manager load
+  doctor   [--repo R]      check the install before the first job: claude on PATH (exit 1 if
+                           not), the approval hook (a warning that prints the hook to add)
+  metrics  JOB [--json]     cost split by role, cache use, turns, first-pass rate, manager load,
+                           advisor re-check yield
   advise   [PLAN] [--goal G --done D] [--final --base SHA]   the advisor's second opinion
                            (Fable/medium, then high if it finds nothing); exit 9 = revise
   scope-check --owns P ... [--job J --task T]   (a verify step) fail if changes leave owned
                            paths; with --job/--task, files no task owns are claimed instead
+  dashboard [JOB] [--port 8765] [--no-start | --stop]   make sure the live dashboard serves
+                           this state dir and print its URL (run/resume do this before any
+                           work; ORCHESTRATE_DASHBOARD=0 turns it off); --stop stops the
+                           ones this tool started or that run this dashboard.py (exit 1 names
+                           any other it leaves running); an unused one exits after 12 h
 
 Execution model
   * Integration branch  orchestrate/<job>  (worktree) starts at the base commit.
@@ -32,7 +42,10 @@ Execution model
   * Before any task runs, the advisor (Fable/medium; high when medium finds nothing) checks
     the plan against the user's definition of done; "revise" stops the job (advisor_blocked).
   * After all tasks: final verify -> reviewer subagent (fresh context, Opus, every edge case;
-    per-area reviewers plus an integration reviewer for big diffs) -> cleanup pass -> the
+    per-area reviewers plus an integration reviewer for big diffs) -> with plan.ui, the UI
+    review (dev server + headless Chrome screenshots, desktop and mobile, taken before the code
+    review; judged by a UI reviewer after it; its findings and the browser's hard evidence join
+    the review's as "[UI] ...") -> cleanup pass -> the
     advisor's final check -> up to N fix rounds -> report.
     A reviewer or advisor that returns no verdict ends the job as review_failed, never done.
   * The manager (Opus) decides in a background thread; events are triaged by rule first and
@@ -43,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import functools
 import json
 import math
@@ -52,8 +66,10 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -64,6 +80,7 @@ import claude_cli  # noqa: E402
 import models  # noqa: E402
 import router  # noqa: E402
 import schemas  # noqa: E402
+import ui_review  # noqa: E402
 
 JOBS = router.DIR / "jobs"
 PLANS = router.DIR / "plans"
@@ -101,7 +118,31 @@ def _skipped(path: str) -> bool:
 
 # =============================================================== utilities ===
 def log(msg: str) -> None:
-    print(f"[orchestrate {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+    """A progress line on stderr and, while a job runs (any mode: run, resume, worker-done,
+    worker-lost), in its logs/_orchestrator.log, which the dashboard shows."""
+    line = f"[orchestrate {time.strftime('%H:%M:%S')}] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    if ui_review.LOG_FILE is not None:  # one place, shared by every copy of this module (__main__, orca_mode's)
+        try:
+            with open(ui_review.LOG_FILE, "a") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+
+
+def log_to_job(job_dir: Path) -> None:
+    (job_dir / "logs").mkdir(parents=True, exist_ok=True)
+    ui_review.LOG_FILE = job_dir / "logs" / "_orchestrator.log"
+
+
+def task_log(job, tid: str, text: str) -> None:
+    """Append to logs/<tid>.log: an Orca worker runs in its own terminal, so this holds what the
+    harness did for the task (start, checks, verify output, merge)."""
+    try:
+        with open(job.dir / "logs" / f"{tid}.log", "a") as fh:
+            fh.write(f"[orchestrate {time.strftime('%Y-%m-%d %H:%M:%S')}] {text.rstrip()}\n")
+    except OSError:
+        pass
 
 
 def sh(cmd: str, cwd: Path, timeout: int = 1800, env: dict | None = None) -> tuple[int, str]:
@@ -118,6 +159,16 @@ def git(cwd: Path, *args: str, check: bool = True) -> str:
     if check and p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed in {cwd}:\n{p.stdout}{p.stderr}")
     return p.stdout.strip()
+
+
+def git_paths(cwd: Path, *args: str) -> list[str]:
+    """Paths a git listing command prints (diff --name-only, ls-files), read NUL-separated with
+    core.quotePath off: a non-ASCII name comes back as itself, never quoted and octal-escaped.
+    For diff, pass --no-renames so a file moved away lists its old path too."""
+    p = subprocess.run(["git", "-c", "core.quotePath=off", *args, "-z"], cwd=cwd, capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed in {cwd}:\n{p.stderr.decode(errors='replace')}")
+    return [x for x in p.stdout.decode("utf-8", errors="surrogateescape").split("\0") if x]
 
 
 def git_ident(repo: Path) -> list[str]:
@@ -197,6 +248,17 @@ def fit_json(obj, limit: int) -> str:
     return s
 
 
+UI_SECTION = "## Reviewing the UI"
+
+
+def review_skill(ui: bool = False) -> str:
+    """The orchestrate-review skill for one kind of role: the integrator and code reviewers get
+    everything before its "Reviewing the UI" section, the UI reviewer gets that section alone."""
+    t = skill_text("orchestrate-review")
+    head, sep, tail = t.partition(UI_SECTION)
+    return (sep + tail).strip() if ui else head.strip()
+
+
 def skill_text(name: str) -> str:
     """Body of a sibling support skill (orchestrate-plan / orchestrate-review)."""
     for base in (HERE.parents[1], Path.home() / ".agents/skills", Path.home() / ".claude/skills"):
@@ -224,6 +286,7 @@ def record_call(job, role: str, res: dict, task: str | None = None, cfg: str = "
     job.state.setdefault("calls", []).append({
         "t": round(time.time(), 1), "role": role, "task": task, "config": cfg, "cost_usd": cost,
         "error": res.get("error_kind"), "model_id": res.get("model_id"),
+        **({"escalated": bool(res["escalated"])} if "escalated" in res else {}),
         **{k: v for k, v in (res.get("metrics") or {}).items()}})
 
 
@@ -365,11 +428,61 @@ def scan(repo: Path) -> dict:
                       or ("/" not in f and f in HOTSPOT_ROOT))
     setup = [cmd for lock, cmd in LOCKFILE_SETUP.items() if lock in fileset][:1]
     root_verify = [f"make {t}" for t in ("lint", "typecheck", "test") if t in make_targets]
-    return {"repo": str(repo), "monorepo": is_mono, "package_manager": pm if any(
+    out = {"repo": str(repo), "monorepo": is_mono, "package_manager": pm if any(
         p["kind"] == "node" for p in pkgs) else None, "packages": packages,
         "agents_docs": agents_docs, "hotspots": hotspots, "suggested_setup": setup,
         "suggested_final_verify": root_verify,
         "make_targets": sorted(make_targets)[:120], "tracked_files": len(all_files)}
+    ui = ui_suggestion(repo, [p for p in pkgs if p["kind"] == "node"], pm)
+    if ui:
+        out["ui_suggestion"] = ui
+    return out
+
+
+WEB_DEPS = ("next", "vite", "react", "react-dom", "vue", "svelte", "@sveltejs/kit", "astro", "nuxt",
+            "remix", "react-scripts")
+
+
+def _default_port(deps: set, dev_script: str) -> int:
+    m = re.search(r"(?:--port[= ]|(?:^|\s)-p\s+)(\d{2,5})\b", dev_script)
+    if m:
+        return int(m.group(1))
+    if "astro" in deps:
+        return 4321
+    if "next" in deps or "nuxt" in deps or "react-scripts" in deps:
+        return 3000
+    if any(d.startswith("@remix-run/") for d in deps) and "vite" not in deps:
+        return 3000
+    return 5173  # vite and everything built on it (SvelteKit, Vue, React templates, Remix 2+)
+
+
+def ui_suggestion(repo: Path, node_pkgs: list[dict], pm: str) -> dict | None:
+    """A plan.ui to propose when the repo has a web app: a package.json with a "dev" script and a
+    web framework in its dependencies. Packages under apps/ win; the user confirms it."""
+    found = []
+    for p in node_pkgs:
+        try:
+            data = json.loads(read_text(repo / p["manifest"]) or "")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        dev = (data.get("scripts") or {}).get("dev")
+        deps = set(data.get("dependencies") or {}) | set(data.get("devDependencies") or {})
+        if not isinstance(dev, str) or not (deps & set(WEB_DEPS) or any(d.startswith("@remix-run/") for d in deps)):
+            continue
+        d = p["dir"]
+        if not d:
+            cmd = f"{pm} run dev"
+        else:
+            cmd = {"pnpm": f"pnpm --filter {data.get('name') or './' + d} run dev",
+                   "yarn": f"yarn --cwd {d} run dev", "bun": f"bun --cwd {d} run dev",
+                   "npm": f"npm --prefix {d} run dev"}[pm]
+        sug = {"dev": cmd, "url": f"http://localhost:{_default_port(deps, dev)}"}
+        if d:
+            sug["paths"] = [f"{d}/**"]
+        found.append((not d.startswith("apps/"), not d, d, sug))
+    return sorted(found, key=lambda x: x[:3])[0][3] if found else None
 
 
 def _make_targets(makefile: Path) -> dict:
@@ -463,6 +576,9 @@ def patterns_overlap(a: str, b: str, files: list[str]) -> bool:
         return False
     if not _has_glob(a) and not _has_glob(b):
         return True
+    for lit, other in ((a, b), (b, a)):  # a literal path is itself the first file both could own
+        if not _has_glob(lit) and owned(lit.rstrip("/"), other):
+            return True
     return any(owned(pr, a) and owned(pr, b)
                for pref in {pa, pb} for pat in (a, b) for pr in _probes(pref, pat))
 
@@ -552,7 +668,7 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
         return errs, warns, []
     if plan.get("base") and not git(repo, "rev-parse", "--verify", "--quiet", plan["base"], check=False):
         errs.append(f"plan.base {plan['base']!r} does not exist")
-    for k in ("verify", "setup", "acceptance", "non_goals", "decisions", "quality_bar"):
+    for k in ("verify", "setup", "acceptance", "non_goals", "decisions", "quality_bar", "assumptions"):
         if k in plan and not (isinstance(plan[k], list) and all(isinstance(x, str) for x in plan[k])):
             errs.append(f"plan.{k} must be a list of strings")
     if not plan.get("acceptance"):
@@ -560,11 +676,24 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
     if not (isinstance(plan.get("definition_of_done"), str) and plan["definition_of_done"].strip()):
         errs.append("plan.definition_of_done is required: what done means, in the user's own words "
                     "(ask them at the start of the grill), kept verbatim")
+    for a in plan.get("assumptions") or []:
+        if isinstance(a, str):
+            warns.append(f"unconfirmed: {a[:200]} (a choice the planner made for the user: put it to "
+                         "them, move it into decisions word for word if they agree, then delete it "
+                         "from assumptions)")
     for c in plan.get("acceptance") or []:
         if isinstance(c, str) and VAGUE.search(c):
             warns.append(f"acceptance criterion is vague ({VAGUE.search(c).group(0)!r}); say what is "
                          f"observable: {c[:80]}")
     errs += [f"plan.{e}" for e in models.validate_plan(plan)]
+    errs += ui_review.validate_ui(plan.get("ui"))
+    ui_paths = (plan.get("ui") or {}).get("paths") if isinstance(plan.get("ui"), dict) else None
+    if isinstance(ui_paths, list) and all(isinstance(x, str) for x in ui_paths) and ui_paths:
+        owns_all = [o for t in plan.get("tasks") or [] for o in t.get("owns") or [] if isinstance(o, str)]
+        for u in ui_paths:  # one entry with a typo is hidden by a good one if only the whole list is checked
+            if owns_all and not any(patterns_overlap(o, u, []) for o in owns_all):
+                warns.append(f"plan.ui.paths entry {u!r} overlaps no task's owns: it only counts if a change "
+                             "lands there; check for a typo")
     tasks = {}
     for i, t in enumerate(plan["tasks"]):
         tid = t.get("id", f"#{i}")
@@ -598,6 +727,11 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
                 MIGRATION_PATH.search(p) for p in t.get("owns", []))) and not t.get("gate"):
             errs.append(f"task {tid}: owns migrations, so it needs a \"gate\" (human approval) — "
                         "add \"gate\": \"<why>\"")
+        if t.get("ui") is not None:
+            if not plan.get("ui"):
+                errs.append(f"task {tid}: \"ui\" pages need plan.ui (the dev command and URL that serve the app)")
+            else:
+                errs += [f"task {tid}: {e}" for e in ui_review.validate_pages(t["ui"], "ui")]
         if t.get("tier") == "T3":
             warns.append(f"task {tid}: T3 subtask; consider splitting it further")
         if len(t.get("done", [])) and not any(re.search(r"\w{4}", d) for d in t["done"]):
@@ -636,6 +770,22 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
                         (warns if ordered else errs).append(
                             msg + (" (ok: they run in order)" if ordered else
                                    "; make one depend on the other or split ownership"))
+    missing_reads = []
+    for tid in ids:
+        for r in tasks[tid].get("reads", []):
+            if any(owned(f, r) for f in files):
+                continue
+            if any(patterns_overlap(r, p, files) for a in anc[tid] | {tid} for p in tasks[a]["owns"]):
+                continue  # an earlier task (or this one) creates it
+            later = [t for t in ids if t != tid and t not in anc[tid]
+                     and any(patterns_overlap(r, p, files) for p in tasks[t]["owns"])]
+            missing_reads.append(
+                f"task {tid} reads {r!r}, which only task {later[0]} creates, and {tid} does not depend "
+                f"on {later[0]}; add depends_on" if later else
+                f"task {tid} reads {r!r}, which matches no tracked file and no earlier task creates it")
+    warns += missing_reads[:8]
+    if len(missing_reads) > 8:
+        warns.append(f"... and {len(missing_reads) - 8} more reads that match nothing")
     hot = scan_hotspots(repo, files)
     for h in hot:
         owners = [t for t in ids if any(owned(h, p) for p in tasks[t]["owns"])]
@@ -745,8 +895,11 @@ def _job_block(plan: dict, repo: Path) -> tuple[list[str], set[str]]:
          "Finish with this JSON report (as your structured output, or as the last fenced block):",
          "```json",
          '{"summary": "what you changed, 1-3 sentences",',
-         ' "interfaces": "types/endpoints/functions others can now use",',
-         ' "notes_for_dependents": "what downstream tasks must know",',
+         ' "interfaces": "for everything other tasks will call: the exact signature or route, '
+         'parameter and field names and types, defaults, and what errors or empty results look like '
+         '(leave out private helpers)",',
+         ' "notes_for_dependents": "what downstream tasks must know, including any new env var, '
+         'config key, DB table or migration, external call or cache this task added (or none)",',
          ' "open_issues": [{"issue": "what is still needed and why", '
          '"kind": "needs_file | needs_decision | fyi", "blocks_acceptance": true, '
          '"files": ["path/that/needs/the/change"]}],',
@@ -951,11 +1104,90 @@ class Job:
         return json.loads((self.dir / "plan.json").read_text())
 
 
-def latest_job() -> str:
-    jobs = sorted(JOBS.glob("*/job.json"), key=lambda p: p.stat().st_mtime)
+def _repo_key(path) -> str:
+    """A repo path as one comparable string: the repository's common git dir, so every linked
+    worktree of a repo (Orca workspaces) gives the same key; the path itself outside a repo."""
+    p = Path(path).expanduser()
+    with contextlib.suppress(Exception):
+        common = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=p,
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+        if common:
+            return str((p / common).resolve())
+    return str(p.resolve())
+
+
+def _job_files(repo=None) -> list[tuple[Path, dict]]:
+    """(job.json, state) for every job, oldest first; with `repo`, only that repo's jobs."""
+    key = _repo_key(repo) if repo is not None else None
+    out = []
+    for f in sorted(JOBS.glob("*/job.json"), key=lambda p: p.stat().st_mtime):
+        try:
+            st = json.loads(f.read_text())
+        except (OSError, ValueError, RecursionError):
+            continue
+        if not isinstance(st, dict):
+            continue
+        if key is None or (st.get("repo") and _repo_key(st["repo"]) == key):
+            out.append((f, st))
+    return out
+
+
+def latest_job(repo=None) -> str:
+    """The newest job, or the newest job of `repo`: without it, a bare `status` in a new session
+    could show another repo's job."""
+    if repo is None:
+        jobs = sorted(JOBS.glob("*/job.json"), key=lambda p: p.stat().st_mtime)
+    else:
+        jobs = [f for f, _ in _job_files(repo)]
     if not jobs:
-        raise SystemExit("no jobs yet")
+        raise SystemExit("no jobs yet" if repo is None else f"no jobs for {Path(repo).expanduser().resolve()}")
     return jobs[-1].parent.name
+
+
+def shown_status(s: dict) -> str:
+    """The job status as `status` shows it: a running job whose process is gone says so."""
+    status = s.get("status") or "?"
+    if status == "running" and s.get("mode") == "orca":
+        return "running (Orca workers; Orca wakes the coordinator when they report)"
+    if status == "running" and not pid_alive(s.get("pid")):
+        return "stopped (process gone)"
+    return status
+
+
+OPEN_HINTS = {  # next step per status, from the outcome table in the orchestrate skill
+    "awaiting_approval": "ask the user about each gated task; only on their yes: resume {job} --approve <task>",
+    "awaiting_human": "put the manager's question to the user word for word, then resume {job} --answer \"<their answer>\"",
+    "advisor_blocked": "show the advisor's findings (report.md) and resolve them, then resume {job}; "
+                       "only the user overrides it",
+    "review_failed": "show the findings in report.md and ask the user: fix and resume {job}, or accept",
+    "failed": "read the failed task's log and report.md, fix plan.json, then resume {job}",
+    "environment": "fix the error in report.md (setup, baseline or plan.ui), then resume {job}",
+    "budget": "ask the user to raise budget_usd, then resume {job}, or stop",
+    "stopped (process gone)": "the process died: resume {job} continues it",
+}
+
+
+def open_jobs(repo) -> list[dict]:
+    """This repo's jobs that are not done and not cleaned, newest first, each with the question or
+    gate it waits on and the next step. Read-only: it never answers anything for the user."""
+    rows = []
+    for f, s in reversed(_job_files(repo)):
+        if s.get("status") == "done" or s.get("cleaned_at"):
+            continue
+        jid = f.parent.name
+        shown = shown_status(s)
+        tasks = s.get("tasks") or {}
+        row = {"job": jid, "status": shown,
+               "updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(f.stat().st_mtime)),
+               "message": (s.get("message") or "").splitlines()[0][:300] if s.get("message") else None,
+               "human_question": s.get("human_question"),
+               "gated": sorted(t for t, x in tasks.items() if x.get("status") == "awaiting_approval"),
+               "failed": sorted(t for t, x in tasks.items() if x.get("status") == "failed"),
+               "next": (OPEN_HINTS.get(shown) or ("wait {job}" if shown.startswith("running")
+                                                  else "see report.md, then resume {job}")).format(job=jid)
+               + (f"; or, if the user drops it: clean {jid}" if not shown.startswith("running") else "")}
+        rows.append({k: v for k, v in row.items() if v not in (None, [])})
+    return rows
 
 
 def pid_alive(pid) -> bool:
@@ -964,6 +1196,20 @@ def pid_alive(pid) -> bool:
         return True
     except (OSError, TypeError, ValueError):
         return False
+
+
+def fresh_run_refusal(plan: dict) -> str | None:
+    """Why `run` can't start plan.job now, or None. Checked before anything else (dashboard, the
+    detached child), so a taken slug fails loudly instead of `wait` reporting an earlier run."""
+    job = Job(plan["job"])
+    if job.state and job.state.get("status") == "done":
+        return f"job {job.id} already finished; pick a new plan.job or `clean {job.id}`"
+    if not job.state:
+        repo = Path(plan["repo"]).expanduser().resolve()
+        if git(repo, "rev-parse", "--verify", "--quiet", f"orchestrate/{job.id}", check=False):
+            return (f"branch orchestrate/{job.id} already exists from an earlier run. "
+                    f"Pick a new plan.job, or delete it: git -C {repo} branch -D orchestrate/{job.id}")
+    return None
 
 
 def start_job(plan: dict, plan_path: Path) -> Job:
@@ -991,6 +1237,7 @@ def start_job(plan: dict, plan_path: Path) -> Job:
                                 "tier": t["tier"]} for t in plan["tasks"]},
         }
     else:  # resume: add new tasks, reset interrupted ones
+        job.state.pop("cleaned_at", None)
         for t in plan["tasks"]:
             st = job.state["tasks"].setdefault(t["id"], {"status": "pending", "title": t["title"],
                                                          "type": t["type"], "tier": t["tier"]})
@@ -1000,6 +1247,7 @@ def start_job(plan: dict, plan_path: Path) -> Job:
                 st["status"] = "pending"  # "stopped": an Orca worker the manager's abort stopped
         job.state["status"] = "running"
     job.save()
+    log_to_job(job.dir)
     return job
 
 
@@ -1118,13 +1366,19 @@ def commit_and_merge(job: Job, plan: dict, task: dict, res: dict,
         git(wt, *ident, "commit", "-q", "-m", f"orchestrate({job.id}): {task['id']}: {task['title']}")
     files = git(wt, "diff", "--name-only", f"{job.state['tasks'][task['id']]['start_sha']}..HEAD").splitlines()
     if files:
+        clear_unfinished_merge(integ)  # an earlier merge cut off mid-verify must not be concluded by this one
+        clean_before = tracked_clean(integ)
         p = subprocess.run(["git", *ident, "merge", "--no-ff", "--no-edit", "-m",
                             f"orchestrate({job.id}): merge {task['id']}", res["branch"]],
                            cwd=integ, capture_output=True, text=True)
         if p.returncode != 0:
-            ok, why = resolve_conflicts(job, plan, task, ident)
+            try:
+                ok, why = resolve_conflicts(job, plan, task, ident, merge_err=(p.stdout + p.stderr)[-1500:])
+            except BaseException:  # a crash or an interrupt mid-resolution never leaves the merge open
+                clear_unfinished_merge(integ, clean_before)
+                raise
             if not ok:
-                git(integ, "merge", "--abort", check=False)
+                clear_unfinished_merge(integ, clean_before)
                 return False, f"merge conflict not resolved: {why}"
     if remove_worktree:  # Orca-managed worktrees are removed through Orca instead
         git(repo, "worktree", "remove", "--force", str(wt), check=False)
@@ -1137,13 +1391,44 @@ def commit_and_merge(job: Job, plan: dict, task: dict, res: dict,
     return True, json.dumps(files)
 
 
-def resolve_conflicts(job: Job, plan: dict, task: dict, ident: list[str]) -> tuple[bool, str]:
+def tracked_clean(integ: Path) -> bool:
+    return not git(integ, "status", "--porcelain", "--untracked-files=no", check=False)
+
+
+def clear_unfinished_merge(integ: Path, clean_before: bool = False) -> None:
+    """The integration worktree belongs to the harness: a merge left open (a failed resolution whose
+    verify rewrote a merged file, or an interrupt during that verify) is aborted, and reset if git
+    can't abort it, so the next `git merge` never concludes it by accident. When the tracked files
+    were clean before this merge, whatever the merge or its verify left in them is reset too, so a
+    later `git add -A` (fix round, cleanup) can't commit it. Untracked and ignored files
+    (screenshots) are kept."""
+    if git(integ, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False):
+        git(integ, "merge", "--abort", check=False)
+        if git(integ, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False):
+            git(integ, "reset", "-q", "--hard", "HEAD", check=False)
+    if clean_before and not tracked_clean(integ):
+        git(integ, "reset", "-q", "--hard", "HEAD", check=False)
+
+
+def resolve_conflicts(job: Job, plan: dict, task: dict, ident: list[str],
+                      merge_err: str = "") -> tuple[bool, str]:
     integ = Path(job.state["integration_wt"])
     conflicted = git(integ, "diff", "--name-only", "--diff-filter=U").splitlines()
+    if not conflicted:  # git refused the merge for another reason: nothing for an integrator to do
+        return False, f"git merge failed without a conflict: {merge_err.strip()[-800:]}"
+    # Only content conflicts (both sides changed the file: UU, AA) can be judged by their markers.
+    # Delete/modify, rename and the like leave no markers, so staging would "resolve" them by
+    # whatever happens to be on disk: those go back to the manager instead.
+    kinds = {line[3:]: line[:2] for line in git(integ, "status", "--porcelain", "--untracked-files=no",
+                                                  "--", *conflicted, check=False).splitlines() if len(line) > 3}
+    structural = sorted(f for f in conflicted if kinds.get(f) not in ("UU", "AA"))
+    if structural:
+        return False, ("conflict git can't show with markers (" + ", ".join(f"{f}: {kinds.get(f, '?')}"
+                       for f in structural) + "): one side deleted or renamed what the other changed")
     log(f"merge conflict for {task['id']} in {conflicted}; handing to integrator subagent")
     reports = {t: s.get("report") for t, s in job.state["tasks"].items() if s.get("report")}
     prompt = f"""ORCHESTRATE_MERGE
-{skill_text('orchestrate-review')}
+{review_skill()}
 
 ---
 You are the INTEGRATOR for job "{job.id}": {plan['goal']}
@@ -1161,18 +1446,58 @@ Reply with the JSON object: resolved (true|false), notes."""
                  settings={"permissions": {"blockWritesOutsideWorkingDirectories": True}},
                  schema=schemas.INTEGRATOR, budget_usd=budget_left(job, plan))
     record_call(job, "integrator", res, task["id"], f"{im}/{ie}")
-    left = git(integ, "diff", "--name-only", "--diff-filter=U").splitlines()
-    markers = [f for f in conflicted if re.search(r"^(<<<<<<<|>>>>>>>) ", read_text(integ / f) or "", re.M)]
-    if left or markers:
-        return False, f"still conflicted: {left or markers}; agent said: {str(res.get('result'))[-300:]}"
+    # The integrator can't run git, so it can't stage: it must say it resolved the conflict, and
+    # its edits must hold no conflict markers; then the harness stages them. (Conflicts without
+    # markers were sent back above, before any model call.)
+    said = res.get("structured") or {}
+    if said.get("resolved") is not True:  # the integrator's own judgement counts: no "yes", no merge
+        return False, f"the integrator did not resolve it: {str(said.get('notes') or res.get('result'))[-300:]}"
+
+    def text(f: str) -> str:
+        try:
+            return (integ / f).read_bytes().decode("utf-8", "replace")
+        except OSError:
+            return ""
+    markers = [f for f in conflicted if re.search(r"^(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|)( |$)", text(f), re.M)]
+    if markers:
+        return False, f"still conflicted: {markers}; agent said: {str(res.get('result'))[-300:]}"
     git(integ, "add", "-A")
+    # Check the resolution before anything starts from it: later tasks run without a baseline, so a
+    # bad merge would show up as the next task's failure and be escalated up the model ladder.
+    cmds = resolution_verify(plan, task, conflicted, job.state["tasks"])
+    # the same environment a worker's verify gets, on a slot no running worker holds
+    busy = {s.get("slot") for t, s in job.state["tasks"].items() if s.get("status") == "running" and t != task["id"]}
+    slot = next(i for i in range(len(busy) + 1) if i not in busy)
+    env = {**os.environ, "ORCHESTRATE_SLOT": str(slot), "ORCHESTRATE_JOB": job.id, "ORCHESTRATE_TASK": task["id"]}
+    for c in cmds:  # commit_and_merge aborts the merge if this is interrupted
+        code, out = sh(c, integ, 1800, env=env)
+        if code:
+            job.state["tasks"][task["id"]]["merge_verify"] = {"cmd": c, "ok": False, "tail": out[-3000:],
+                                                              "files": conflicted}
+            return False, f"integrator resolution fails verify: `{c}`\n{out[-1500:]}"
+    job.state["tasks"][task["id"]]["merge_verify"] = {"cmds": cmds, "ok": True, "files": conflicted}
     git(integ, *ident, "commit", "-q", "--no-edit")
     return True, "resolved"
 
 
+def resolution_verify(plan: dict, task: dict, conflicted: list[str], states: dict) -> list[str]:
+    """Verify commands a conflict resolution must pass: the merging task's, then those of the
+    finished tasks that own a conflicted file (their intent is the other side of the conflict).
+    No duplicates."""
+    cmds = list(task.get("verify") or [])
+    for t in plan["tasks"]:
+        if t["id"] != task["id"] and (states.get(t["id"]) or {}).get("status") == "done" \
+                and any(owned(f, p) for f in conflicted for p in t.get("owns") or []):
+            cmds += t.get("verify") or []
+    return list(dict.fromkeys(cmds))
+
+
 def verify_and_review(job: Job, plan: dict, rnd_no: int) -> tuple[dict, list[dict]]:
-    """Final verify on the integration branch, then a fresh-context review. Returns (verdict, blocking)."""
+    """Final verify on the integration branch, then a fresh-context review. Returns (verdict, blocking).
+    With plan.ui the screenshots are taken first (no tokens): when they can't be taken for a
+    reason outside the code, the round fails closed before the paid code review."""
     integ = Path(job.state["integration_wt"])
+    clear_unfinished_merge(integ)  # never verify or review a half-merged tree
     code, vout = 0, ""
     for c in plan["verify"]:
         code, out = sh(c, integ, 1800)
@@ -1182,23 +1507,58 @@ def verify_and_review(job: Job, plan: dict, rnd_no: int) -> tuple[dict, list[dic
     rnd = {"round": rnd_no, "final_verify_ok": code == 0, "final_verify_tail": vout[-3000:]}
     job.state["review"]["rounds"].append(rnd)
     job.save()
-    verdict = {"verdict": "changes_requested", "summary": "final verify failed",
-               "findings": [{"severity": "blocker", "issue": "final verify failed",
-                             "evidence": vout[-1500:]}]} if code else review(job, plan, vout)
+    ui = ui_capture_step(job, plan, rnd_no, rnd, code == 0) if plan.get("ui") else None
+    if code:
+        verdict = {"verdict": "changes_requested", "summary": "final verify failed",
+                   "findings": [{"severity": "blocker", "issue": "final verify failed",
+                                 "evidence": vout[-1500:]}]}
+    elif ui and ui.get("error") and not ui.get("app_failed"):
+        verdict = ui_failed(job, ui, {"verdict": "changes_requested", "summary": "", "findings": []},
+                            f"UI review could not run: {ui['error']}", code_reviewed=False)
+    else:
+        verdict = review(job, plan, vout)
+        if ui and not ui.get("skipped"):
+            verdict = ui_judge_step(job, plan, ui, verdict)
     rnd["verdict"] = verdict
     blocking = blocking_findings(verdict.get("findings"))
     if not verdict.get("reviewer_error"):
+        # a UI finding is checked by the next round's UI review, not turned into a test criterion
+        # the code reviewer (who sees no screenshots) would have to sign off
         rnd["bar_raised"] = (raise_bar(job, plan, verdict.get("raise_bar") or [], f"reviewer:round{rnd_no}")
                              + raise_bar(job, plan, regression_criteria(
-                                 [f for f in blocking if not str(f.get("issue", "")).startswith("acceptance criterion")],
+                                 [f for f in blocking if not str(f.get("issue", "")).startswith(
+                                     ("acceptance criterion", UI_TAG))],
                                  rnd_no), f"review-finding:round{rnd_no}", BAR_MAX_REGRESSION))
     job.save()
     return verdict, blocking
 
 
-def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) -> None:
-    """One fix subagent on the integration branch (used when the manager is off or defers)."""
+def reviewed_rounds(job: Job) -> int:
+    """Review rounds that produced a verdict. A round that failed closed (no reviewer verdict, a UI
+    review that could not run) doesn't use up plan.review_rounds: after the fix and a resume,
+    the job still gets its fix rounds."""
+    return sum(1 for r in job.state["review"]["rounds"]
+               if r.get("verdict") and not r["verdict"].get("reviewer_error"))
+
+
+def fix_round_context(plan: dict) -> str:
+    """What the user settled, for the fix subagent: the definition of done, the decisions (with
+    answers given during the job) and the non-goals, ahead of the findings."""
+    L = list(done_header(plan))
+    if plan.get("decisions"):
+        L += ["## Decisions already made with the user (follow them; do not revisit)",
+              *[f"- {d}" for d in plan["decisions"]], ""]
+    if plan.get("non_goals"):
+        L += ["## Out of scope for this whole job (do not build these)",
+              *[f"- {n}" for n in plan["non_goals"]], ""]
+    return "\n".join(L)
+
+
+def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) -> bool:
+    """One fix subagent on the integration branch (used when the manager is off or defers).
+    Returns whether it committed anything."""
     integ = Path(job.state["integration_wt"])
+    clear_unfinished_merge(integ)  # its `git add -A` + commit must not conclude a merge left open
     ident = git_ident(Path(job.state["repo"]))
     area = plan.get("area", "cross")
     union = sorted({p for t in plan["tasks"] for p in t["owns"]} | set(plan.get("review_may_edit", [])))
@@ -1207,6 +1567,7 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
              + " ".join(f"--owns {shlex.quote(p)}" for p in union))
     task = ("Fix these review findings on the integration branch of job "
             f"\"{job.id}\" ({plan['goal']}). Do not commit.\n\n"
+            + fix_round_context(plan) + "\n## Findings to fix\n"
             + json.dumps(blocking, indent=2)
             + "\n\nAcceptance criteria for the whole job:\n"
             + "\n".join(f"- {a}" for a in plan.get("acceptance", [])))
@@ -1226,10 +1587,528 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
         record_call(job, "fix_round", {"total_cost_usd": (x.get("cost_usd") or 0) + (x.get("classifier_cost_usd") or 0),
                                        "metrics": x.get("metrics")}, None, x.get("config", ""))
     job.state["review"]["rounds"][-1]["fix"] = {"result": s.get("result"), "steps": s.get("steps")}
+    stray = scope_violations(integ, union)
+    if stray:  # never commit what the fix (or anything else) left outside the job's files
+        log(f"review round {rnd_no}: not committing {len(stray)} path(s) outside the job's files: "
+            + ", ".join(stray[:10]))
+        job.state["review"]["rounds"][-1]["fix"]["not_committed"] = stray
+        for f in stray:
+            if subprocess.run(["git", "cat-file", "-e", f"HEAD:{f}"], cwd=integ, capture_output=True).returncode == 0:
+                git(integ, "checkout", "HEAD", "--", f, check=False)
+            else:
+                with contextlib.suppress(OSError):
+                    (integ / f).unlink()
     git(integ, "add", "-A")
-    if git(integ, "diff", "--cached", "--name-only"):
+    committed = bool(git(integ, "diff", "--cached", "--name-only"))
+    if committed:
         git(integ, *ident, "commit", "-q", "-m", f"orchestrate({job.id}): review fixes round {rnd_no}")
+    job.state["review"]["rounds"][-1]["fix"]["committed"] = committed
     job.save()
+    return committed
+
+
+# --------------------------------------------------------------- ui review ---
+UI_TAG = "[UI] "
+
+
+def ui_capture_step(job: Job, plan: dict, rnd_no: int, rnd: dict, verify_ok: bool) -> dict:
+    """Run plan.ui.dev and screenshot every page (desktop and mobile). No tokens. Returns the
+    round's "ui" dict: "skipped" says why nothing ran, "error" why it could not run."""
+    integ = Path(job.state["integration_wt"])
+    ui = {"ran": False, "skipped": None, "error": None, "app_failed": False, "url": plan["ui"]["url"],
+          "dir": None, "shots": [], "page_failures": [], "restored": [], "verdict": None}
+    rnd["ui"] = ui
+    if not verify_ok:
+        ui["skipped"] = "final verify failed"
+        return ui
+    paths = ui_paths(plan)
+    declared = [t["id"] for t in plan["tasks"] if t.get("ui")
+                and (job.state["tasks"].get(t["id"]) or {}).get("status") == "done"]
+    if paths and not declared:
+        changed = git_paths(integ, "diff", "--name-only", "--no-renames", f"{job.state['base_sha']}..HEAD")
+        if not any(owned(f, p) for f in changed for p in paths):
+            ui["skipped"] = "diff touches no ui.paths"
+            log(f"UI review skipped: the diff touches no ui.paths ({', '.join(paths)}) and no merged task "
+                "declared ui pages")
+            job.save()
+            return ui
+    root = integ / ".orchestrate" / "screenshots"
+    kept = job.state.get("screenshots_root")
+    if kept and Path(kept) != root and Path(kept).is_dir():
+        # a resumed job after `clean`: bring the earlier rounds back next to the new one
+        ui_review.ensure_gitignore(integ)
+        move_screenshots(job, Path(kept), root)
+    job.state["screenshots_root"] = str(root)
+    log(f"UI review (round {rnd_no}): dev server + screenshots")
+    try:
+        got = ui_review.capture(plan, job, rnd_no)
+    except Exception as e:  # noqa: BLE001  (fail closed)
+        got = {"ran": False, "error": f"{type(e).__name__}: {e}"}
+    ui.update({k: got.get(k, ui[k]) for k in ("ran", "error", "app_failed", "dir", "shots",
+                                              "page_failures", "restored")})
+    if not ui["error"] and not ui["shots"] and not ui["page_failures"]:
+        ui["error"] = "no screenshots were taken"
+    job.save()
+    return ui
+
+
+def ui_failed(job: Job, ui: dict, verdict: dict, why: str, code_reviewed: bool = True) -> dict:
+    """The UI review was configured but gave no judgment: the round fails closed, never a pass."""
+    ui["error"] = ui["error"] or why
+    log(f"UI review failed closed: {why}")
+    job.save()
+    return {**verdict, "verdict": "changes_requested", "reviewer_error": True, "summary": why,
+            "not_reviewed": ("the UI has not been reviewed" if code_reviewed
+                             else "neither the code nor the UI has been reviewed"),
+            "findings": list(verdict.get("findings") or []) + [
+                {"severity": "blocker", "issue": f"the UI was not reviewed: {why}"}]}
+
+
+def ui_judge_step(job: Job, plan: dict, ui: dict, verdict: dict) -> dict:
+    """After the code review: the UI reviewer judges the screenshots, and the harness adds what the
+    browser recorded as hard evidence. Its findings join the round's as "[UI] ...". No verdict,
+    or a screenshot left unassessed after one re-ask, fails the round closed. The blocking UI
+    findings of the last reviewed round are put to the reviewer again: each one it does not
+    answer as fixed stays a finding."""
+    if verdict.get("reviewer_error"):
+        ui["skipped"] = "the code review produced no verdict"
+        return verdict
+    found: list[dict] = []
+    if ui.get("app_failed"):
+        found.append({"severity": "blocker", "confidence": "high",
+                      "issue": f"the app does not start any more: `{plan['ui']['dev']}` exited before "
+                               f"{ui['url']} answered, although it started before the job's changes",
+                      "evidence": str(ui.get("error"))[-1500:],
+                      "suggestion": f"see {job.dir / 'logs' / '_devserver.log'}"})
+    earlier = earlier_ui_findings(job)
+    v = None
+    if ui["shots"]:
+        keep: dict = {}
+        v = _ask_reviewer(job, plan, ui_review_prompt(job, plan, ui, earlier), schemas.UI_REVIEW, "ui_reviewer",
+                          cfg=models.role("ui_reviewer", plan), tag="ORCHESTRATE_UI_REVIEW", keep=keep)
+        if v is None:
+            return ui_failed(job, ui, verdict, "the UI reviewer produced no verdict: unparseable or failed output")
+        missing = _unreviewed(ui, v)
+        if missing:
+            log(f"UI reviewer left {len(missing)} of {len(ui['shots'])} screenshot(s) unassessed; asking once more")
+            v2 = _reask_missing(job, plan, keep, missing)
+            if v2 is not None:
+                v = settle_verdict(merge_ui_replies(v, v2))
+        ui["verdict"] = v
+        ui["unreviewed"] = _unreviewed(ui, v)
+        if ui["unreviewed"]:
+            ui["verdict"] = None
+            return ui_failed(job, ui, verdict, f"the UI reviewer did not assess {len(ui['unreviewed'])} of the "
+                                               f"{len(ui['shots'])} screenshots ({', '.join(ui['unreviewed'][:8])})")
+        found += enforce_ui_pages(v)
+        found += earlier_ui_answers(ui, earlier, v)
+    found += ui_evidence_findings(ui, (v or {}).get("expected") or [])
+    found = [enrich_ui_finding(f, ui, Path(job.state["screenshots_root"])) for f in found]
+    merged = list(verdict.get("findings") or []) + [
+        {**f, "issue": f"{UI_TAG}{f.get('issue', '')}"} for f in found]
+    ui["blocking"] = len(blocking_findings(found))
+    job.save()
+    summary = (v or {}).get("summary") or ("the app did not start" if ui.get("app_failed")
+                                           else "every page stopped responding")
+    return {**verdict, "findings": merged, "ui_verdict": (v or {}).get("verdict"),
+            "summary": f"{verdict.get('summary', '')} | UI review: {summary}",
+            "verdict": "changes_requested" if blocking_findings(merged) else "pass"}
+
+
+def merge_ui_replies(v: dict, v2: dict) -> dict:
+    """The first UI reply and the re-ask's, as one: every finding and expected entry of both, and
+    per shot the worse judgement (a shot either reply marked not ok stays not ok) with both
+    replies' observations."""
+    pages: dict[str, dict] = {}
+    for r in (v, v2):
+        for p in r.get("pages") or []:
+            if not isinstance(p, dict):
+                continue
+            sid = str(p.get("shot"))
+            old = pages.get(sid)
+            if old is None:
+                pages[sid] = dict(p)
+                continue
+            obs = [str(x.get("observations", "")).strip() for x in (old, p)]
+            pages[sid] = {**old, "ok": old.get("ok") is True and p.get("ok") is True,
+                          "observations": " | ".join(o for o in dict.fromkeys(obs) if o)}
+    expected = [e for r in (v, v2) for e in r.get("expected") or [] if isinstance(e, dict)]
+    earlier: dict[str, dict] = {}
+    for r in (v, v2):
+        for e in r.get("earlier") or []:
+            if isinstance(e, dict):
+                old = earlier.get(str(e.get("id")))
+                earlier[str(e.get("id"))] = e if old is None else {**e, "fixed": bool(old.get("fixed")) and bool(e.get("fixed"))}
+    return {**v2, "pages": list(pages.values()), "findings": _union_findings(v, v2), "expected": expected,
+            "earlier": list(earlier.values())}
+
+
+def _union_findings(*replies: dict) -> list[dict]:
+    """The findings of every reply, once each (same severity, issue and file)."""
+    out, seen = [], set()
+    for r in replies:
+        for f in r.get("findings") or []:
+            if not isinstance(f, dict):
+                continue
+            k = (str(f.get("severity", "")).lower(), str(f.get("issue", "")).strip(), str(f.get("file", "")).strip())
+            if k not in seen:
+                seen.add(k)
+                out.append(f)
+    return out
+
+
+def _unreviewed(ui: dict, v: dict) -> list[str]:
+    seen = {str(p.get("shot")) for p in v.get("pages") or [] if isinstance(p, dict)}
+    return [s["id"] for s in ui["shots"] if s["id"] not in seen]
+
+
+def _reask_missing(job: Job, plan: dict, keep: dict, missing: list[str]) -> dict | None:
+    """One more turn in the UI reviewer's session for the screenshots it skipped."""
+    if not keep.get("session"):
+        return None
+    root = Path(job.state["screenshots_root"])
+    by_id = {}
+    for s in job.state["review"]["rounds"][-1].get("ui", {}).get("shots") or []:
+        by_id[s["id"]] = s
+    lines = "\n".join(f"- shot: {m}\n  file: {root / by_id[m]['file']}" if m in by_id else f"- shot: {m}"
+                      for m in missing)
+    model, effort = models.role("ui_reviewer", plan)
+    res = claude(f"ORCHESTRATE_UI_REVIEW (missing screenshots)\nYour reply has no `pages` entry for these "
+                 f"screenshots. Open each with Read and judge it like the others:\n{lines}\n\nThen reply with the "
+                 "complete JSON object again: a `pages` entry for every screenshot (these and the ones you "
+                 "already judged), every finding, expected entry, earlier answer, summary and verdict.",
+                 model, effort, Path(job.state["integration_wt"]), perm="dontAsk", tools=["Read", "Grep", "Glob"],
+                 resume=keep["session"], schema=schemas.UI_REVIEW, budget_usd=budget_left(job, plan))
+    record_call(job, "ui_reviewer", res, None, f"{model}/{effort}")
+    v = res.get("structured")
+    return v if isinstance(v, dict) and v.get("verdict") in ("pass", "changes_requested") else None
+
+
+def enforce_ui_pages(v: dict) -> list[dict]:
+    """The UI reviewer's findings, plus one major finding per screenshot it did not mark ok that
+    none of its blocking findings names: a page judged wrong can't pass silently, nor hide
+    behind a blocking finding about another page."""
+    found = [f for f in v.get("findings") or [] if isinstance(f, dict)]
+    blocking = blocking_findings(found)
+    for p in v.get("pages") or []:
+        if isinstance(p, dict) and p.get("ok") is not True \
+                and not _mentions(blocking, {"id": str(p.get("shot"))}):
+            found.append({"severity": "major", "confidence": "medium",
+                          "issue": f"page looks wrong in screenshot {p.get('shot')}: "
+                                   f"{str(p.get('observations', ''))[:400]}"})
+    return found
+
+
+def not_ok_pages(v: dict | None) -> list[dict]:
+    return [p for p in (v or {}).get("pages") or [] if isinstance(p, dict) and p.get("ok") is not True]
+
+
+def _names_shot(text: str, shot: dict) -> bool:
+    """The text names this shot (round-N/name--viewport, or name--viewport) as a whole token: not
+    a mid-flow shot of it (name--viewport--step), nor a page whose name ends with it."""
+    sid = shot["id"]
+    short = sid.split("/", 1)[-1]
+    return bool(re.search(r"(?<![\w-])" + re.escape(sid) + r"(?![\w-])", text)
+                or re.search(r"(?<![\w/-])" + re.escape(short) + r"(?![\w-])", text))
+
+
+def _mentions(findings: list[dict], shot: dict) -> bool:
+    """A finding's issue or evidence names this shot."""
+    return any(_names_shot(f"{f.get('issue', '')} {f.get('evidence', '')}", shot)
+               for f in findings if isinstance(f, dict))
+
+
+def _expected(expected: list, shot: dict, kind: str) -> str | None:
+    """The reviewer's reason when it listed this shot's `kind` of evidence as expected."""
+    for e in expected or []:
+        if isinstance(e, dict) and e.get("kind") == kind and str(e.get("why") or "").strip() \
+                and _names_shot(str(e.get("shot") or ""), shot):
+            return str(e["why"]).strip()
+    return None
+
+
+def ui_evidence_findings(ui: dict, expected: list) -> list[dict]:
+    """What the browser recorded, as findings no reviewer can wave through: a page with no HTTP
+    response or a 5xx is a blocker, so is a page that stopped responding; a 4xx document, a
+    flow step that failed or an uncaught exception is major unless the UI reviewer listed that
+    shot and kind in `expected` with a reason (then it is a minor note with that reason). A
+    finding that merely names the shot waives nothing."""
+    out = []
+    for f in ui.get("page_failures") or []:
+        out.append({"severity": "blocker", "confidence": "high",
+                    "issue": f"{f['name']}--{f['viewport']} ({f['path']}): {f['error']}",
+                    "suggestion": "a script on the page never returns (an endless loop or a blocking call)"})
+
+    def major(s: dict, kind: str, issue: str, evidence: str = "") -> None:
+        why = _expected(expected, s, kind)
+        if why:
+            out.append({"severity": "minor", "confidence": "high",
+                        "issue": f"{issue} (expected, says the UI reviewer: {why[:300]})"})
+        else:
+            out.append({"severity": "major", "confidence": "high", "issue": issue,
+                        **({"evidence": evidence} if evidence else {})})
+
+    for s in ui.get("shots") or []:
+        st, where = s.get("status"), f"{s['id']} ({s.get('path')})"
+        errs = "; ".join((s.get("page_errors") or [])[:2])
+        for name in s.get("missed_shots") or []:  # the state the plan asked to see was never rendered
+            out.append({"severity": "blocker" if s.get("tasks") else "major", "confidence": "high",
+                        "issue": f"{where}: planned screenshot {s.get('name')}--{s.get('viewport')}--{name} "
+                                 f"was never taken: a flow step failed before it",
+                        "evidence": "; ".join((s.get("step_errors") or [])[:2])})
+        if st is None:
+            out.append({"severity": "blocker", "confidence": "high",
+                        "issue": f"{where}: the page got no HTTP response" + (f": {errs}" if errs else "")})
+            continue
+        if isinstance(st, int) and st >= 500:
+            out.append({"severity": "blocker", "confidence": "high", "issue": f"{where}: the page returned HTTP {st}",
+                        "evidence": errs})
+            continue
+        if isinstance(st, int) and st >= 400:
+            major(s, "http_4xx", f"{where}: the page returned HTTP {st}")
+        if s.get("step_errors"):
+            issue = f"{where}: a flow step failed: " + "; ".join(s["step_errors"][:2])
+            if any("were not run" in e for e in s["step_errors"]):  # the reviewer never saw the rest of the flow
+                out.append({"severity": "major", "confidence": "high", "issue": issue})
+            else:
+                major(s, "step_error", issue)
+        if s.get("page_errors"):
+            major(s, "page_error", f"{where}: the page threw an uncaught exception: "
+                                   + _clip_text((s.get("page_errors") or [""])[0], 300),
+                  "; ".join(str(x)[:300] for x in (s.get("page_errors") or [])[1:3]))
+    return out
+
+
+def _clip_text(t, n: int) -> str:
+    t = " ".join(str(t or "").split())
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+
+def earlier_ui_findings(job: Job) -> list[dict]:
+    """The blocking [UI] findings of the last round before this one that produced a verdict, each
+    with an id (E1...) and the shots it named. The next UI review must say whether each is fixed."""
+    rounds = job.state.get("review", {}).get("rounds") or []
+    for r in reversed(rounds[:-1]):
+        v = r.get("verdict") or {}
+        if not v or v.get("reviewer_error"):
+            continue
+        shots = (r.get("ui") or {}).get("shots") or []
+        out = []
+        for f in blocking_findings(v.get("findings")):
+            issue = str(f.get("issue", ""))
+            if not issue.startswith(UI_TAG):
+                continue
+            issue = issue[len(UI_TAG):]
+            named = [s for s in shots if _names_shot(f"{issue} {f.get('evidence', '')}", s)]
+            out.append({"id": f"E{len(out) + 1}", "round": r.get("round"), "severity": f.get("severity"),
+                        "issue": issue, "shots": [{k: s.get(k) for k in ("id", "name", "viewport", "step")}
+                                                  for s in named[:4]]})
+            if len(out) >= 20:
+                break
+        return out
+    return []
+
+
+def earlier_ui_answers(ui: dict, earlier: list[dict], v: dict) -> list[dict]:
+    """A finding for every earlier UI finding the reviewer did not answer as fixed, at its old
+    severity. Recorded in ui["earlier"] for the report."""
+    answers = {str(a.get("id")): a for a in v.get("earlier") or [] if isinstance(a, dict)}
+    out, rows = [], []
+    for e in earlier:
+        a = answers.get(e["id"])
+        fixed = bool(a and a.get("fixed") is True)
+        rows.append({"id": e["id"], "round": e["round"], "issue": e["issue"], "fixed": fixed,
+                     "answered": a is not None, "observations": str((a or {}).get("observations", ""))[:600]})
+        if fixed:
+            continue
+        now = [s["id"] for s in ui.get("shots") or [] for o in e["shots"]
+               if (s.get("name"), s.get("viewport"), s.get("step")) == (o.get("name"), o.get("viewport"), o.get("step"))]
+        what = "still not fixed" if a else "not re-checked by the UI reviewer"
+        out.append({"severity": e.get("severity") or "major", "confidence": "high",
+                    "issue": f"{what} (from round {e['round']}): {e['issue']}"
+                             + (f" (now in {', '.join(now)})" if now else ""),
+                    **({"evidence": rows[-1]["observations"]} if a else {})})
+    ui["earlier"] = rows
+    return out
+
+
+def enrich_ui_finding(f: dict, ui: dict, root: Path) -> dict:
+    """Give a UI finding the screenshots it names (absolute paths) and their browser evidence, so
+    the fix worker (or the Orca worker in another worktree) can open them."""
+    text = f"{f.get('issue', '')} {f.get('evidence', '')}"
+    shots = [s for s in ui.get("shots") or [] if _names_shot(text, s)]
+    if not shots:
+        return f
+    ev = {s["id"]: {k: s.get(k) for k in ("status", "console", "page_errors", "failed_requests", "step_errors")
+                    if s.get(k)} for s in shots[:4]}
+    return {**f, "screenshots": [str(root / s["file"]) for s in shots[:4]],
+            "browser_evidence": json.dumps(ev)[:2000]}
+
+
+UI_REVIEW_BRIEF = """Open every screenshot listed above with Read (it shows you the image) and look at it closely.
+For each shot, write what you see in `pages` (observations first, then `ok`), one entry per shot id:
+every shot, not a sample; a shot with no entry fails the review. A tall page also comes as
+viewport-sized tiles: read the tiles for detail (the full image is scaled down when you view it).
+
+Judge each page against the tasks that declared it, the acceptance criteria and the decisions:
+- Does the page show what those tasks say it should, in a state a user could use?
+- Visible defects: a blank or half-rendered page, a framework error overlay, unstyled content,
+  overlapping or cut-off text, content wider than the viewport (horizontal scroll on mobile),
+  controls off-screen or too small to tap on mobile, broken images, an empty state where data
+  should be, placeholder text, unreadable contrast, misaligned or inconsistent controls.
+- The browser evidence: HTTP status (of the document on screen when the shot was taken),
+  console errors, uncaught exceptions, failed requests, the dialogs the harness accepted, and
+  notes. A step error means a flow the plan describes couldn't be performed (its selector never
+  appeared, or the element was hidden, covered or off-screen): a blocker when that flow is an
+  acceptance criterion, otherwise major, unless the screenshots show the UI is right and only
+  the plan's selector is stale (then minor, and say so). The harness itself adds a major
+  finding for every shot with a 4xx page, a step error or an uncaught exception, and a blocker
+  for a page with no response or a 5xx. When a 4xx, step error or exception is expected (a
+  not-found page on purpose, a stale selector), list it in `expected` with the shot id, the kind
+  (http_4xx, step_error or page_error) and why. Only an `expected` entry waives the harness's
+  finding; a finding that names the shot does not.
+You can Read and Grep the source to point a finding at the file:line that causes it. You can't
+run commands or a browser.
+
+Report every issue you find, including ones you are unsure about: the harness decides what blocks
+from severity and confidence. Severity: blocker = a page is broken, blank, crashes or shows an
+error overlay, or an acceptance criterion is visibly unmet; major = a visible defect a user would
+hit, a broken mobile layout, a flow step that doesn't work; minor = polish only. Give each
+finding the source file (and line) where you can, and a concrete fix. Mention the shot id in the
+issue. When <earlier_findings> lists findings, answer each one in `earlier` (id, what the new
+shot shows, fixed true or false); one with no answer, or not fixed, stays a finding. Reply with
+the JSON object: pages, findings, expected, earlier, summary, verdict."""
+
+
+UI_EVIDENCE_MAX = 24000   # chars of browser evidence in the UI reviewer's prompt, shared by the shots
+UI_EVIDENCE_LIST = 8      # step errors, exceptions, failed requests and notes kept per shot (after folding)
+
+
+def _fold(items, n: int, width: int = 300) -> list[str]:
+    """Repeated lines once, with a count; each line cut to `width`; at most n, then "... and N more"."""
+    counts: dict[str, int] = {}
+    for x in items or []:
+        k = _clip_text(x, width)
+        counts[k] = counts.get(k, 0) + 1
+    rows = [k + (f" (x{c})" if c > 1 else "") for k, c in counts.items()]
+    return rows[:n] + ([f"... and {len(rows) - n} more"] if len(rows) > n else [])
+
+
+def ui_evidence_json(shots: list[dict], limit: int = UI_EVIDENCE_MAX) -> tuple[str, int]:
+    """The browser evidence per shot as JSON, and how many console messages were left out. Every
+    shot keeps its status, step errors, uncaught exceptions, failed requests and notes; console
+    messages (errors before warnings, repeats folded) fill what is left of the shot's share."""
+    share = max(limit // max(len(shots), 1), 800)
+    out, left_out = {}, 0
+    for s in shots:
+        e: dict = {"status": s.get("status")}
+        if s.get("first_status") not in (None, s.get("status")):
+            e["first_document_status"] = s["first_status"]
+        e["title"] = _clip_text(s.get("title"), 160)
+        for k in ("step_errors", "page_errors", "failed_requests", "notes"):
+            if s.get(k):
+                e[k] = _fold(s[k], UI_EVIDENCE_LIST)
+        console = sorted(_fold(s.get("console"), 10 ** 6),
+                         key=lambda m: 0 if re.match(r"\[(error|assert)\b|\[\S+ error\]", m) else 1)
+        used, kept = len(json.dumps(e, ensure_ascii=False)), []
+        for m in console:
+            if used + len(m) + 8 > share:
+                break
+            kept.append(m)
+            used += len(m) + 8
+        if len(kept) < len(console):
+            left_out += len(console) - len(kept)
+            kept.append(f"... and {len(console) - len(kept)} more console message(s) left out")
+        if kept:
+            e["console"] = kept
+        out[s["id"]] = e
+    return json.dumps(out, indent=1, ensure_ascii=False), left_out
+
+
+def earlier_block(earlier: list[dict], ui: dict, root: Path) -> str:
+    """The <earlier_findings> block: last round's blocking UI findings, with this round's shot of
+    the same page and viewport to check each against."""
+    if not earlier:
+        return ""
+    rows = []
+    for e in earlier:
+        now = [s for s in ui.get("shots") or [] for o in e["shots"]
+               if (s.get("name"), s.get("viewport"), s.get("step")) == (o.get("name"), o.get("viewport"), o.get("step"))]
+        rows.append(f"- id: {e['id']} ({e.get('severity')}, round {e['round']}): {_clip_text(e['issue'], 600)}"
+                    + "".join(f"\n  check in: {s['id']} ({root / s['file']})" for s in now))
+    return ("\n<earlier_findings>\nThe last review round found these blocking UI problems, and a fix ran since. "
+            "Check each one in this round's shots and answer it in `earlier`: fixed or not, and what the "
+            "new shot shows. Report anything new as usual.\n"
+            + fence("earlier UI findings", "\n".join(rows), 20000) + "\n</earlier_findings>\n")
+
+
+def ui_review_prompt(job: Job, plan: dict, ui: dict, earlier: list[dict] | None = None) -> str:
+    integ = Path(job.state["integration_wt"])
+    root = Path(job.state["screenshots_root"])
+    stat = git(integ, "diff", "--stat", f"{job.state['base_sha']}..HEAD")
+    sizes = {"desktop": "1440x900 CSS px", "mobile": "390x844 CSS px at DPR 2 (images 780px wide), mobile UA, touch"}
+    shots = []
+    for s in ui["shots"]:
+        tiles = s.get("tiles") or []
+        shots.append(f"- shot: {s['id']}\n  file: {root / s['file']}\n  page: {s['name']} ({s['path']}), "
+                     f"viewport: {s['viewport']}" + (f", taken mid-flow at step \"{s['step']}\"" if s.get("step") else "")
+                     + f"\n  declared by: {', '.join(s.get('tasks') or []) or 'the job (plan.ui.pages)'}"
+                     + (f"\n  tiles (top to bottom, read these for detail): " + ", ".join(str(root / t) for t in tiles)
+                        if tiles else ""))
+    for f in ui.get("page_failures") or []:
+        shots.append(f"- no screenshot: {f['name']}--{f['viewport']} ({f['path']}): {f['error']} "
+                     "(already a blocker finding; nothing to judge)")
+    evidence, left_out = ui_evidence_json(ui["shots"])
+    pages = {}
+    for t in plan["tasks"]:
+        for pg in t.get("ui") or []:
+            pages.setdefault(t["id"], {"title": t.get("title"), "goal": t.get("goal"), "pages": []})["pages"].append(pg)
+    return f"""ORCHESTRATE_UI_REVIEW
+You are the UI REVIEWER for job "{job.id}", with a fresh context. Goal: {plan['goal']}
+The app was started with `{plan['ui']['dev']}` on the job's merged code and served at {ui['url']}.
+Headless Chrome loaded each page in a fresh profile, ran its steps and took a full-page screenshot
+(cut at {ui_review.MAX_SHOT_HEIGHT} CSS px), at these viewports: {'; '.join(f'{k} {v}' for k, v in sizes.items())}.
+The material comes first, then the standard to judge against, then the task.
+
+<screenshots>
+{chr(10).join(shots)}
+</screenshots>
+
+<browser_evidence>
+{fence('browser evidence per shot (HTTP status, title, console, exceptions, failed requests, step errors)', evidence, 2 * len(evidence) + 100)}
+{'Every shot is listed with its status, step errors, exceptions and failed requests. ' + str(left_out) + ' console message(s) were left out to fit (errors are kept before warnings).' + chr(10) if left_out else ''}</browser_evidence>
+{earlier_block(earlier or [], ui, root)}
+<tasks_that_changed_pages>
+{fit_json(pages, 6000) if pages else '(no task declared pages; the job-level pages are listed above)'}
+</tasks_that_changed_pages>
+
+<diff_stat>
+{stat[-3000:]}
+</diff_stat>
+
+<definition_of_done>
+{chr(10).join(done_header(plan))}
+Job acceptance criteria:
+{chr(10).join('- ' + a for a in plan.get('acceptance', [])) or '- (none given: judge against the goal)'}
+</definition_of_done>
+
+<decisions>
+Settled with the user. A violation is a major finding; don't re-argue them.
+{chr(10).join('- ' + d for d in plan.get('decisions', [])) or '- (none recorded)'}
+</decisions>
+
+<non_goals>
+Anything built for these is scope creep.
+{chr(10).join('- ' + n for n in plan.get('non_goals', [])) or '- (none recorded)'}
+</non_goals>
+
+{FENCE_NOTE}
+
+<review_skill>
+{review_skill(ui=True)}
+</review_skill>
+
+{UI_REVIEW_BRIEF}"""
 
 
 # ------------------------------------------------------------------ review ---
@@ -1251,27 +2130,44 @@ def reviewer_cfg(plan: dict) -> tuple[str, str]:
     return models.clamp(old.get("model", m), old.get("effort", e), plan.get("max_model"))
 
 
-def _ask_reviewer(job: Job, plan: dict, prompt: str, schema: dict, role: str) -> dict | None:
-    """One reviewer call, plus one re-ask if the reply doesn't parse. None = no verdict (P0.1)."""
+def _ask_reviewer(job: Job, plan: dict, prompt: str, schema: dict, role: str,
+                  cfg: tuple[str, str] | None = None, tag: str = "ORCHESTRATE_REVIEW",
+                  keep: dict | None = None) -> dict | None:
+    """One reviewer call, plus one re-ask if the reply doesn't parse. None = no verdict (P0.1).
+    `keep` gets the session id, for a follow-up turn."""
     integ = Path(job.state["integration_wt"])
-    model, effort = reviewer_cfg(plan)
+    model, effort = cfg or reviewer_cfg(plan)
     res = claude(prompt, model, effort, integ, perm="dontAsk", tools=["Read", "Grep", "Glob"],
                  schema=schema, budget_usd=budget_left(job, plan))
     record_call(job, role, res, None, f"{model}/{effort}")
+    res = _reask(job, plan, res, (model, effort), schema, tag, role)
+    if keep is not None:
+        keep["session"] = res.get("session_id")
     v = res.get("structured")
-    if not (isinstance(v, dict) and v.get("verdict") in ("pass", "changes_requested")) \
-            and res.get("error_kind") != "budget":
-        res2 = claude("ORCHESTRATE_REVIEW (retry)\nYour reply was not the verdict JSON object. "
-                      "Reply with ONLY that JSON object.",
-                      model, effort, integ, perm="dontAsk", tools=["Read", "Grep", "Glob"],
-                      resume=res.get("session_id"), schema=schema, budget_usd=budget_left(job, plan))
-        record_call(job, role, res2, None, f"{model}/{effort}")
-        v = res2.get("structured")
-        res = res2
-    if not (isinstance(v, dict) and v.get("verdict") in ("pass", "changes_requested")):
+    if not _is_verdict(v):
         job.state.setdefault("review_errors", []).append(str(res.get("result"))[-500:])
         return None
     return v
+
+
+def _is_verdict(v) -> bool:
+    return isinstance(v, dict) and v.get("verdict") in ("pass", "changes_requested")
+
+
+def _reask(job: Job, plan: dict, res: dict, cfg: tuple[str, str], schema: dict, tag: str, role: str) -> dict:
+    """A reviewer reply with no verdict object gets one re-ask in the same session (not when the
+    budget ran out, and not without a session: a fresh session would get only the retry line and
+    review nothing). Returns the reply to use. Main thread only: record_call updates job state."""
+    if _is_verdict(res.get("structured")) or res.get("error_kind") == "budget" or not res.get("session_id"):
+        return res
+    model, effort = cfg
+    res2 = claude(f"{tag} (retry)\nYour reply was not the verdict JSON object. "
+                  "Reply with ONLY that JSON object.",
+                  model, effort, Path(job.state["integration_wt"]), perm="dontAsk",
+                  tools=["Read", "Grep", "Glob"], resume=res.get("session_id"), schema=schema,
+                  budget_usd=budget_left(job, plan))
+    record_call(job, role, res2, None, f"{model}/{effort}")
+    return res2
 
 
 EDGE_CASE_BRIEF = """Edge cases (check ALL of them, not a sample): for every behaviour this diff adds or changes,
@@ -1304,6 +2200,34 @@ def enforce_edge_cases(v: dict) -> dict:
     if added:
         v = {**v, "verdict": "changes_requested", "findings": list(v.get("findings") or []) + added}
     return v
+
+
+def _issue_words(text) -> list[str]:
+    return re.findall(r"[a-z0-9_]{4,}", str(text or "").lower())
+
+
+def covering_finding(f: dict, findings: list[dict]) -> dict | None:
+    """The finding among `findings` that already says what `f` says: the same file, the same line
+    when both give one, every identifier f names (a word with `_`, a digit or an inner capital)
+    in its issue too, and at least 60% of f's issue words in its issue (the rule
+    enforce_edge_cases uses). Only used to TAG a likely repeat (possible_duplicate_of): a word
+    match can't tell two different bugs apart, and a duplicate costs less than a lost blocker."""
+    words = _issue_words(f.get("issue"))
+    if not words:
+        return None
+    idents = {w for w in re.findall(r"[A-Za-z0-9_]{4,}", str(f.get("issue") or ""))
+              if "_" in w or re.search(r"\d", w) or re.search(r"[a-z][A-Z]", w)}
+    for g in findings:
+        if not (isinstance(g, dict) and (g.get("file") or "") == (f.get("file") or "")):
+            continue
+        if isinstance(f.get("line"), int) and isinstance(g.get("line"), int) and f["line"] != g["line"]:
+            continue
+        text = " ".join(_issue_words(g.get("issue")))
+        if any(w.lower() not in text for w in idents):
+            continue
+        if sum(w in text for w in words) / len(words) >= 0.6:
+            return g
+    return None
 
 
 def blocking_findings(findings) -> list[dict]:
@@ -1353,12 +2277,74 @@ def enforce_acceptance(plan: dict, v: dict) -> dict:
     return v
 
 
+STALE_DOC_MAX = 20
+
+
+def stale_doc_refs(integ: Path, base: str) -> list[str]:
+    """Lines in tracked Markdown files that still name a path this job deleted or renamed away
+    (`file:line:text`), skipping docs the job itself changed. At most STALE_DOC_MAX. Paths only:
+    symbols depend on the language and match too much. A path counts only as a whole token
+    (`api.py` is not named by `legacy_api.py`). Cleanup can't edit an untouched doc, so the
+    reviewer gets these and a stale one becomes a small fix task."""
+    p = subprocess.run(["git", "-c", "core.quotePath=off", "diff", "-M", "--name-status", "-z", f"{base}..HEAD"],
+                       cwd=integ, capture_output=True)
+    fields = [x for x in p.stdout.decode("utf-8", errors="surrogateescape").split("\0")]
+    gone, touched, i = [], set(), 0
+    while i < len(fields) and fields[i]:
+        st = fields[i]
+        n = 2 if st[:1] in ("R", "C") else 1
+        paths = fields[i + 1:i + 1 + n]
+        i += 1 + n
+        touched.update(paths)
+        if st[:1] in ("D", "R") and paths:
+            gone.append(paths[0])
+    gone = list(dict.fromkeys(gone))
+    if not gone:
+        return []
+    with tempfile.NamedTemporaryFile("w", suffix=".pat", delete=False, encoding="utf-8",
+                                     errors="surrogateescape") as fh:
+        fh.write("\n".join(gone) + "\n")
+    try:
+        out = subprocess.run(["git", "-c", "core.quotePath=off", "grep", "-n", "-F", "-f", fh.name, "--", "*.md"],
+                             cwd=integ, capture_output=True).stdout.decode("utf-8", errors="replace")
+    finally:
+        os.unlink(fh.name)
+    alone = [re.compile(r"(?:(?<=\./)|(?<![\w./-]))" + re.escape(g) + r"(?![\w-])") for g in gone]
+    hits: list[str] = []
+    for h in out.splitlines():
+        parts = h.split(":", 2)
+        if len(parts) < 3 or parts[0] in touched or h in hits:
+            continue
+        if not any(r.search(parts[2]) for r in alone):
+            continue
+        hits.append(h[:300])
+        if len(hits) >= STALE_DOC_MAX:
+            break
+    return hits
+
+
+def stale_docs_block(refs: list[str]) -> str:
+    """The reviewer prompt's <stale_doc_refs> block; empty when nothing is stale."""
+    if not refs:
+        return ""
+    return ("<stale_doc_refs>\nThese lines in docs the job did not change still name a file the job deleted or "
+            "renamed. Check them under check 8 and report each stale one as a finding at the usual severity "
+            "(a stale path in AGENTS.md or CLAUDE.md is normally major: those files are inlined into "
+            "every later brief).\n" + fence("doc lines naming removed paths", "\n".join(refs), 8000)
+            + "\n</stale_doc_refs>\n\n")
+
+
 def review(job: Job, plan: dict, verify_out: str) -> dict:
     integ = Path(job.state["integration_wt"])
     base = job.state["base_sha"]
     diff = git(integ, "diff", f"{base}..HEAD")
     limit = int(plan.get("review_diff_chars", 120000))
-    v = review_once(job, plan, verify_out, diff) if len(diff) <= limit else review_by_area(job, plan, verify_out, limit)
+    refs = stale_doc_refs(integ, base)
+    rounds = job.state.get("review", {}).get("rounds") or []
+    if refs and rounds:
+        rounds[-1]["stale_doc_refs"] = refs
+    v = review_once(job, plan, verify_out, diff, refs) if len(diff) <= limit \
+        else review_by_area(job, plan, verify_out, limit, refs)
     return v if v.get("reviewer_error") else settle_verdict(enforce_acceptance(plan, enforce_edge_cases(v)))
 
 
@@ -1405,7 +2391,8 @@ a finding). The bar only goes up, so propose additions, not relaxations.
 </how_to_review>"""
 
 
-def review_once(job: Job, plan: dict, verify_out: str, diff: str | None = None) -> dict:
+def review_once(job: Job, plan: dict, verify_out: str, diff: str | None = None,
+                stale: list[str] | None = None) -> dict:
     integ = Path(job.state["integration_wt"])
     base = job.state["base_sha"]
     stat = git(integ, "diff", "--stat", f"{base}..HEAD")
@@ -1435,8 +2422,8 @@ The material comes first, then your playbook and the standard to judge against, 
 {fence('verify output', verify_out[-2000:], 2500)}
 </verify_output>
 
-<playbook>
-{skill_text('orchestrate-review')}
+{stale_docs_block(stale or [])}<playbook>
+{review_skill()}
 </playbook>
 
 {_review_header(job, plan)}
@@ -1449,12 +2436,12 @@ every finding in `findings`."""
     return v if v is not None else no_verdict("unparseable or failed reviewer output")
 
 
-def review_by_area(job: Job, plan: dict, verify_out: str, limit: int) -> dict:
+def review_by_area(job: Job, plan: dict, verify_out: str, limit: int, stale: list[str] | None = None) -> dict:
     """Big diffs: one reviewer per area in parallel, then an integration reviewer over their
     verdicts and the cross-area interface surface (meta-review, P3.3). Nothing is truncated away."""
     integ = Path(job.state["integration_wt"])
     base = job.state["base_sha"]
-    changed = git(integ, "diff", "--name-only", f"{base}..HEAD").splitlines()
+    changed = git_paths(integ, "diff", "--name-only", "--no-renames", f"{base}..HEAD")
     areas: dict[str, list[str]] = {}
     for f in changed:
         t = next((t for t in plan["tasks"] if any(owned(f, p) for p in t["owns"])), None)
@@ -1487,7 +2474,7 @@ The material comes first, then your playbook and the standard, then the task.
 </task_reports>
 
 <playbook>
-{skill_text('orchestrate-review')}
+{review_skill()}
 </playbook>
 
 {_review_header(job, plan)}
@@ -1504,10 +2491,12 @@ verdict."""
                              budget_usd=budget_left(job, plan)) for a, fs in areas.items()}
         results = {a: f.result() for a, f in futs.items()}
     area_v = {}
-    for a, res in results.items():
+    for a, res in results.items():  # main thread: record_call and the re-ask update job state
         record_call(job, "reviewer_area", res, None, f"{am}/{ae}")
+        res = _reask(job, plan, res, (am, ae), schemas.AREA_REVIEW, "ORCHESTRATE_REVIEW_AREA", "reviewer_area")
         v = res.get("structured")
-        if not (isinstance(v, dict) and v.get("verdict") in ("pass", "changes_requested")):
+        if not _is_verdict(v):
+            job.state.setdefault("review_errors", []).append(f"area {a}: {str(res.get('result'))[-500:]}")
             return no_verdict(f"area reviewer for {a} returned no verdict")
         area_v[a] = enforce_edge_cases(v)
     surface = [f for f in changed if INTERFACE_FILE.search(f)]
@@ -1536,8 +2525,8 @@ first, then your playbook and the standard, then the task.
 {ctx['reports']}
 </task_reports>
 
-<playbook>
-{skill_text('orchestrate-review')}
+{stale_docs_block(stale or [])}<playbook>
+{review_skill()}
 </playbook>
 
 {_review_header(job, plan)}
@@ -1549,11 +2538,19 @@ matter."""
     v = _ask_reviewer(job, plan, prompt, schemas.REVIEW, "reviewer")
     if v is None:
         return no_verdict("integration reviewer returned no verdict")
-    seen = {(f.get("file"), f.get("issue")) for f in v.get("findings", [])}
+    own = [g for g in v.get("findings") or [] if isinstance(g, dict)]  # the integration reviewer's, before any area's
     for a, av in area_v.items():
         for f in av.get("findings", []):
-            if f.get("severity") in ("blocker", "major") and (f.get("file"), f.get("issue")) not in seen:
-                v.setdefault("findings", []).append({**f, "area": a})
+            if not isinstance(f, dict) or f.get("severity") not in ("blocker", "major"):
+                continue
+            # An area's blocker or major is never dropped on a word match: "the delete endpoint
+            # skips the owner check" and "the update endpoint skips the owner check" share 8 of 9
+            # words. A likely repeat is kept and tagged, so the fix round can treat the two as one.
+            same = covering_finding(f, own)
+            entry = {**f, "area": a}
+            if same is not None:
+                entry["possible_duplicate_of"] = str(same.get("issue") or "")[:200]
+            v.setdefault("findings", []).append(entry)
     if any(f.get("severity") in ("blocker", "major") for f in v.get("findings", [])):
         v["verdict"] = "changes_requested"
     v["areas"] = {a: av.get("summary") for a, av in area_v.items()}
@@ -1572,12 +2569,25 @@ what the user defined as done:
 - Is each task's `done` strong enough, and do its `verify` commands actually prove it?
 - Ownership, dependencies and ordering: will parallel tasks collide or wait on the wrong thing?
 - Risks the plan ignores: migrations, auth, data loss, compatibility, shared files.
+- Open choices: could an agent holding only its task's brief (plus the decisions and the glossary)
+  start coding without choosing something another task or the user will depend on: an endpoint
+  path or payload shape, field or table names, error codes, a limit, the behaviour of an edge case
+  that `done` names? Each such choice is a finding, major when two tasks must agree on it or the
+  user would notice it. The suggestion is the `interfaces` text to write down, or the question to
+  put to the user when it is a product decision. Ordinary implementation latitude, which only the
+  task itself depends on, is not a finding.
+- Scope: does any task build something the definition of done and the acceptance criteria don't
+  need? Building something a non-goal rules out is major; other extra work is minor. A smaller
+  approach that contradicts a recorded decision is not a finding: decisions are settled.
 Read the repo as much as you need to check these against the code.""",
     "final": """The reviewer already passed this work; you are the last check before the branch is pushed or
 merged. Judge whether it is done by the user's definition, not merely whether it compiles:
 - Is every acceptance criterion really met, with evidence a skeptic would accept?
 - Edge cases, error paths and integration points the reviewer may have missed.
 - Anything half-wired, left behind (debug code, TODOs, dead code), or outside the job's scope.
+- Shortcuts that make the tests or the demo pass without the behaviour: a hardcoded result where a
+  lookup or computation is needed, a branch on a test fixture's input, a fallback that returns
+  canned data. A passing test is no evidence for these.
 Read the diff and any file you need.""",
 }
 ADVICE_TAIL = """Report every problem you find, including ones you are unsure about: the harness decides what
@@ -1646,13 +2656,15 @@ def advise(stage: str, plan: dict, cwd: Path, body: str, *, budget=lambda: None,
     for eff in efforts:
         res = claude(prompt, model, eff, cwd, perm="dontAsk", tools=["Read", "Grep", "Glob"],
                      schema=schemas.ADVICE, budget_usd=budget(), timeout=1800)
+        res["escalated"] = eff != effort  # the re-check, not the advisor's own effort
         on_call(res, f"{model}/{eff}")
         v = res.get("structured")
-        if not _advice_ok(v) and res.get("error_kind") != "budget":
+        if not _advice_ok(v) and res.get("error_kind") != "budget" and res.get("session_id"):
             res = claude("ORCHESTRATE_ADVISE (retry)\nYour reply was not the advice JSON object. "
                          "Reply with ONLY that JSON object.", model, eff, cwd, perm="dontAsk",
                          tools=["Read", "Grep", "Glob"], resume=res.get("session_id"),
                          schema=schemas.ADVICE, budget_usd=budget(), timeout=600)
+            res["escalated"] = eff != effort
             on_call(res, f"{model}/{eff}")
             v = res.get("structured")
         if not _advice_ok(v):
@@ -1761,8 +2773,10 @@ def plan_gate(job: Job, plan: dict) -> int | None:
         lines = "\n".join(f"- [{f.get('severity')}] {f.get('issue')}"
                           + (f" ({f['file']})" if f.get("file") else "")
                           + (f": {f['suggestion']}" if f.get("suggestion") else "") for f in blocking)
+        read = (a.get("done_restated") or "").strip()
         return finish(job, plan, "advisor_blocked",
-                      f"the advisor says revise the plan before running it: {a.get('summary', '')}\n{lines}\n"
+                      f"the advisor says revise the plan before running it: {a.get('summary', '')}\n"
+                      + (f"The advisor read done as: {read}\n" if read else "") + f"{lines}\n"
                       f"Fix {job.dir / 'plan.json'} and `orchestrate.py resume {job.id}` (the advisor checks "
                       f"again), or, if the user decides to run it as is, "
                       f"`orchestrate.py resume {job.id} --approve advisor:plan`.")
@@ -1786,20 +2800,60 @@ dead. Don't run git. If nothing needs cleaning, change nothing. Reply with the J
 changed (bool), removed (what you removed, one line each), notes."""
 
 
+def ui_paths(plan: dict) -> list[str]:
+    """plan.ui.paths as git prints paths. validate rejects './web/**' and stray spaces; a plan.json
+    written before that check is normalised here, so it can't skip every UI review silently."""
+    raw = (plan.get("ui") or {}).get("paths") or []
+    out = []
+    for x in raw:
+        x = str(x).strip()
+        while x.startswith("./"):
+            x = x[2:]
+        if x and x != ".":
+            out.append(x)
+    return out
+
+
+def cleanup_ui_files(plan: dict, files: list[str]) -> set[str]:
+    """With plan.ui, the changed files the screenshots depend on: those under ui.paths and those
+    owned by a task that declared ui pages. Without ui.paths every change counts (that is what
+    leaving ui.paths out means: every diff gets a UI review)."""
+    ui = plan.get("ui")
+    if not ui:
+        return set()
+    paths = ui_paths(plan)
+    if not paths:
+        return set(files)
+    owns = [p for t in plan.get("tasks") or [] if t.get("ui") for p in t.get("owns") or []]
+    return {f for f in files if any(owned(f, p) for p in [*paths, *owns])}
+
+
 def cleanup_pass(job: Job, plan: dict) -> dict:
     """Cleanup subagent (models.role("cleanup")) on the integration branch. Kept only if it stays
     inside the job's files and the job's verify still passes; otherwise reverted."""
     integ = Path(job.state["integration_wt"])
+    clear_unfinished_merge(integ)
     base = job.state["base_sha"]
     head = git(integ, "rev-parse", "HEAD")
     prev = job.state.get("cleanup") or {}
     if prev.get("head") == head:
         return prev  # already cleaned this exact head
-    files = git(integ, "diff", "--name-only", "--diff-filter=AMR", f"{base}..HEAD").splitlines()
+    files = git_paths(integ, "diff", "--name-only", "--no-renames", "--diff-filter=AM", f"{base}..HEAD")
     if not files:
         return {"head": head, "result": "nothing to clean"}
+    ui_files = cleanup_ui_files(plan, files)
+    if ui_files:
+        # the screenshots were judged on this head: an edit to a file the UI is built from would
+        # ship a UI nobody looked at, so cleanup leaves those files alone
+        files = [f for f in files if f not in ui_files]
+        if not files:
+            out = {"head": head, "result": f"nothing to clean: all {len(ui_files)} changed file(s) can change "
+                                           "the screenshots the UI reviewer judged, so cleanup leaves them alone"}
+            job.state["cleanup"] = out
+            job.save()
+            return out
     def untracked() -> set[str]:
-        return set(git(integ, "ls-files", "--others", "--exclude-standard").splitlines())
+        return set(git_paths(integ, "ls-files", "--others", "--exclude-standard"))
 
     before = untracked()
     m, e = models.role("cleanup", plan)
@@ -1812,7 +2866,7 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
     record_call(job, "cleanup", res, None, f"{m}/{e}")
     out = {"config": f"{m}/{e}", "report": res.get("structured") or {}}
     new_files = untracked() - before
-    touched = sorted(set(git(integ, "diff", "--name-only", "HEAD").splitlines()) | new_files)
+    touched = sorted(set(git_paths(integ, "diff", "--name-only", "--no-renames", "HEAD")) | new_files)
 
     def revert(why: str) -> None:
         git(integ, "reset", "-q", "--hard", "HEAD")
@@ -1822,10 +2876,13 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
         log(f"cleanup reverted: {why}")
 
     outside = [f for f in touched if f not in files]
+    if ui_files:
+        out["ui_files_left_alone"] = len(ui_files)
     if not touched:
         out["result"] = "no changes"
     elif outside:
-        revert(f"edited files outside the job's diff: {outside[:10]}")
+        revert(f"edited files it may not edit (outside the job's diff, or UI files the screenshots were "
+               f"judged on): {outside[:10]}")
     else:
         for c in plan["verify"]:
             code, vout = sh(c, integ, 1800)
@@ -1890,7 +2947,7 @@ def guard_snapshot() -> str:
 MANAGER_DEFAULTS = {"enabled": True, "model": models.ROLES["manager"][0],
                     "effort": models.ROLES["manager"][1], "max_interventions": 12, "max_task_retries": 2}
 TASK_FIELDS = ("id", "title", "goal", "type", "tier", "owns", "reads", "depends_on", "interfaces",
-               "done", "verify", "gate", "baseline")
+               "done", "verify", "gate", "baseline", "ui")
 # event fields written by subagents, logs or reviewers: shown to the manager only inside fences
 UNTRUSTED_KEYS = ("open_issues", "report", "final_message", "log_tail", "error", "findings", "summary")
 TRIVIAL_VERIFY = re.compile(r"^\s*(true|:|exit 0|echo\b.*|printf\b.*|test 1|\[ 1 \])\s*$")
@@ -2132,6 +3189,18 @@ def apply_actions(job: Job, plan: dict, decision: dict, event: dict) -> dict:
                 errs.append(f"split {tid}: the pieces drop done criteria {dropped}; keep each in at "
                             "least one piece (the bar only rises)")
                 continue
+            if old.get("ui"):  # the pages the user confirmed stay screenshotted
+                if not any(x.get("ui") for x in parts):
+                    for x in parts:
+                        x["ui"] = json.loads(json.dumps(old["ui"]))
+                else:
+                    key = lambda pg: (pg.get("path"), json.dumps(pg.get("steps") or [], sort_keys=True))  # noqa: E731
+                    have = {key(pg) for x in parts for pg in x.get("ui") or [] if isinstance(pg, dict)}
+                    lost_ui = [pg.get("path") for pg in old["ui"] if isinstance(pg, dict) and key(pg) not in have]
+                    if lost_ui:
+                        errs.append(f"split {tid}: the pieces drop ui pages {lost_ui}; keep each (same path "
+                                    "and steps) in at least one piece, or leave `ui` out to keep them all")
+                        continue
             for x in parts:
                 x.setdefault("depends_on", list(old.get("depends_on", [])))
                 if old.get("gate") and not x.get("gate"):
@@ -2618,6 +3687,35 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     return None
 
 
+ANSWER_QUESTION_MAX = 2000   # chars of the manager's question kept with the user's answer
+_TAGLIKE = re.compile(r"</?\s*[A-Za-z_][\w.:-]*(?:\s[^<>\n]*)?/?>")
+
+
+def _decision_text(text) -> str:
+    """One line for plan.decisions: sanitized, whitespace and newlines collapsed, and anything
+    shaped like a tag (`</decisions>`) shown with ‹ › instead, since the entry is pasted inside
+    such tags in every later prompt."""
+    t = _TAGLIKE.sub(lambda m: "‹" + m.group()[1:-1] + "›", sanitize(str(text or ""), 10 ** 6))
+    return " ".join(t.split())
+
+
+def record_answer(job: Job, plan: dict, question, answer: str) -> None:
+    """The user's answer to the manager's question is a decision: it joins plan.decisions, so later
+    briefs, the manager, the reviewers and the advisor hold the work to it. The question goes with
+    it, so a short answer ("yes", "option B") keeps its meaning. Only the user's own words are
+    added, never the manager's, and never twice."""
+    q = _decision_text(question)
+    if len(q) > ANSWER_QUESTION_MAX:  # the question and its options come last: keep the end
+        q = "…" + q[-(ANSWER_QUESTION_MAX - 1):]
+    entry = f"{q} -> {_decision_text(answer)} (decided by the user during job {job.id})"
+    if entry in (plan.get("decisions") or []):
+        return
+    plan.setdefault("decisions", []).append(entry)
+    job.state.setdefault("decisions_added", []).append(entry)
+    write_json(job.dir / "plan.json", plan)
+    job.save()
+
+
 def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
                 skip_baseline: bool, answer: str | None = None) -> int | None:
     """Everything before the first task, shared by both worker modes: setup and baseline on the
@@ -2625,6 +3723,10 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
     plan check. Returns an exit code to stop, or None to start tasks."""
     job.state["approved"] = sorted(set(job.state.get("approved", [])) | set(approve))
     job.save()
+    if plan.get("ui") and not ui_review.find_chrome():
+        return finish(job, plan, "environment",
+                      f"plan.ui asks for a UI review, but {ui_review.chrome_missing()}. Install it (or drop "
+                      f"plan.ui), then `orchestrate.py resume {job.id}`.")
     repo = Path(job.state["repo"])
     if git(repo, "status", "--porcelain"):
         log("note: your checkout has uncommitted changes; the job starts from the last commit "
@@ -2642,6 +3744,19 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
                               f"job baseline fails BEFORE any change: `{c}`\n{out[-3000:]}\n"
                               "Fix the environment, or set plan.baseline to commands that pass now.")
         job.state["baseline_ok"] = True
+        job.state.pop("baseline_skipped", None)  # an earlier --skip-baseline: it has run now
+        job.save()
+    elif skip_baseline and not job.state.get("baseline_ok"):
+        job.state["baseline_skipped"] = True  # kept on resume: report.md says the baseline never ran
+        job.save()
+    if plan.get("ui") and not job.state.get("ui_preflight_ok"):
+        # the UI review runs after every task: check its dev server now, before any token is spent
+        log(f"UI preflight: starting `{plan['ui']['dev']}` once on the code as it is now")
+        why = ui_review.preflight(plan, job)
+        if why:
+            return finish(job, plan, "environment",
+                          f"plan.ui: {why}\nFix it (or drop plan.ui), then `orchestrate.py resume {job.id}`.")
+        job.state["ui_preflight_ok"] = True
         job.save()
 
     if job.state.get("human_question"):
@@ -2650,6 +3765,7 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
                           f"still waiting for your answer: {job.state['human_question']}\n"
                           f"Answer with: orchestrate.py resume {job.id} --answer \"...\"")
         q = job.state.pop("human_question")
+        record_answer(job, plan, q, answer)
         r = manage(job, plan, {"kind": "human_answer", "question": q, "answer": answer})
         if r.get("hint") == "ask_human":
             job.state["human_question"] = r.get("question")
@@ -2674,22 +3790,26 @@ def review_round(job: Job, plan: dict) -> int | str:
     log(f"all tasks merged; final verify + review (round {rnd_no})")
     verdict, blocking = verify_and_review(job, plan, rnd_no)
     if verdict.get("reviewer_error"):
+        what = verdict.get("not_reviewed")
         return finish(job, plan, "review_failed",
-                      f"{verdict.get('summary')}. The work is on {job.state['branch']} but has not "
-                      f"been reviewed. Resume with `orchestrate.py resume {job.id}` to review again.")
+                      f"{verdict.get('summary')}. The work is on {job.state['branch']} but "
+                      + (what or "has not been reviewed")
+                      + f". Fix that and resume with `orchestrate.py resume {job.id}` to review again "
+                        "(a round that could not review doesn't count toward review_rounds).", resumable=True)
+    reviewed = reviewed_rounds(job)
     source = "reviewer"
     if not blocking:
         blocking, err = final_gate(job, plan, rnd_no, verdict)
         if err:
             return finish(job, plan, "review_failed",
-                          f"{err}. Resume with `orchestrate.py resume {job.id}` to ask again.")
+                          f"{err}. Resume with `orchestrate.py resume {job.id}` to ask again.", resumable=True)
         if not blocking:
             return finish(job, plan, "done", "")
         source = "advisor"
         verdict = {"summary": f"advisor (final check): {job.state['review']['rounds'][-1]['advisor'].get('summary', '')}"}
-    if rnd_no >= rounds:
+    if reviewed >= rounds:
         return finish(job, plan, "review_failed",
-                      f"the {source} still requests changes after {rnd_no} round(s): {verdict.get('summary', '')}")
+                      f"the {source} still requests changes after {reviewed} round(s): {verdict.get('summary', '')}")
     r = manage(job, plan, {"kind": "review_changes_requested", "round": rnd_no, "source": source,
                            "summary": verdict.get("summary"), "findings": blocking,
                            "final_verify_ok": job.state["review"]["rounds"][-1]["final_verify_ok"]})
@@ -2745,23 +3865,37 @@ def run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
             return r
         if r == "fix_round":
             owed = job.state["review"].pop("owed_fix")
-            legacy_fix_round(job, plan, owed["round"], owed["findings"])
+            if not legacy_fix_round(job, plan, owed["round"], owed["findings"]):
+                # the same code again would only get a fresh reviewer's second opinion on it
+                return finish(job, plan, "review_failed",
+                              f"the fix subagent changed nothing, so round {owed['round']}'s findings still "
+                              "stand:\n" + "\n".join(f"- [{f.get('severity')}] {f.get('issue')}"
+                                                     for f in owed["findings"][:8])
+                              + f"\nFix them on {job.state['branch']} and resume with "
+                                f"`orchestrate.py resume {job.id}` to review again, or accept them.")
 
 
 TERMINAL = ("done", "review_failed", "failed")
 
 
-def finish(job: Job, plan: dict, status: str, message: str) -> int:
+def finish(job: Job, plan: dict, status: str, message: str, resumable: bool = False) -> int:
+    """End this run of the job. A terminal status records the task totals and the advisor's
+    yield (each finish replaces the job's earlier rows, so a resumed job counts once, as it
+    ended) and extracts lessons once. `resumable`: the round could not run (no reviewer or
+    advisor answer); nothing was judged, so no lessons yet."""
     job.state.update(status=status, message=message, finished=time.time())
     job.save()
-    if status in TERMINAL and not job.state.get("closed"):
+    if status in TERMINAL and not resumable and not job.state.get("closed"):
         job.state["closed"] = True
         try:
             extract_lessons(job, plan)
         except Exception as e:  # noqa: BLE001  (lessons are best-effort)
             log(f"lesson extraction skipped: {e}")
-        record_task_totals(job, plan)
         job.save()
+    if status in TERMINAL:
+        record_task_totals(job, plan)
+    if status in TERMINAL or status == "advisor_blocked":
+        record_advisor_yield(job)
     report = render_report(job, plan)
     (job.dir / "report.md").write_text(report)
     print(report)
@@ -2858,8 +3992,10 @@ def job_metrics(state: dict) -> dict:
     calls = state.get("calls", [])
     task_cost = sum(s.get("cost_usd") or 0 for s in tasks.values())
     by_role: dict[str, float] = {}
+    calls = [c for c in calls if isinstance(c, dict)]
     for c in calls:
-        by_role[c["role"]] = by_role.get(c["role"], 0) + (c.get("cost_usd") or 0)
+        role = str(c.get("role"))  # a key of one type: odd state must not break sorting or JSON
+        by_role[role] = by_role.get(role, 0) + (c.get("cost_usd") if isinstance(c.get("cost_usd"), (int, float)) else 0)
     if not calls:
         by_role = {"subagent": task_cost, "other (manager/review, not itemised)": state.get("cost_usd", 0) - task_cost}
     total = state.get("cost_usd", 0) or 0
@@ -2872,7 +4008,7 @@ def job_metrics(state: dict) -> dict:
     inp = sum((c.get("input") or 0) for c in model_calls)
     cr = sum((c.get("cache_read") or 0) for c in model_calls)
     cw = sum((c.get("cache_creation") or 0) for c in model_calls)
-    sub_calls = [c for c in calls if c["role"] == "subagent" and c.get("turns") is not None]
+    sub_calls = [c for c in calls if c.get("role") == "subagent" and isinstance(c.get("turns"), (int, float))]
     return {
         "cost_usd": round(total, 2),
         "cost_by_role": {k: round(v, 2) for k, v in sorted(by_role.items(), key=lambda x: -x[1])},
@@ -2888,7 +4024,59 @@ def job_metrics(state: dict) -> dict:
         "rejected_proposals": len([e for e in mlog if e.get("rejected")]),
         "manager_busy_min": round(m.get("busy_s", 0) / 60, 1) if "busy_s" in m else None,
         "review_rounds": len(state.get("review", {}).get("rounds", [])),
+        **advisor_metrics(state),
     }
+
+
+def advisor_metrics(state: dict) -> dict:
+    """Does the advisor's second call at ADVISOR_ESCALATE (after a clean medium pass) find anything?
+    Information for the user's choice of ADVISOR_ESCALATE; nothing here changes a call. Jobs from
+    before the advisor return None."""
+    if "advice" not in state:
+        return dict.fromkeys(("advisor_calls", "advisor_escalated", "advisor_escalation_found",
+                              "advisor_escalation_cost_usd"))
+    calls = [c for c in state.get("calls", []) if c.get("role") == "advisor"]
+    recs = [r for rs in (state.get("advice") or {}).values() for r in rs or []
+            if isinstance(r, dict) and not r.get("error")]
+    esc = [r for r in recs if r.get("escalated")]
+    return {"advisor_calls": len(calls), "advisor_escalated": len(esc),
+            "advisor_escalation_found": sum(1 for r in esc if advice_blocking(r)),
+            "advisor_escalation_cost_usd": round(sum(
+                c.get("cost_usd") or 0 for c in calls
+                if (c["escalated"] if "escalated" in c  # tagged when made; older jobs: by config
+                    else str(c.get("config", "")).endswith("/" + models.ADVISOR_ESCALATE))), 4)}
+
+
+def record_advisor_yield(job: Job) -> None:
+    """One line per finished job in advice.jsonl next to task_costs.jsonl, so the yield of the
+    advisor's high re-check can be added up across jobs."""
+    m = advisor_metrics(job.state)
+    if m["advisor_calls"] is None:
+        return
+    entry = {"t": time.time(), "job": job.id, "calls": m["advisor_calls"], "escalated": m["advisor_escalated"],
+             "found": m["advisor_escalation_found"], "escalation_cost_usd": m["advisor_escalation_cost_usd"]}
+    with contextlib.suppress(OSError):
+        with router.locked():
+            with open(router.DIR / "advice.jsonl", "a") as fh:
+                fh.write(json.dumps(entry) + "\n")
+
+
+def skipped_checks(s: dict, plan: dict) -> list[str]:
+    """Checks that did not run, or that the user overrode, so report.md never reads as if they
+    passed. UI reviews are left out: ui_report_lines already says when one was skipped."""
+    out = []
+    ok = s.get("advice_plan_ok")
+    if isinstance(ok, str) and ok.startswith(("approved by user", "skipped:")):
+        out.append(f"advisor plan check: {ok}")
+    for r in (s.get("review") or {}).get("rounds", []):
+        if (r.get("advisor") or {}).get("overridden_by_user"):
+            out.append(f"advisor final check: overridden by the user (--approve advisor:final), round {r.get('round')}")
+    if s.get("baseline_skipped") and not s.get("baseline_ok"):
+        out.append("job baseline: not run (--skip-baseline)")
+    gates = {t["id"] for t in plan.get("tasks", []) if t.get("gate")}
+    out += [f"gate {g}: approved by the user" for g in s.get("approved") or []
+            if g in gates and not g.startswith("advisor:")]
+    return out
 
 
 def render_report(job: Job, plan: dict) -> str:
@@ -2899,18 +4087,26 @@ def render_report(job: Job, plan: dict) -> str:
          f"Cost: ${s.get('cost_usd', 0):.2f}"]
     mt = job_metrics(s)
     L.append("Cost by role: " + ", ".join(f"{k} ${v:.2f}" for k, v in mt["cost_by_role"].items()))
+    if mt["advisor_calls"]:
+        L.append(f"Advisor: {mt['advisor_calls']} call(s); the {models.ADVISOR_ESCALATE} re-check ran "
+                 f"{mt['advisor_escalated']} time(s), found blocking issues {mt['advisor_escalation_found']} "
+                 f"time(s), cost ${mt['advisor_escalation_cost_usd']:.2f}")
     if s.get("capacity"):
         c = s["capacity"]
         L.append(f"Parallel cap: {c['cap']} (limited by {c['limited_by']})")
     for w in s.get("warnings", []):
         L.append(f"Warning: {w}")
+    skipped = skipped_checks(s, plan)
+    if skipped:
+        L += ["", "Checks skipped or overridden (not run):", *[f"- {x}" for x in skipped]]
     if s.get("message"):
         L += ["", f"> {s['message'].splitlines()[0]}"] + [f"> {x}" for x in s["message"].splitlines()[1:12]]
     L += ["", "| Task | Type / tier | Status | Model path | Cost | Summary |", "|---|---|---|---|---|---|"]
     for t in plan["tasks"]:
         st = s["tasks"].get(t["id"], {})
         path = " → ".join(x.get("config", "?") for x in st.get("steps") or []) or "-"
-        summ = ((st.get("report") or {}).get("summary") or st.get("error") or "").replace("\n", " ")[:120]
+        summ = ((st.get("error") if st.get("status") == "failed" else None)
+                or (st.get("report") or {}).get("summary") or st.get("error") or "").replace("\n", " ")[:120]
         L.append(f"| {t['id']} | {t['type']} {t['tier']} | {st.get('status')} | {path} | "
                  f"${(st.get('cost_usd') or 0):.2f} | {summ} |")
     extra = [t for t, st in s["tasks"].items() if st.get("status") in ("split", "skipped")]
@@ -2918,6 +4114,9 @@ def render_report(job: Job, plan: dict) -> str:
         st = s["tasks"][t]
         why = f"split into {', '.join(st.get('split_into', []))}" if st["status"] == "split" else st.get("skip_reason", "")
         L.append(f"| {t} | {st.get('type')} {st.get('tier')} | {st['status']} | - | - | {why} |")
+    if s.get("decisions_added"):
+        L += ["", "Decided during the job (your answers, now plan decisions every later step follows):",
+              *[f"- {d}" for d in s["decisions_added"]]]
     if s.get("human_question"):
         L += ["", f"**The manager is asking you:** {s['human_question']}",
               f"Answer with: `orchestrate.py resume {job.id} --answer \"...\"`"]
@@ -2951,10 +4150,20 @@ def render_report(job: Job, plan: dict) -> str:
                 continue
             L += ["", f"{label} ({a.get('config')}{', after a clean pass at medium' if a.get('escalated') else ''}): "
                       f"**{a.get('verdict')}**: {a.get('summary', '')}"]
+            if (a.get("done_restated") or "").strip():
+                L.append(f"Advisor's reading of done: {a['done_restated'].strip()}")
             L += [f"- [{f.get('severity')}] {f.get('file', '')} {f.get('issue', '')}" for f in (a.get("findings") or [])[:10]]
     cl = s.get("cleanup") or {}
     if cl.get("config"):
         L += ["", f"Cleanup ({cl['config']}): {cl.get('reverted') and 'reverted, ' + cl['reverted'] or cl.get('result', '')}"]
+    merged = {t: st["merge_verify"] for t, st in s["tasks"].items() if isinstance(st.get("merge_verify"), dict)}
+    if merged:
+        L += ["", "Merge conflicts resolved by the integrator:"]
+        for t, m in merged.items():
+            files = ", ".join(m.get("files") or []) or "(files not recorded)"
+            check = (("verified: " + ", ".join(f"`{c}`" for c in m.get("cmds") or [])) if m.get("cmds")
+                     else "no verify command to run") if m.get("ok") else f"FAILED verify: `{m.get('cmd')}`"
+            L.append(f"- **{t}** in {files}: {check}")
     claimed = {t: st["claimed"] for t, st in s["tasks"].items() if st.get("claimed")}
     if claimed:
         L += ["", "Files claimed by tasks because no task owned them:",
@@ -2962,13 +4171,18 @@ def render_report(job: Job, plan: dict) -> str:
     for r in s.get("review", {}).get("rounds", []):
         v = r.get("verdict") or {}
         L += ["", f"Review round {r['round']}: final verify {'ok' if r.get('final_verify_ok') else 'FAILED'}, "
-                  f"verdict **{v.get('verdict', '-')}**: {v.get('summary', '')}"]
+                  + (f"verdict **{v.get('verdict', '-')}**: {v.get('summary', '')}" if v
+                     else "interrupted before a verdict (the job stopped during this round)")]
         for a in v.get("acceptance", []) or []:
             L.append(f"- {'✅' if a.get('met') else '❌'} {a.get('criterion', '')} — {a.get('evidence', '')}")
         ecs = [e for e in v.get("edge_cases", []) or [] if isinstance(e, dict)]
         if ecs:
             L.append(f"- edge cases checked: {len(ecs)}, unhandled: {sum(not e.get('handled', True) for e in ecs)}")
         L += [f"- [{f.get('severity')}] {f.get('file', '')} {f.get('issue', '')}" for f in v.get("findings", [])[:15]]
+        if r.get("stale_doc_refs"):
+            L.append(f"- docs that still name a file the job deleted or renamed ({len(r['stale_doc_refs'])}):")
+            L += [f"  - `{x[:200]}`" for x in r["stale_doc_refs"][:10]]
+    L += ui_report_lines(s)
     props = router.pending()
     if props:
         L += ["", f"{len(props)} routing/AGENTS.md proposal(s) pending: `router.py proposals` (user approves)"]
@@ -2981,10 +4195,329 @@ def render_report(job: Job, plan: dict) -> str:
     return "\n".join(L)
 
 
+def ui_report_lines(s: dict) -> list[str]:
+    """The UI review section of report.md: per round, what ran and which screenshots it took."""
+    rounds = [r for r in (s.get("review") or {}).get("rounds", []) if r.get("ui")]
+    if not rounds:
+        return []
+    L = ["", f"UI review (screenshots under `{s.get('screenshots_root') or '-'}`):"]
+    for r in rounds:
+        u = r["ui"]
+        v = u.get("verdict") or {}
+        rv = r.get("verdict") or {}
+        ui_f = [f for f in rv.get("findings") or [] if str(f.get("issue", "")).startswith(UI_TAG)]
+        nb = blocking_findings(ui_f)
+        counts = ", ".join(f"{sum(f.get('severity') == k for f in nb)} {k}" for k in ("blocker", "major")
+                           if any(f.get("severity") == k for f in nb))
+        state = (f"the app did not start (a blocker finding): {u['error']}" if u.get("app_failed")
+                 else f"failed closed: {u['error']}" if u.get("error") else f"skipped: {u['skipped']}"
+                 if u.get("skipped") else "interrupted before a verdict" if not rv
+                 else f"UI reviewer **{v.get('verdict', '-')}**: {v.get('summary', '')}")
+        if rv and not u.get("skipped") and not (u.get("error") and not u.get("app_failed")):
+            state += f"; round's UI outcome: **{'blocked' if nb else 'pass'}**" + (f" ({counts})" if counts else "")
+        L.append(f"- round {r['round']}: {len(u.get('shots') or [])} screenshot(s), {state}")
+        if u.get("unreviewed"):
+            L.append(f"  - not assessed by the UI reviewer: {', '.join(u['unreviewed'][:12])}")
+        for p in not_ok_pages(v)[:12]:
+            L.append(f"  - judged wrong by the UI reviewer: {p.get('shot')}: {_clip_text(p.get('observations'), 200)}")
+        for e in (u.get("earlier") or [])[:12]:
+            L.append(f"  - earlier finding {e.get('id')} (round {e.get('round')}): "
+                     + ("fixed" if e.get("fixed") else "still open" if e.get("answered") else "not re-checked")
+                     + f": {_clip_text(e.get('issue'), 160)}")
+        for f in (u.get("page_failures") or [])[:12]:
+            L.append(f"  - no screenshot of {f.get('name')}--{f.get('viewport')} ({f.get('path')}): {f.get('error')}")
+        if u.get("restored"):
+            L.append(f"  - put back after the dev server wrote them: {', '.join(u['restored'][:12])}")
+        for sh in (u.get("shots") or [])[:24]:
+            errs = sum(len(sh.get(k) or []) for k in ("console", "page_errors", "failed_requests", "step_errors"))
+            st = sh.get("status")
+            L.append(f"  - `{sh.get('file')}` ({sh.get('path')}, {sh.get('viewport')}, "
+                     + (f"HTTP {st}" if st is not None else "no HTTP response")
+                     + (f", {errs} browser message(s)" if errs else "") + ")")
+            for n in (sh.get("notes") or [])[:3]:
+                L.append(f"    - note: {_clip_text(n, 200)}")
+        if len(u.get("shots") or []) > 24:
+            L.append(f"  - ... and {len(u['shots']) - 24} more in `{u.get('dir')}`")
+    return L
+
+
+# =============================================================== dashboard ===
+DASHBOARD_PORT = 8765
+
+
+def _dash_ping(port: int, timeout: float = 0.5):
+    """The dashboard's /api/ping JSON; "busy" when something else answers or hangs; None when
+    nothing listens."""
+    import http.client
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        c.request("GET", "/api/ping")
+        r = c.getresponse()
+        body = r.read(65536)
+        if r.status == 200:
+            try:
+                d = json.loads(body)
+                return d if isinstance(d, dict) else "busy"
+            except ValueError:
+                return "busy"
+        return "busy"
+    except ConnectionRefusedError:
+        return None
+    except (OSError, http.client.HTTPException):
+        return "busy"
+    finally:
+        c.close()
+
+
+def _same_dir(a, b) -> bool:
+    try:
+        return Path(str(a)).resolve() == Path(str(b)).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+DASH_RANGE = 20
+
+
+def _dash_fingerprint() -> str:
+    """Which code a dashboard runs (dashboard.py, the modules it imports and where they live):
+    a running one keeps the code it started with."""
+    return router.code_fingerprint()
+
+
+def _dash_records() -> list[dict]:
+    """Dashboards this tool started for this state dir: pid, port, fingerprint, and the process's
+    start time. A record whose process is gone, or whose pid now names another process (another
+    start time), is left out: it outlived its dashboard."""
+    try:
+        d = json.loads((router.DIR / "dashboard.json").read_text())
+        rows = [r for r in d.get("dashboards", []) if isinstance(r, dict)] if isinstance(d, dict) else []
+    except (OSError, ValueError):
+        return []
+    out = []
+    for r in rows:
+        pid = r.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not pid_alive(pid):
+            continue
+        if r.get("pstart") and ui_review._started(pid) != r["pstart"]:
+            continue
+        out.append(r)
+    return out
+
+
+def _dash_save_records(rows: list[dict]) -> None:
+    f = router.DIR / "dashboard.json"
+    write_json(f, {"dashboards": rows})
+    with contextlib.suppress(OSError):
+        os.chmod(f, 0o600)
+
+
+def _dash_ours(r: dict, port: int, recs: list[dict]) -> dict | None:
+    """The record of the dashboard answering on `port`, when this tool started it (pid and port
+    both match), else None."""
+    pid = r.get("pid") if isinstance(r, dict) else None
+    return next((x for x in recs if isinstance(pid, int) and x.get("pid") == pid and x.get("port") == port), None)
+
+
+def _dash_stale(r: dict, port: int, recs: list[dict]) -> bool:
+    """True when we know the dashboard on `port` runs other dashboard.py code than this one."""
+    fp = _dash_fingerprint()
+    if r.get("fingerprint"):
+        return r["fingerprint"] != fp
+    rec = _dash_ours(r, port, recs)
+    return bool(rec and rec.get("fingerprint") != fp)
+
+
+def _ours_here(r) -> bool:
+    return isinstance(r, dict) and bool(r.get("orchestrate_dashboard")) and _same_dir(r.get("jobs_dir"), JOBS)
+
+
+def _runs_this_dashboard(pid: int) -> bool:
+    """True when process `pid` runs this skill's dashboard.py (Linux /proc; False elsewhere)."""
+    me = (HERE / "dashboard.py").resolve()
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        cwd = Path(os.readlink(f"/proc/{pid}/cwd"))
+    except OSError:
+        return False
+    for a in argv[1:3]:
+        a = os.fsdecode(a)
+        if a.endswith("dashboard.py"):
+            with contextlib.suppress(OSError):
+                if (cwd / a).resolve() == me:
+                    return True
+    return False
+
+
+def _runs_a_dashboard(pid: int) -> bool | None:
+    """True when process `pid` runs some dashboard.py (any install of this skill); None where
+    /proc can't tell (macOS)."""
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return None if not Path("/proc/self").exists() else False
+    return any(os.fsdecode(a).endswith("dashboard.py") for a in argv[1:3])
+
+
+def _dash_killable(r: dict, port: int, recs: list[dict]) -> bool:
+    """Only a process running this dashboard.py, or a pid this tool recorded for that port that
+    is still the process it started (same start time) and, where /proc can tell, still runs a
+    dashboard.py, is signalled: a ping reply is not trusted to name the process to kill."""
+    pid = r.get("pid") if isinstance(r, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return False
+    if _runs_this_dashboard(pid):
+        return True
+    rec = _dash_ours(r, port, recs)
+    if not rec or not rec.get("pstart") or ui_review._started(pid) != rec["pstart"]:
+        return False
+    return _runs_a_dashboard(pid) is not False
+
+
+def _dash_stop(pid: int, port: int) -> bool:
+    """SIGTERM a dashboard and wait until its port is free."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGTERM)
+    end = time.time() + 5
+    while time.time() < end:
+        if _dash_ping(port) is None:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def ensure_dashboard(job_id: str | None, port: int = DASHBOARD_PORT, start: bool = True) -> str | None:
+    """The URL of a dashboard serving this state dir. Under a lock (so concurrent runs share one):
+    scan port..port+20 for a dashboard of this state dir and reuse it, unless it runs older
+    dashboard.py code; one this tool started is then restarted on the same port, one it did not
+    start is left alone. Otherwise start dashboard.py detached on the first free port and record
+    it (router.DIR/dashboard.json). None (silently) when ORCHESTRATE_DASHBOARD=0; never raises."""
+    if os.environ.get("ORCHESTRATE_DASHBOARD", "1") == "0":
+        return None
+    import fcntl
+    import urllib.parse
+    q = f"?job={urllib.parse.quote(job_id, safe='')}" if job_id else ""
+    try:
+        router.DIR.mkdir(parents=True, exist_ok=True)
+        with open(router.DIR / "dashboard.lock", "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            p = _ensure_dashboard_locked(port, start)
+        return f"http://127.0.0.1:{p}/{q}" if p else None
+    except Exception as e:  # noqa: BLE001  (the dashboard is a convenience: never stop a job for it)
+        log(f"dashboard: could not start: {e}")
+    return None
+
+
+def _ensure_dashboard_locked(port: int, start: bool) -> int | None:
+    recs = _dash_records()
+    pings = {}
+    for p in range(port, port + DASH_RANGE + 1):
+        r = pings[p] = _dash_ping(p)
+        if not _ours_here(r):
+            continue  # nothing, another program, or another state dir's dashboard
+        if not _dash_stale(r, p, recs):
+            return p
+        if start and _dash_ours(r, p, recs) and _dash_killable(r, p, recs):
+            log(f"dashboard: :{p} runs an older dashboard.py; restarting it on the same port")
+            if _dash_stop(r["pid"], p):
+                pings[p] = None
+                recs = [x for x in recs if x.get("port") != p]
+                _dash_save_records(recs)
+        else:
+            log(f"dashboard: :{p} serves this state dir with older code that this tool did not start; "
+                "leaving it alone (stop it yourself to free the port)")
+    if not start:
+        return None
+    fp = _dash_fingerprint()
+    for p in range(port, port + DASH_RANGE + 1):
+        if pings.get(p) is not None:
+            continue
+        with open(router.DIR / "dashboard.log", "a") as fh:
+            proc = subprocess.Popen([sys.executable, str(HERE / "dashboard.py"), "--port", str(p)],
+                                    stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    start_new_session=True, cwd=str(router.DIR))
+        end = time.time() + 5
+        while time.time() < end and proc.poll() is None:
+            if _ours_here(_dash_ping(p)):
+                _dash_save_records([x for x in recs if x.get("port") != p] + [
+                    {"pid": proc.pid, "port": p, "fingerprint": fp, "started": time.time(),
+                     "pstart": ui_review._started(proc.pid)}])
+                return p
+            time.sleep(0.1)
+        if proc.poll() is None:  # up but not answering as a dashboard: give up, don't leave it
+            proc.kill()
+            proc.wait(5)
+            log(f"dashboard: started on port {p} but it did not answer within 5s "
+                f"(see {router.DIR / 'dashboard.log'})")
+            return None
+        proc.wait()  # it exited (port taken in between, or an error): reap it
+        if _ours_here(_dash_ping(p)):
+            return p  # a dashboard for this state dir took the port first: share it
+    log(f"dashboard: no free port in {port}-{port + DASH_RANGE} (see {router.DIR / 'dashboard.log'})")
+    return None
+
+
+def stop_dashboards(port: int = DASHBOARD_PORT, left: list | None = None) -> list[int]:
+    """Stop every dashboard serving this state dir on port..port+20, and those this tool recorded.
+    A dashboard whose pid this tool did not record and that does not run this dashboard.py is not
+    signalled; its port goes to `left`."""
+    stopped = []
+    recs = _dash_records()
+    ports = set(range(port, port + DASH_RANGE + 1)) | {x.get("port") for x in recs
+                                                        if isinstance(x.get("port"), int)}
+    for p in sorted(ports):
+        r = _dash_ping(p)
+        if not _ours_here(r):
+            continue
+        if not _dash_killable(r, p, recs):
+            if left is not None:
+                left.append(p)
+            continue
+        if _dash_stop(r["pid"], p):
+            stopped.append(p)
+    if _dash_records():
+        _dash_save_records([x for x in _dash_records() if x.get("port") not in stopped])
+    return stopped
+
+
+def cmd_dashboard(a) -> int:
+    if a.stop:
+        left: list[int] = []
+        stopped = stop_dashboards(a.port, left)
+        if stopped or not left:
+            print("stopped the dashboard on " + ", ".join(f":{p}" for p in stopped) if stopped
+                  else f"no dashboard serving this state dir ({JOBS}) was running")
+        for p in left:
+            print(f"the dashboard on :{p} serves this state dir but this tool did not start it and can't tell "
+                  "which process it is; stop it yourself to free the port", file=sys.stderr)
+        return 1 if left else 0
+    if os.environ.get("ORCHESTRATE_DASHBOARD", "1") == "0":
+        print("the dashboard is turned off (ORCHESTRATE_DASHBOARD=0)", file=sys.stderr)
+        return 1
+    jid = a.job
+    if not jid:
+        with contextlib.suppress(SystemExit):
+            jid = latest_job()
+    url = ensure_dashboard(jid, a.port, start=not a.no_start)
+    if not url:
+        print("no dashboard is serving this state dir" + ("" if a.no_start else " and none could be started")
+              + f" ({JOBS})", file=sys.stderr)
+        return 1
+    print(url)
+    return 0
+
+
+def _note_dashboard(job: Job, url: str | None) -> None:
+    if url:
+        job.state["dashboard"] = url
+        job.save()
+
+
 # ===================================================================== cli ===
 def cmd_plan(a) -> int:
     repo = Path(a.repo).expanduser().resolve()
-    plan, errs, cost, raw = draft_plan(repo, a.goal, a.done, a.planner)
+    plan, errs, cost, raw = draft_plan(repo, a.goal, a.done, a.planner, acceptance=a.acceptance,
+                                       decisions=a.decision, non_goals=a.non_goal)
     if plan is None:
         print("planner did not return a plan:\n" + raw[-2000:], file=sys.stderr)
         return 2
@@ -2995,13 +4528,42 @@ def cmd_plan(a) -> int:
     return cmd_validate(argparse.Namespace(plan=str(out), json=False))
 
 
-def draft_plan(repo: Path, goal: str, done: str, planner: str | None = None
-               ) -> tuple[dict | None, list[str], float, str]:
-    """The planner subagent: (plan, validation errors, cost, last raw reply). The user's
-    definition of done is set verbatim; an invalid plan is sent back up to twice."""
+def pin_settled(plan: dict, done: str, acceptance: list[str], decisions: list[str],
+                non_goals: list[str]) -> None:
+    """What the user settled in the grill wins over the planner's copy: the definition of done,
+    decisions and non-goals verbatim, and every acceptance criterion (the planner may add more,
+    since the bar only rises). A decision only the planner wrote isn't the user's, so it moves to
+    `assumptions`, which validate and run put to the user. That holds when the user gave no
+    decisions too: then plan.decisions ends up empty."""
+    plan["definition_of_done"] = done  # the user's words, never the planner's
+    own = [d for d in plan.get("decisions") or [] if isinstance(d, str)
+           and not bar_duplicate(d, decisions)]
+    plan["decisions"] = list(decisions)
+    if own:
+        plan["assumptions"] = [*(plan.get("assumptions") or []), *own]
+    if non_goals:
+        plan["non_goals"] = list(non_goals)
+    if acceptance:
+        theirs = [c for c in plan.get("acceptance") or [] if isinstance(c, str)]
+        missing = [c for c in acceptance if " ".join(c.split()) not in {" ".join(x.split()) for x in theirs}]
+        plan["acceptance"] = missing + theirs
+
+
+def draft_plan(repo: Path, goal: str, done: str, planner: str | None = None, *,
+               acceptance: list[str] | None = None, decisions: list[str] | None = None,
+               non_goals: list[str] | None = None) -> tuple[dict | None, list[str], float, str]:
+    """The planner subagent: (plan, validation errors, cost, last raw reply). What the user
+    settled is pinned after every reply (pin_settled); an invalid plan is sent back up to twice."""
+    acceptance, decisions, non_goals = list(acceptance or []), list(decisions or []), list(non_goals or [])
     info = scan(repo)
     cap = capacity()
     schema_hint = skill_text("orchestrate-plan")
+    settled = ""
+    if acceptance or decisions or non_goals:
+        settled = ("\nSETTLED WITH THE USER (copy these verbatim; you may add acceptance criteria, but never "
+                   "drop or reword these):\n"
+                   + "".join(f"{k}:\n" + "".join(f"- {x}\n" for x in v) for k, v in
+                             (("acceptance", acceptance), ("decisions", decisions), ("non_goals", non_goals)) if v))
     prompt = f"""ORCHESTRATE_PLAN
 {schema_hint}
 
@@ -3013,6 +4575,12 @@ GOAL: {goal}
 WHAT DONE MEANS (the user's own words; copy it verbatim into "definition_of_done", and make
 `acceptance` the checkable criteria that prove it):
 {done}
+{settled}
+YOU CANNOT ASK THE USER. For each choice that the goal, the decisions and the definition of done
+leave open AND that touches the architecture, a public interface or route, a new dependency, or
+stored data and its format, write one line in `assumptions`: what you chose and the alternative
+you ruled out. The user confirms them before anything runs. Leave out mechanical choices, and
+never put your own choices in `decisions`: those are the user's.
 
 REPO SCAN:
 {json.dumps(info, indent=2)[:12000]}
@@ -3037,7 +4605,7 @@ Use "repo": "{repo}". Reply with ONLY the plan JSON object."""
     for i in range(3):
         if plan is not None:
             plan["repo"] = str(repo)
-            plan["definition_of_done"] = done  # the user's words, never the planner's
+            pin_settled(plan, done, acceptance, decisions, non_goals)
             errs, _, _ = validate(plan)
             if not errs:
                 break
@@ -3105,25 +4673,74 @@ def cmd_run(a, resume: bool = False) -> int:
                   f"for it, add their words as \"definition_of_done\" to {plan_path}, then resume.",
                   file=sys.stderr)
         return 2
+    if resume and job.state.get("status") == "done":
+        raise SystemExit(f"job {job.id} already finished; pick a new plan.job or `clean {job.id}`")
+    live = job if resume else Job(plan["job"])
+    if live.state.get("status") == "running" and live.state.get("mode") != "orca" \
+            and live.state.get("pid") != os.getpid() and pid_alive(live.state.get("pid")):
+        print(f"job {live.id} is still running (pid {live.state.get('pid')}): `orchestrate.py wait {live.id}`. "
+              f"A second {'resume' if resume else 'run'} would run two orchestrators on the same worktrees.",
+              file=sys.stderr)
+        return 2
+    if not resume:
+        why = fresh_run_refusal(plan)
+        if why:
+            print(why, file=sys.stderr)
+            return 2
+    if not resume and plan.get("assumptions"):
+        print("plan.assumptions holds choices the planner made that the user has not confirmed:\n"
+              + "\n".join(f"- {x}" for x in plan["assumptions"])
+              + "\nPut each one to the user, move an accepted one into decisions word for word, re-grill a "
+                "rejected one, then delete the field and run again.", file=sys.stderr)
+        return 2
+    for w in warns:
+        log(f"plan warning: {w}")
+    dash = ensure_dashboard(plan["job"])  # before any work, so the user can watch from the start
+    if dash:
+        log(f"dashboard: {dash}")
     mode = workers_mode(a, Job(plan["job"]))  # an existing job keeps the mode it started in
     if mode == "orca":
         import orca_mode
         if a.detach:
             log("Orca mode: --detach ignored; this command returns once the workers have started")
         job = start_job(plan, plan_path)
+        _note_dashboard(job, dash)
         fn = orca_mode.resume if resume else orca_mode.start
         return fn(job, job.plan, a.approve or [], a.max_parallel, a.skip_baseline, getattr(a, "answer", None))
     if a.detach:
         JOBS.mkdir(parents=True, exist_ok=True)
         argv = [sys.executable, str(Path(__file__).resolve())] + [x for x in sys.argv[1:] if x != "--detach"]
         logp = JOBS / f"{plan['job']}.out"
+        if resume:
+            # `wait` right after this must not read the status the job stopped with: it is running now
+            job.state.update(status="running", mode="headless", message="")
+            job.state.pop("finished", None)
+            job.state.pop("pid", None)  # the last run's pid may belong to another process by now
+            job.save()
         with open(logp, "a") as fh:
+            start = fh.tell()
             p = subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True,
                                  cwd=Path.cwd())
-        print(json.dumps({"job": plan["job"], "pid": p.pid, "log": str(logp),
+        if resume:  # only the pid, on a fresh read: never overwrite what the child saved since
+            fresh = Job(job.id)
+            if fresh.state.get("pid") != p.pid and fresh.state.get("status") == "running":
+                fresh.state["pid"] = p.pid
+                fresh.save()
+        try:  # a child that dies at once (a refusal, a crash) must not be reported as started
+            rc = p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            rc = None
+        if rc not in (None, 0):
+            with open(logp) as fh:
+                fh.seek(start)
+                print(fh.read()[-3000:], file=sys.stderr, end="")
+            print(f"the detached run exited with code {rc} before starting the job (log: {logp})", file=sys.stderr)
+            return rc
+        print(json.dumps({"job": plan["job"], "pid": p.pid, "log": str(logp), "dashboard": dash,
                           "next": f"orchestrate.py wait {plan['job']} --timeout 540"}))
         return 0
     job = start_job(plan, plan_path)
+    _note_dashboard(job, dash)
     return run_job(job, plan, a.approve or [], a.max_parallel, a.skip_baseline,
                    getattr(a, "answer", None))
 
@@ -3163,6 +4780,7 @@ def cmd_worker_event(a) -> int:
         raise SystemExit(f"no job {a.job}")
     if job.state.get("mode") != "orca":
         raise SystemExit(f"job {a.job} doesn't run Orca workers")
+    log_to_job(job.dir)
     if a.cmd == "worker-lost":
         return orca_mode.worker_lost(job, job.plan, a.dispatch, a.reason)
     payload = json.loads(a.payload) if a.payload else {}
@@ -3175,14 +4793,14 @@ def cmd_worker_event(a) -> int:
 
 
 def cmd_status(a) -> int:
-    job = Job(a.job or latest_job())
+    if getattr(a, "open", False):
+        print(json.dumps(open_jobs(a.repo or "."), indent=2))
+        return 0
+    job = Job(a.job or latest_job(getattr(a, "repo", None)))
     if not job.state:
         raise SystemExit(f"no job {a.job}")
     s = job.state
-    alive = pid_alive(s.get("pid"))
-    status = s["status"] if not (s["status"] == "running" and not alive) else "stopped (process gone)"
-    if s.get("mode") == "orca" and s["status"] == "running":
-        status = "running (Orca workers; Orca wakes the coordinator when they report)"
+    status = shown_status(s)
     out = {"job": job.id, "status": status, "cost_usd": round(s.get("cost_usd", 0), 3),
            "branch": s["branch"], "cap": (s.get("capacity") or {}).get("cap"),
            "tasks": {t: {"status": x["status"], "type": x.get("type"), "tier": x.get("tier"),
@@ -3196,7 +4814,7 @@ def cmd_status(a) -> int:
 
 
 def cmd_wait(a) -> int:
-    jid = a.job or latest_job()
+    jid = a.job or latest_job(getattr(a, "repo", None))
     end = time.time() + a.timeout
     while True:
         job = Job(jid)
@@ -3229,6 +4847,7 @@ def cmd_clean(a) -> int:
     if job.state.get("status") == "running" and pid_alive(job.state.get("pid")):
         raise SystemExit("job is still running")
     wt_root = job.dir / "wt"
+    kept = keep_screenshots(job)
     if wt_root.exists():
         for d in wt_root.iterdir():
             git(repo, "worktree", "remove", "--force", str(d), check=False)
@@ -3237,8 +4856,177 @@ def cmd_clean(a) -> int:
     if a.branches:
         for t in job.state["tasks"]:
             git(repo, "branch", "-D", f"orchestrate/{job.id}--{t}", check=False)
-    print(f"cleaned worktrees for {job.id}; integration branch {job.state['branch']} kept")
+    job.state["cleaned_at"] = time.time()  # `status --open` no longer lists it; a resume clears it
+    job.save()
+    if kept and (job.dir / "report.md").exists() and (job.dir / "plan.json").exists():
+        with contextlib.suppress(Exception):  # the report names the screenshots' new place
+            (job.dir / "report.md").write_text(render_report(job, job.plan))
+    print(f"cleaned worktrees for {job.id}; integration branch {job.state['branch']} kept"
+          + (f"; screenshots moved to {kept}" if kept else ""))
     return 0
+
+
+def guard_hook_config() -> dict:
+    return {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": f"python3 {shlex.quote(str(HERE / 'approval_gate.py'))}"}]}]}}
+
+
+def claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+
+
+def _matches_bash(matcher) -> bool:
+    """A PreToolUse matcher that covers the Bash tool (none, "", "*", "Bash", "Bash|Write"...)."""
+    if matcher in (None, "", "*"):
+        return True
+    try:
+        return bool(re.fullmatch(str(matcher), "Bash"))
+    except re.error:
+        return str(matcher) == "Bash"
+
+
+def _gate_script(command: str) -> str | None:
+    """The approval_gate.py path a hook command runs, ~ and $VARS expanded."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    for t in parts:
+        if t.endswith("approval_gate.py"):
+            return os.path.expandvars(os.path.expanduser(t))
+    return None
+
+
+def _plugin_hook(cfg: Path, name: str) -> Path | None:
+    """The installed copy of plugin `name` (plugin@marketplace) whose hooks/hooks.json runs
+    approval_gate.py, if any."""
+    roots = []
+    with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
+        d = json.loads((cfg / "plugins" / "installed_plugins.json").read_text())
+        roots += [Path(e["installPath"]) for e in (d.get("plugins") or {}).get(name) or []
+                  if isinstance(e, dict) and e.get("installPath")]
+    plugin, _, market = name.partition("@")
+    roots += sorted((cfg / "plugins" / "cache" / market / plugin).glob("*")) if market else []
+    for r in roots:
+        h = r / "hooks" / "hooks.json"
+        if "approval_gate.py" in (read_text(h) or "") and (r / "skills/orchestrate/scripts/approval_gate.py").is_file():
+            return h
+    return None
+
+
+def approval_hook_check(repo: Path) -> tuple[str | None, list[str]]:
+    """Where the approval_gate hook comes from (a settings file, or the enabled orchestrate
+    plugin, which ships it), or None, plus warnings about hooks that are there but would not
+    run. Without it, an agent's --approve or --answer runs without the user's permission prompt."""
+    cfg = claude_config_dir()
+    files = [cfg / "settings.json", cfg / "settings.local.json",
+             repo / ".claude" / "settings.json", repo / ".claude" / "settings.local.json"]
+    loaded = []
+    for f in files:
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict):
+            loaded.append((f, d))
+    off = [f for f, d in loaded if d.get("disableAllHooks") is True]
+    if off:
+        return None, [f"`disableAllHooks` is set in {off[0]}, so no hook runs, the approval hook included"]
+    warns: list[str] = []
+    found = None
+    for f, d in loaded:
+        hooks = d.get("hooks") if isinstance(d.get("hooks"), dict) else {}
+        for entry in hooks.get("PreToolUse") or []:
+            if not isinstance(entry, dict):
+                continue
+            for h in entry.get("hooks") or []:
+                if not (isinstance(h, dict) and "approval_gate.py" in str(h.get("command", ""))):
+                    continue
+                if not _matches_bash(entry.get("matcher")):
+                    warns.append(f"the approval hook in {f} has matcher {entry.get('matcher')!r}, which "
+                                 "does not cover the Bash tool, so it never runs")
+                    continue
+                script = _gate_script(str(h.get("command", "")))
+                if script and "$" not in script and not Path(script).is_file():
+                    warns.append(f"the approval hook in {f} points at {script}, which does not exist")
+                    continue
+                found = found or str(f)
+        plugins = d.get("enabledPlugins") if isinstance(d.get("enabledPlugins"), dict) else {}
+        for name, on in plugins.items():
+            if on is True and str(name).split("@", 1)[0] == "orchestrate" and not found:
+                if _plugin_hook(cfg, str(name)):
+                    found = f"the orchestrate plugin ({name}, enabled in {f})"
+                else:
+                    found = f"the orchestrate plugin ({name}, enabled in {f}; hook not verified)"
+                    warns.append(f"the plugin {name} is enabled, but no installed copy with the approval hook "
+                                 f"was found under {cfg / 'plugins'}; check it is this skill's plugin")
+    return found, ([] if found and not found.endswith("hook not verified)") else warns)
+
+
+def approval_hook_found(repo: Path) -> str | None:
+    return approval_hook_check(repo)[0]
+
+
+def doctor(repo: Path) -> dict:
+    """Install checks that would otherwise fail late or silently. No model calls."""
+    errors, warnings = [], []
+    if not shutil.which(claude_cli.claude_bin()):
+        errors.append(f"`{claude_cli.claude_bin()}` is not on PATH: install Claude Code")
+    hook, why = approval_hook_check(repo)
+    warnings += why
+    if not hook:
+        warnings.append("the approval hook is not installed, so an agent's --approve, --answer or "
+                        "`router.py approve` runs without asking the user. Add this to ~/.claude/settings.json "
+                        "(merge into an existing \"hooks\" object):\n" + json.dumps(guard_hook_config(), indent=2))
+    return {"scripts": str(HERE), "approval_hook": hook, "errors": errors, "warnings": warnings}
+
+
+def cmd_doctor(a) -> int:
+    d = doctor(Path(a.repo).expanduser().resolve())
+    print(f"scripts: {d['scripts']}")
+    print(f"approval hook: {d['approval_hook'] or 'MISSING'}")
+    for e in d["errors"]:
+        print(f"ERROR: {e}")
+    for w in d["warnings"]:
+        print(f"WARNING: {w}")
+    print("ok" if not d["errors"] else "fix the errors before running a job")
+    return 1 if d["errors"] else 0
+
+
+def keep_screenshots(job: Job) -> Path | None:
+    """`clean` removes the integration worktree, where the screenshots live: move them to
+    jobs/<job>/screenshots first and point the job state (report, dashboard) there."""
+    old = job.state.get("screenshots_root")
+    if not old or not Path(old).is_dir():
+        return None
+    new = job.dir / "screenshots"
+    if Path(old).resolve() == new.resolve():
+        return None
+    move_screenshots(job, Path(old), new)
+    return new
+
+
+def move_screenshots(job: Job, src: Path, dst: Path) -> None:
+    """Merge the screenshot folder `src` into `dst` (a round already in `dst` is kept unless
+    `src` has the same round), point the job state at `dst` and remove `src`. `clean` keeps the
+    screenshots this way, and a resumed job's next capture brings them back to the worktree, so
+    every round stays under one root and resolves (report, dashboard)."""
+    dst.mkdir(parents=True, exist_ok=True)
+    if src.is_dir():
+        for e in sorted(src.iterdir()):
+            t = dst / e.name
+            if t.is_dir() and not t.is_symlink():
+                shutil.rmtree(t)
+            elif t.exists() or t.is_symlink():
+                t.unlink()
+            shutil.move(str(e), str(t))
+        shutil.rmtree(src, ignore_errors=True)
+    job.state["screenshots_root"] = str(dst)
+    for r in (job.state.get("review") or {}).get("rounds", []):
+        u = r.get("ui") or {}
+        if u.get("dir") and Path(u["dir"]).parent == src:
+            u["dir"] = str(dst / Path(u["dir"]).name)
+    job.save()
 
 
 def main(argv=None) -> int:
@@ -3252,6 +5040,9 @@ def main(argv=None) -> int:
     p.add_argument("--done", required=True, help="the user's definition of done, verbatim (asked in the grill)")
     p.add_argument("--out")
     p.add_argument("--planner", help="model/effort for the planner (default: fable/medium)")
+    p.add_argument("--acceptance", action="append", help="a criterion the user confirmed, verbatim (repeat)")
+    p.add_argument("--decision", action="append", help="a decision the user made, verbatim (repeat)")
+    p.add_argument("--non-goal", action="append", help="something the user ruled out, verbatim (repeat)")
     v = sub.add_parser("validate"); v.add_argument("plan"); v.add_argument("--json", action="store_true")
     b = sub.add_parser("brief"); b.add_argument("plan"); b.add_argument("task")
     for name in ("run", "resume"):
@@ -3268,11 +5059,22 @@ def main(argv=None) -> int:
         if name == "resume":
             r.add_argument("--answer", help="your answer to the manager's question (status awaiting_human)")
     st = sub.add_parser("status"); st.add_argument("job", nargs="?")
+    st.add_argument("--repo", help="with no JOB: this repo's newest job (with --open: its open jobs)")
+    st.add_argument("--open", action="store_true",
+                    help="list the repo's jobs that are not done or cleaned, with the next step (JSON)")
     w = sub.add_parser("wait"); w.add_argument("job", nargs="?"); w.add_argument("--timeout", type=int, default=540)
+    w.add_argument("--repo", help="with no JOB: wait for this repo's newest job")
     cl = sub.add_parser("clean"); cl.add_argument("job"); cl.add_argument("--branches", action="store_true")
     sc = sub.add_parser("scope-check"); sc.add_argument("--owns", action="append", required=True)
     sc.add_argument("--job"); sc.add_argument("--task")
     sub.add_parser("guard-hook", help="print the settings.json hook that routes approvals to the user")
+    dr = sub.add_parser("doctor", help="check the install: claude on PATH (error), the approval hook (warning)")
+    dr.add_argument("--repo", default=".")
+    da = sub.add_parser("dashboard", help="make sure the live dashboard is serving and print its URL")
+    da.add_argument("job", nargs="?")
+    da.add_argument("--port", type=int, default=DASHBOARD_PORT)
+    da.add_argument("--no-start", action="store_true", help="only look for a running dashboard")
+    da.add_argument("--stop", action="store_true", help="stop the dashboards serving this state dir")
     me = sub.add_parser("metrics"); me.add_argument("job", nargs="?"); me.add_argument("--json", action="store_true")
     wd = sub.add_parser("worker-done", help="Orca mode: a worker sent worker_done")
     wd.add_argument("job")
@@ -3328,12 +5130,14 @@ def main(argv=None) -> int:
         return cmd_wait(a)
     elif a.cmd == "clean":
         return cmd_clean(a)
+    elif a.cmd == "dashboard":
+        return cmd_dashboard(a)
     elif a.cmd == "guard-hook":
-        cmd = f"python3 {shlex.quote(str(HERE / 'approval_gate.py'))}"
         print("# Add to ~/.claude/settings.json (merge into an existing \"hooks\" object). The plugin\n"
               "# install does this for you; `npx skills` installs need it by hand.")
-        print(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
-            {"type": "command", "command": cmd}]}]}}, indent=2))
+        print(json.dumps(guard_hook_config(), indent=2))
+    elif a.cmd == "doctor":
+        return cmd_doctor(a)
     elif a.cmd == "metrics":
         job = Job(a.job or latest_job())
         if not job.state:

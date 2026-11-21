@@ -1,0 +1,14 @@
+{
+ "id": "final-hardcoded-shortcut",
+ "core": false,
+ "pair": "final-clean",
+ "stage": "final",
+ "from": "reviewer/hardcoded-instead-of-lookup",
+ "about": "The final check before hand-over must catch a result that only satisfies the test: Get returns schedule \"s1\" (the fixture's id) instead of the token's schedule (C9, 'Shortcuts').",
+ "expect": {
+  "verdict": "revise",
+  "finding_mentions": [
+   "s1"
+  ]
+ }
+}

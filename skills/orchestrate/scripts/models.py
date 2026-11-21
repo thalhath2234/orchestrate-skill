@@ -67,6 +67,9 @@ ROLES: dict[str, tuple[str, str]] = {
     "classifier": ("haiku", "low"),
     # Extract AGENTS.md notes from reports: extraction is Haiku's job [CHOOSE], default effort.
     "lessons": ("haiku", "medium"),
+    # Looks at the job's screenshots (desktop and mobile) when plan.ui is set: vision plus judgment
+    # against the definition of done. Opus 5.5 at its default effort, like the code reviewer.
+    "ui_reviewer": ("opus", "medium"),
 }
 # When the advisor at its role effort finds nothing, ask again at this effort before believing it.
 ADVISOR_ESCALATE = "high"

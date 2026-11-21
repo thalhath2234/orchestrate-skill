@@ -1,0 +1,52 @@
+{
+ "id": "plans-after-confirm",
+ "core": false,
+ "pair": "no-plan-before-confirm",
+ "about": "The same request, then the user confirms. Now the route starts: an advise, run_task, plan or validate call.",
+ "files": {
+  "Makefile": "test:\n\tpython3 -m pytest -q\n",
+  "cli.py": "import argparse\n\n\ndef main(argv=None):\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--verbose\", action=\"store_true\", help=\"print debug lines\")\n    a = ap.parse_args(argv)\n    if a.verbose:\n        print(\"debug: starting\")\n    print(\"hello\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "test_cli.py": "from cli import main\n\n\ndef test_verbose_prints_debug(capsys):\n    main([\"--verbose\"])\n    assert \"debug: starting\" in capsys.readouterr().out\n"
+ },
+ "budget_usd": 4,
+ "stub": {
+  "scan": {
+   "exit": 0,
+   "stdout": "{\"areas\": [\"api\", \"web\"], \"verify\": [\"make test\"], \"hotspots\": [], \"setup\": [], \"ui_suggestion\": null}"
+  },
+  "advise": {
+   "exit": 0,
+   "stdout": "{\"verdict\": \"proceed\", \"findings\": [], \"summary\": \"sound\"}"
+  },
+  "validate": {
+   "exit": 0,
+   "stdout": "plan ok\n"
+  },
+  "run_task": {
+   "exit": 0,
+   "stdout": "{\"result\": \"ok\", \"report\": {\"summary\": \"renamed --verbose to --debug; test updated\"}, \"steps\": []}"
+  }
+ },
+ "turns": [
+  {
+   "user": "In cli.py, rename the --verbose flag to --debug and update test_cli.py. Done means: make test passes and python3 cli.py --debug prints the debug line.",
+   "expect": {
+    "calls_include": [
+     "^orchestrate (status|scan)\\b"
+    ],
+    "calls_lack": [
+     "^orchestrate (run|plan|validate|advise|resume)\\b",
+     "^run_task\\b"
+    ]
+   }
+  },
+  {
+   "user": "Yes, that's right. Go ahead.",
+   "expect": {
+    "calls_include": [
+     "^(orchestrate (advise|plan|validate|run)|run_task)\\b"
+    ]
+   }
+  }
+ ]
+}

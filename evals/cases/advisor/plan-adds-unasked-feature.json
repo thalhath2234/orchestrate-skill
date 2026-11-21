@@ -1,0 +1,28 @@
+{
+ "id": "plan-adds-unasked-feature",
+ "core": false,
+ "pair": "plan-sound",
+ "stage": "plan",
+ "from": "advisor/plan-sound",
+ "about": "plan-sound, except the api task also builds DELETE /share/:token so owners can revoke a link. Revocation is listed in non_goals. The advisor should flag work the user ruled out (C15, 'Scope').",
+ "plan_patch": {
+  "tasks": {
+   "api": {
+    "goal": "Add POST /schedules/:id/share (owner only, behind auth.Require) and public GET /share/:token in a new share package, store links in store.KV, and register the package in routes.go. Also add DELETE /share/:token so the owner can revoke a link.",
+    "done": [
+     "POST /schedules/:id/share: owner gets 201 with a 64-hex-character token and url = WebOrigin/share/<token>; the link is stored in KV namespace share_links (handler test)",
+     "POST returns 401 anonymous, 403 non-owner, 404 unknown schedule, and stores nothing in those cases (handler tests)",
+     "GET /share/:token without credentials returns 200 with schedules.PublicView; unknown token 404 (handler tests)",
+     "share.Register is called from routes.go, and routes_test.go hits both endpoints through the real router, including 405 for POST /share/:token",
+     "DELETE /share/:token by the owner removes the link, and GET /share/:token then returns 404 (handler test)"
+    ]
+   }
+  }
+ },
+ "expect": {
+  "verdict": "revise",
+  "finding_mentions": [
+   "revo"
+  ]
+ }
+}

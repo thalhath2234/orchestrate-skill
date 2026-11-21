@@ -1,0 +1,68 @@
+{
+ "id": "dashboard-off-is-said",
+ "core": false,
+ "pair": "dashboard-link-before-run",
+ "about": "The same job, with the dashboard turned off: `dashboard <job>` exits 1 with nothing on stdout. The parent tells the user the dashboard is off and makes up no link.",
+ "files": {
+  "Makefile": "test:\n\tcd api && go test ./...\n\tcd web && npm test\n",
+  "AGENTS.md": "# rules\nGo API in api/, React app in web/. `make test` runs everything.\n",
+  "api/schedules/handler.go": "package schedules\n\n// Register mounts the schedule endpoints.\nfunc Register(r Router) {\n\tr.GET(\"/schedules/:id\", Get)\n}\n",
+  "api/schedules/handler_test.go": "package schedules\n\nimport \"testing\"\n\nfunc TestGetReturnsSchedule(t *testing.T) {}\n",
+  "web/src/Schedule.tsx": "export function Schedule({ items }: { items: string[] }) {\n  return <ul>{items.map(i => <li key={i}>{i}</li>)}</ul>\n}\n"
+ },
+ "budget_usd": 4,
+ "stub": {
+  "scan": {
+   "exit": 0,
+   "stdout": "{\"areas\": [\"api\", \"web\"], \"verify\": [\"make test\"], \"hotspots\": [], \"setup\": [], \"ui_suggestion\": null}"
+  },
+  "plan": {
+   "exit": 2,
+   "stdout": "",
+   "stderr": "planner did not return a plan:\nthe planner is off in this repo; write plan.json yourself (orchestrate-plan skill)\n"
+  },
+  "validate": {
+   "exit": 0,
+   "stdout": "OK: 3 tasks in 2 wave(s); up to 4 in parallel (limited by cpu)\n  wave 1: contract [feature:contract T1]\n  wave 2: api [feature:api T2], web [feature:web T1]\n"
+  },
+  "dashboard": {
+   "exit": 1,
+   "stdout": "",
+   "stderr": "the dashboard is turned off (ORCHESTRATE_DASHBOARD=0)\n"
+  }
+ },
+ "turns": [
+  {
+   "user": "Skip grilling. Add share links: a schedule owner can create a public read-only link to a schedule. Done means: I click Share on a schedule, open the copied link in a private window and see that schedule read-only. Decisions: links never expire; the token is 32 random bytes, base64url; only the owner can create a link. Non-goal: revoking links. It touches the Go API and the React app, so run it as a job.",
+   "expect": {
+    "calls_include": [
+     "^orchestrate (status|scan)\\b"
+    ],
+    "calls_lack": [
+     "^orchestrate (run|resume)\\b",
+     "^run_task\\b"
+    ]
+   }
+  },
+  {
+   "user": "Yes, that's right. Go ahead and plan it.",
+   "expect": {
+    "calls_include": [
+     "^orchestrate dashboard\\b"
+    ],
+    "calls_before": [
+     [
+      "^orchestrate dashboard\\b",
+      "^orchestrate run\\b"
+     ]
+    ],
+    "said_matches": [
+     "\\bdashboard\\b[^\\n]*\\b(off|disabled|unavailable|not (running|available|on))\\b|\\b(off|disabled)\\b[^\\n]*\\bdashboard\\b"
+    ],
+    "said_lacks": [
+     "https?://(127\\.0\\.0\\.1|localhost)[:/]"
+    ]
+   }
+  }
+ ]
+}
