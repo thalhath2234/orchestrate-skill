@@ -77,7 +77,26 @@ The best cases are real incidents: every `rejected_actions` in a job's manager l
 
 Recorded on 2026-11-15 with Claude Code 2.1.325. See `docs/IMPROVEMENT-PLAN.md` for the table. The P9 runs (baseline, after, sweeps) are kept in `evals/runs/p9-*` with their full JSON.
 
-No real-model run has been recorded yet for the UI reviewer and parent roles, the advisor, planner and reviewer cases added on 2026-11-21, or the parent dashboard pair. Run `make eval-quick` and `make eval-parent` (both save their JSON under `evals/runs/`) and record the baseline here.
+On 2026-11-22 (Claude Code 2.1.330, `02b9caf`) the core set passed 26/27 (0.963) for $6.34, one trial per case: `runs/quick-20261122-180607.json`.
+
+| Role | Core cases passed | Cost |
+|---|---|---|
+| manager | 9/10 | $1.54 |
+| reviewer | 4/4 | $1.31 |
+| classifier | 5/5 | $0.10 |
+| advisor | 3/3 | $2.08 |
+| worker | 1/1 | $0.42 |
+| ui_reviewer | 2/2 | $0.37 |
+| parent | 2/2 | $0.52 |
+
+The run before it (`runs/quick-20261122-144116.json`, at `690be6e`) passed 24/27 for $10.20. What to know before comparing:
+
+- `manager/review-finding-contradicts-decision` failed both times with `ask_human`. The manager says the fixture's code is stubs that meet no acceptance criterion, so it won't `accept`: the fixture may be wrong.
+- `parent/no-plan-before-confirm` failed, then passed with no change to the parent prompts between the runs: treat it as flaky until it has several trials.
+- Reviewers now mark doubts `confidence: low`, which doesn't block. In `route-not-registered` one traced gap ("expiry is never set when a link is created") was marked low. Watch for `low` hiding real bugs.
+- `runs/sweep-reviewer-20261122/` (opus/medium against opus/high) is incomplete and confounded: read its `RESULT.md` first.
+
+Cases outside the core set (non-core cases of every role, and every planner case) have no real-model baseline since 2026-11-21. Run `make eval` or `make eval-parent` and record it here.
 
 On 2026-11-21 the manager grader was tightened (`touches` matches task ids exactly, `mentions` searches the actions and not the note). The manager numbers above were graded the looser way and may be inflated. Re-run the cases that use them (`--role manager --case scope-failure --case open-issue-needs-pending-owner --trials 3`) and record the new baseline here.
 
