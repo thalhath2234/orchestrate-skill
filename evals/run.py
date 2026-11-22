@@ -170,21 +170,30 @@ def run_manager(o, case: dict, tmp: Path, config: str | None) -> dict:
 SEV_RANK = {"minor": 1, "major": 2, "blocker": 3}
 
 
+def _says(f: dict, term: str) -> bool:
+    """`term`, or one of its `|` alternatives, in the finding's text."""
+    text = json.dumps(f).lower()
+    return any(alt.lower() in text for alt in term.split("|"))
+
+
 def grade_reviewer(exp: dict, v: dict) -> list[str]:
-    """The reviewer's verdict against `expect`. Only blocker/major findings count."""
+    """The reviewer's verdict against `expect`. Only the reviewer's own blocker/major findings that
+    it stands by count: not the harness's (an unassessed criterion quotes the plan, so it would name
+    what the reviewer never found), and not one it marked low confidence. `finding_mentions` and
+    `finding_file` must all hold in one finding."""
     fails = ["reviewer produced no verdict"] if v.get("reviewer_error") else []
-    serious = [f for f in v.get("findings", []) if SEV_RANK.get(f.get("severity"), 0) >= 2]
+    serious = [f for f in v.get("findings", []) if isinstance(f, dict) and SEV_RANK.get(f.get("severity"), 0) >= 2
+               and f.get("confidence") != "low" and f.get("source") != "harness"]
     if exp.get("verdict") and v.get("verdict") != exp["verdict"]:
         fails.append(f"verdict {v.get('verdict')} != {exp['verdict']}")
-    text = json.dumps(serious).lower()
-    miss = [n for n in exp.get("finding_mentions", []) if n.lower() not in text]
-    if miss:
-        fails.append(f"no blocker/major finding mentions {miss}")
-    hit = [n for n in exp.get("no_finding_mentions", []) if n.lower() in text]
+    want, where = exp.get("finding_mentions", []), exp.get("finding_file")
+    if (want or where) and not any((not where or where in str(f.get("file", ""))) and all(_says(f, n) for n in want)
+                                   for f in serious):
+        fails.append(f"no blocker/major finding of its own" + (f" on {where}" if where else "")
+                     + (f" mentions {want}" if want else ""))
+    hit = [n for n in exp.get("no_finding_mentions", []) if any(_says(f, n) for f in serious)]
     if hit:
         fails.append(f"a blocker/major finding mentions {hit} (re-argues a settled decision)")
-    if exp.get("finding_file") and not any(exp["finding_file"] in str(f.get("file", "")) for f in serious):
-        fails.append(f"no blocker/major finding on {exp['finding_file']}")
     return fails
 
 
@@ -464,7 +473,7 @@ def run_ui_reviewer(o, case: dict, tmp: Path, config: str | None) -> dict:
 # the case's canned output, so no job runs and no subagent costs money.
 PARENT_DEFAULT = "opus/medium"
 PARENT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill", "Agent", "Task", "TodoWrite"]
-PARENT_EXPECT = {"bash_includes", "bash_lacks", "writes_lack", "calls_include", "calls_lack", "calls_before",
+PARENT_EXPECT = {"files_unchanged", "no_in_place_edit", "bash_includes", "bash_lacks", "writes_lack", "calls_include", "calls_lack", "calls_before",
                  "reply_includes", "reply_matches", "reply_lacks", "said_includes", "said_matches", "said_lacks"}
 # Keys that only pass when the turn did something. Every parent turn needs one: a turn graded only
 # on what it must not do passes when the skill never loaded or the session errored out.
@@ -559,6 +568,47 @@ def parse_stream(stdout: str) -> dict:
     return out
 
 
+IN_PLACE = {"sed": ("-i", "--in-place"), "gsed": ("-i", "--in-place"), "perl": ("-i",), "ruby": ("-i",)}
+PREFIXES = {"env", "sudo", "command", "exec", "nohup", "nice", "xargs", "time", "builtin"}
+
+
+def in_place_edits(cmd: str) -> list[str]:
+    """The simple commands in `cmd` that edit a file in place (sed -i in any spelling, perl -pi...).
+    Each is parsed like a shell would, so a quoted `|` or `;` in a sed script, or a `-i` that
+    belongs to the next command, can't confuse it."""
+    import shlex
+    found = []
+    for line in str(cmd).splitlines():
+        try:
+            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            words = list(lex)
+        except ValueError:  # unbalanced quotes: judge the line as one command
+            words = line.split()
+        simple: list[list[str]] = [[]]
+        for w in words:
+            if w and set(w) <= set(";&|()"):
+                simple.append([])
+            else:
+                simple[-1].append(w)
+        for argv in simple:
+            i = 0
+            while i < len(argv) and (re.match(r"^[A-Za-z_]\w*=", argv[i]) or argv[i] in PREFIXES or
+                                     (argv[i] == "timeout" and i + 1 < len(argv))):
+                i += 2 if argv[i] == "timeout" else 1
+                while i < len(argv) and argv[i].startswith("-") and argv[i - 1] in ("env", "sudo", "nice"):
+                    i += 1
+            if i >= len(argv):
+                continue
+            flags = IN_PLACE.get(argv[i].rsplit("/", 1)[-1])
+            if flags and any(a.startswith("--in-place") or (a.startswith("-") and not a.startswith("--")
+                                                             and "i" in a[1:].split(".", 1)[0] and "-i" in flags
+                                                             and re.match(r"^-[A-Za-z]+", a))
+                             for a in argv[i + 1:]):
+                found.append(" ".join(argv[i:]))
+    return found
+
+
 def grade_parent(exp: dict, turn: dict, calls: list[list[str]]) -> list[str]:
     """One turn against its `expect`. Tool calls first: Bash commands (attempts count, even one
     the approval hook then stops), written paths and the stub's call log (`orchestrate wait x`,
@@ -574,6 +624,12 @@ def grade_parent(exp: dict, turn: dict, calls: list[list[str]]) -> list[str]:
         hit = [b for b in turn["bash"] if re.search(rx, b)]
         if hit:
             fails.append(f"ran {hit[0][:160]!r} (matches {rx!r})")
+    if exp.get("no_in_place_edit"):
+        hit = [e for b in turn["bash"] for e in in_place_edits(b)]
+        if hit:
+            fails.append(f"edited in place: {hit[0][:160]!r}")
+    if exp.get("files_unchanged"):
+        fails += [f"changed {f}, which this turn may not edit" for f in turn.get("changed") or []]
     for rx in exp.get("writes_lack", []):
         hit = [w for w in turn["writes"] if re.search(rx, w)]
         if hit:
@@ -650,6 +706,8 @@ def run_parent(o, case: dict, tmp: Path, config: str | None) -> dict:
             fails.append(f"turn {i}: claude failed ({why}): {(out['reply'] or p.stderr or p.stdout)[-300:]}")
             break
         session = out["session_id"]
+        out["changed"] = [f for f, body in (case.get("files") or {}).items()
+                          if not (repo / f).is_file() or (repo / f).read_text(errors="replace") != body]
         fails += [f"turn {i}: {f}" for f in grade_parent(turn.get("expect") or {}, out, calls)]
         labels.append(",".join(sorted({c[0] if c[0] == "run_task" else " ".join(c[:2]) for c in calls})) or "no calls")
     return {"ok": not fails, "label": " | ".join(labels) or "error", "fails": fails, "cost": round(cost, 4),

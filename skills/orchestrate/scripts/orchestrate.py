@@ -2629,12 +2629,12 @@ def enforce_acceptance(plan: dict, v: dict) -> dict:
     for c, rows in acceptance_rows(crit, v):
         unmet = next((r for r in rows if r.get("met") is not True), None)
         if not rows:
-            added.append({"severity": "blocker", "issue": f"acceptance criterion not assessed: {c}"})
+            added.append({"severity": "blocker", "source": "harness", "issue": f"acceptance criterion not assessed: {c}"})
         elif unmet:
-            added.append({"severity": "blocker", "issue": f"acceptance criterion not met: {c}",
+            added.append({"severity": "blocker", "source": "harness", "issue": f"acceptance criterion not met: {c}",
                           "suggestion": str(unmet.get("evidence", ""))[:500]})
         elif not any(schemas.has_evidence(r.get("evidence")) for r in rows):
-            added.append({"severity": "blocker", "issue": f"acceptance criterion marked met without "
+            added.append({"severity": "blocker", "source": "harness", "issue": f"acceptance criterion marked met without "
                                                           f"evidence (file:line or test): {c}"})
     if added:
         v = {**v, "verdict": "changes_requested", "findings": list(v.get("findings") or []) + added}
@@ -2730,7 +2730,7 @@ def unreadable_code(cwd: Path, base: str) -> list[dict]:
         data = subprocess.run([*jail.GIT, "cat-file", "blob", b"HEAD:" + os.fsencode(f)], cwd=cwd,
                               capture_output=True).stdout
         if (named or mode == "100755" or data.startswith(b"#!")) and not readable(data):
-            bad.append({"severity": "blocker", "confidence": "high", "file": printable(f),
+            bad.append({"severity": "blocker", "confidence": "high", "source": "harness", "file": printable(f),
                         "issue": f"{printable(f)} holds binary data under a code file's name, so no reviewer "
                                  "could read the change",
                         "suggestion": "Commit it as plain UTF-8 text, or under an extension that says it is binary."})

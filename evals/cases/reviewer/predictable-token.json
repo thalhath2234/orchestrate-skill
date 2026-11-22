@@ -15,7 +15,7 @@
  "expect": {
   "verdict": "changes_requested",
   "finding_mentions": [
-   "crypto"
+   "crypto|csprng|math/rand|predictab|guess"
   ],
   "finding_file": "share/handler.go"
  }
