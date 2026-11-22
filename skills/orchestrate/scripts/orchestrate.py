@@ -738,6 +738,8 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
     for k in ("verify", "setup", "acceptance", "non_goals", "decisions", "quality_bar", "assumptions"):
         if k in plan and not (isinstance(plan[k], list) and all(isinstance(x, str) for x in plan[k])):
             errs.append(f"plan.{k} must be a list of strings")
+    if plan.get("sandbox") is not None and not isinstance(plan["sandbox"], bool):
+        errs.append(f"plan.sandbox must be true or false (or left out), not {plan['sandbox']!r}")
     if not plan.get("acceptance"):
         errs.append("plan.acceptance is required: the job's definition of done, as checkable criteria")
     if not (isinstance(plan.get("definition_of_done"), str) and plan["definition_of_done"].strip()):
@@ -1501,7 +1503,7 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
     if plan.get("extra_tools"):
         cmd += ["--extra-tools", *plan["extra_tools"]]
     cmd += ["--jail", jail.mode_of(plan), "--trusted-verify", scope]
-    if plan.get("sandbox"):
+    if jail.mode_of(plan) == "required":
         cmd.append("--sandbox")
     if plan.get("exclude_dynamic_prompt", True):  # measured: ~4.8k fewer cache-write tokens per session
         cmd.append("--exclude-dynamic-prompt")
@@ -4326,8 +4328,10 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
     job.state["commit_hook_skipped"] = not plan.get("commit_hook") and has_commit_hook(repo)
     if job.state["commit_hook_skipped"]:
         log('note: the repo\'s pre-commit hook will not run (set "commit_hook": true to run it as a check on each task)')
-    orca = job.state.get("mode") == "orca"
-    job.state["unconfined"] = ORCA_UNCONFINED if orca else "plan.sandbox is false" if mode == "off" else why
+    loose = "plan.sandbox is false" if mode == "off" else why
+    if job.state.get("mode") == "orca":
+        loose = ORCA_UNCONFINED + (f"; verify, setup and the dev server aren't confined either: {loose}" if loose else "")
+    job.state["unconfined"] = loose
     if job.state["unconfined"]:
         log(f"warning: workers are NOT confined ({job.state['unconfined']}): they can write anywhere you can")
     confine = confinement(plan) if has_worker_code(job, integ) else None  # a resume; first time it's the user's code
@@ -4823,7 +4827,8 @@ def render_report(job: Job, plan: dict) -> str:
               *[f"- **{t}**: {', '.join(f)}" for t, f in claimed.items()]]
     for r in s.get("review", {}).get("rounds", []):
         v = r.get("verdict") or {}
-        L += ["", f"Review round {r['round']}: final verify {'ok' if r.get('final_verify_ok') else 'FAILED'}, "
+        L += ["", f"Review round {r['round']}{' (superseded by an edit, not counted)' if r.get('superseded') else ''}: "
+                  f"final verify {'ok' if r.get('final_verify_ok') else 'FAILED'}, "
                   + (f"verdict **{v.get('verdict', '-')}**: {v.get('summary', '')}" if v
                      else "interrupted before a verdict (the job stopped during this round)")]
         for a in v.get("acceptance", []) or []:
@@ -5457,6 +5462,11 @@ def cmd_worker_event(a) -> int:
         raise SystemExit(f"no job {a.job}")
     if job.state.get("mode") != "orca":
         raise SystemExit(f"job {a.job} doesn't run Orca workers")
+    if jail.mode_of(job.plan) == "required":
+        print(f"plan.sandbox is now true, and this job's Orca workers aren't confined ({ORCA_UNCONFINED}): their "
+              "work isn't checked or merged. Have the user either drop \"sandbox\" from the job's plan.json and "
+              "run this same command again, or start a new job with --workers headless.", file=sys.stderr)
+        return 2
     log_to_job(job.dir)
     if a.cmd == "worker-lost":
         return orca_mode.worker_lost(job, job.plan, a.dispatch, a.reason)

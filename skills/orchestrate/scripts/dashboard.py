@@ -387,7 +387,8 @@ def job_payload(jid: str) -> dict | None:
                     "interventions": m.get("interventions", 0),
                     "log": [_manager_entry(e) for e in _dicts(m.get("log"))],
                     "busy_s": m.get("busy_s")},
-        "review": rounds, "accepted_by_manager": _dict(s.get("review")).get("accepted_by_manager"),
+        "review": rounds, "review_rounds_used": sum(1 for r in rounds if not r.get("superseded")),
+        "accepted_by_manager": _dict(s.get("review")).get("accepted_by_manager"),
         "owed_fix": _dict(s.get("review")).get("owed_fix"),
         "advice": advice, "advice_plan_ok": s.get("advice_plan_ok"),
         "skipped_checks": _skipped_checks(s, p), "baseline_skipped": bool(s.get("baseline_skipped")),
@@ -1635,7 +1636,7 @@ KINDS.overview = {
       <div class="tile"><div class="k">Cost</div><div class="v">${money(D.cost_usd)}</div><div class="s">${D.budget_usd ? 'of ' + money(D.budget_usd) + ' budget' : 'no budget set'}</div>${costMeter()}</div>
       <div class="tile"><div class="k">Parallel</div><div class="v">${c.running}<small> / ${cap.cap ?? D.max_parallel ?? '–'}</small></div><div class="s">${cap.limited_by ? 'capped by ' + human(cap.limited_by) : 'slots in use'}${cap.mem_available_gb != null ? ' · ' + cap.mem_available_gb + ' GB free' : ''}</div></div>
       <div class="tile"><div class="k">Manager</div><div class="v">${D.manager.enabled ? String(D.manager.interventions || 0) : 'off'}</div><div class="s">${D.manager.enabled ? 'interventions' + (M.auto_triaged ? ' · ' + M.auto_triaged + ' by rule' : '') : 'manager disabled'}</div></div>
-      <div class="tile"><div class="k">Review</div><div class="v">${(D.review||[]).length}<small> / ${D.review_rounds_max ?? 2}</small></div><div class="s">${(() => { const r = latestReview(); return r ? 'last: ' + human((r.verdict||{}).verdict || '…') : 'no round yet'; })()}</div></div>
+      <div class="tile"><div class="k">Review</div><div class="v">${D.review_rounds_used ?? (D.review||[]).length}<small> / ${D.review_rounds_max ?? 2}</small></div><div class="s">${(() => { const r = latestReview(); return r ? 'last: ' + human((r.verdict||{}).verdict || '…') : 'no round yet'; })()}</div></div>
     </div>`);
     patch(t.r.dod, D.definition_of_done ? h`<div class="card" style="margin-bottom:14px"><div class="card-h">Definition of done <span class="r">the user's own words</span></div><div class="card-b"><div class="quote">${str(D.definition_of_done)}</div></div></div>` : '');
     const ap = advEntries('plan'), af = advEntries('final'), lastA = af[af.length-1] || ap[ap.length-1];
@@ -2018,7 +2019,7 @@ function sideReview(){
   const ap = advEntries('plan'), af = advEntries('final');
   const fs = findings(), lr = latestReview(), cur = lr ? fs.filter(f => f._round === lr.round) : [];
   const advRow = (a, stage, i, n) => treeRow({d:0, icon:I.owl, label: (stage === 'plan' ? 'Plan check' : 'Final check') + (n > 1 ? ' ' + (i+1) : ''), desc: a.error ? 'no usable answer' : a.verdict || '', meta: a.config || '', tip: a.summary || a.cause || '', attrs: act('open','advisor',stage), sel: isSel('advisor', stage)});
-  return h`${sect('rounds', 'Rounds', `${R.length} / ${D.review_rounds_max ?? 2}`, rows.length ? rows : h`<div class="side-note">No review round yet. Review starts once every task has merged.</div>`)}
+  return h`${sect('rounds', 'Rounds', `${D.review_rounds_used ?? R.length} / ${D.review_rounds_max ?? 2}`, rows.length ? rows : h`<div class="side-note">No review round yet. Review starts once every task has merged.</div>`)}
     ${sect('advisor', 'Advisor', ap.length + af.length || '', ap.length || af.length ? h`${ap.map((a, i) => advRow(a, 'plan', i, ap.length))}${af.map((a, i) => advRow(a, 'final', i, af.length))}` : h`<div class="side-note">${D.advice_plan_ok ? 'Plan check: ' + str(D.advice_plan_ok) : 'No advisor check yet.'}</div>`)}
     ${sect('latest', 'Latest findings', cur.length, cur.length ? h`<div class="side-probs">${cur.map(f => probRow(f))}</div>` : h`<div class="side-note">No findings.</div>`)}`;
 }

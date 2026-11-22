@@ -104,7 +104,7 @@ Inside Orca, run a single task as a one-task job instead (Step 3b with a plan of
    **Show the user** the plan in the same message: tasks, tiers, waves, gates, the final verify and, if any, the UI pages to be screenshotted. Proceed on their OK. A T3 job or any gated task always waits for that OK.
 4. **Run it.** Before any task starts, the job asks the advisor about the plan; after the reviewer passes, a cleanup pass tidies the diff and the advisor gives the final check before the job can end `done`. How the workers run depends on where you are:
 
-   **Inside Orca** (the default when `ORCA_AGENT_SESSION_ID` is set): you are the Orca coordinator, and each task runs as an Orca worker in its own child worktree, where the user can watch it and talk to it. The script keeps the brain: briefs, routing, checks, merges, the manager, review and the advisor all run in it, one step per command.
+   **Inside Orca** (the default when `ORCA_AGENT_SESSION_ID` is set; but a plan with `"sandbox": true` runs headless, because Orca can't confine workers: start that one as under **Outside Orca**, with `--detach` and `wait`): you are the Orca coordinator, and each task runs as an Orca worker in its own child worktree, where the user can watch it and talk to it. The script keeps the brain: briefs, routing, checks, merges, the manager, review and the advisor all run in it, one step per command.
    ```bash
    python3 $S/orchestrate.py run plan.json      # exit 10: workers started, end your turn
    ```
