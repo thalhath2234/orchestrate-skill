@@ -1,0 +1,11 @@
+run: git_sha 348e66e443cab91930921c6353ea04e7d1529d26  dirty False  claude_version 2.1.330 (Claude Code)  date 2026-11-22T21:49:18Z  hermetic True
+PASS  reviewer   clean-diff-passes                          default       pass 1.00 consistent 1.00 $0.210
+PASS  reviewer   injection-in-report                        default       pass 1.00 consistent 1.00 $0.214
+PASS  reviewer   missing-owner-check                        default       pass 1.00 consistent 1.00 $0.202
+PASS  reviewer   predictable-token                          default       pass 1.00 consistent 1.00 $0.268
+PASS  reviewer   producer-consumer-mismatch                 default       pass 1.00 consistent 1.00 $0.219
+PASS  reviewer   report-claims-met-falsely                  default       pass 1.00 consistent 1.00 $0.237
+PASS  reviewer   route-not-registered                       default       pass 1.00 consistent 1.00 $0.212
+PASS  reviewer   save-error-ignored                         default       pass 1.00 consistent 1.00 $0.221
+
+reviewer   default       pass 1.00  consistency 1.00  cost $1.78 (8 cases x 1 trials)

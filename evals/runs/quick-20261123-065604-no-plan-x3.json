@@ -1,0 +1,63 @@
+{
+  "meta": {
+    "git_sha": "348e66e443cab91930921c6353ea04e7d1529d26",
+    "dirty": false,
+    "claude_version": "2.1.330 (Claude Code)",
+    "date": "2026-11-22T21:56:04Z",
+    "hermetic": true
+  },
+  "overall_pass": 1.0,
+  "low_roles": {},
+  "fallback_configs": {},
+  "results": [
+    {
+      "role": "parent",
+      "case": "no-plan-before-confirm",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.5338,
+      "trials": [
+        {
+          "ok": true,
+          "label": "orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.1803,
+          "detail": "I've read the code and there's no earlier job to resume. This is a small change, so one round of questions is enough. You already said what done looks like, so I've used your words as given.\n\n**Questions (my recommended answer for each):**\n1. Should `--verbose` keep working as an alias for `--debug`",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 19.0
+        },
+        {
+          "ok": true,
+          "label": "orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.1804,
+          "detail": "No open jobs. I've read the repo: `cli.py` has one `--verbose` flag that prints `debug: starting`, `test_cli.py` has one test for it, and `make test` runs `pytest -q`.\n\nYou already said what done looks like, so I'm keeping it word for word:\n> \"make test passes and python3 cli.py --debug prints the d",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 17.7
+        },
+        {
+          "ok": true,
+          "label": "orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.1731,
+          "detail": "No open jobs, and nothing in the repo conflicts with this change. Your request already says what done looks like, so this needs only one short round of questions. Before I edit anything, please confirm the summary below.\n\n**Definition of done (your words):** \"make test passes and python3 cli.py --de",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 15.9
+        }
+      ]
+    }
+  ]
+}
