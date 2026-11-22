@@ -990,7 +990,8 @@ class OrchestrateTest(unittest.TestCase):
         code, out = self.drive_orca(("run", str(self.write_plan(base_plan(self.repo)))), {"tasks": WRITES})
         self.assertEqual(code, 0, out[-3000:])
         fresh = [c for c in self.orca_of("worker-start")]
-        self.assertTrue(all(c["worktree"] == "new-top-level" and c["repo"] == f"path:{self.repo}" for c in fresh), fresh)
+        repo = f"path:{self.repo.resolve()}"  # the job records the resolved path (macOS's temp dir is a symlink)
+        self.assertTrue(all(c["worktree"] == "new-top-level" and c["repo"] == repo for c in fresh), fresh)
 
     def test_orca_question_holds_new_work_but_running_workers_still_merge(self):
         self.orca_env()
@@ -1758,6 +1759,12 @@ class OrchestrateTest(unittest.TestCase):
         job.state["tasks"]["web"]["start_sha"] = start
         return job, plan, integ, head, wt, br
 
+    def _start_conflicting_merge(self, integ, br):
+        # with an identity: where none is configured (CI) git refuses before it writes MERGE_HEAD
+        p = subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "merge", "--no-ff", "--no-edit", br],
+                           cwd=integ, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, f"the merge should stop on a conflict: {p.stdout}{p.stderr}")
+
     def test_a_modify_delete_conflict_is_never_merged_on_its_own(self):
         # no markers to judge: staging would keep whatever is on disk and drop one side silently
         for name, integ_change, web_change in (
@@ -1789,7 +1796,7 @@ class OrchestrateTest(unittest.TestCase):
             lambda w: (w / "AGENTS.md").write_text("# root rules\nfrom-web\n"))
         subprocess.run(["git", "-C", str(wt), "commit", "-qam", "web"], env={**os.environ, "GIT_AUTHOR_NAME": "t",
                        "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}, check=True)
-        subprocess.run(["git", "merge", "--no-ff", "--no-edit", br], cwd=integ, capture_output=True)
+        self._start_conflicting_merge(integ, br)
         (integ / "AGENTS.md").write_text("# root rules\nfrom-integration\nfrom-web\n")  # markers gone anyway
         real = self.o.claude
         self.o.claude = lambda *a, **k: {"result": "I could not decide, sorry.", "structured": None}
@@ -1820,7 +1827,7 @@ class OrchestrateTest(unittest.TestCase):
         self.assertEqual(self.o.git(integ, "rev-parse", "HEAD"), head)
         self.assertEqual(self.o.git(integ, "status", "--porcelain", "--untracked-files=no"), "")
         # and a later step that commits on the integration branch clears any merge left open first
-        subprocess.run(["git", "merge", "--no-ff", "--no-edit", br], cwd=integ, capture_output=True)
+        self._start_conflicting_merge(integ, br)
         self.assertTrue(self.o.git(integ, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False))
         self.o.clear_unfinished_merge(integ)
         self.assertEqual(self.o.git(integ, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False), "")

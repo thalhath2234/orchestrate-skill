@@ -1239,9 +1239,16 @@ def _proc_stat(pid: int) -> tuple[int, int, int] | None:
     except (OSError, ValueError, IndexError):
         pass
     try:
-        r = subprocess.run(["ps", "-o", "ppid=,pgid=,sess=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+        # no `sess=`: on macOS it isn't the session id. getsid is, on both.
+        r = subprocess.run(["ps", "-o", "ppid=,pgid=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
         a = [int(x) for x in r.stdout.split()]
-        return (a[0], a[1], a[2] if len(a) > 2 else a[1]) if len(a) >= 2 else None
+        if len(a) != 2:
+            return None
+        try:
+            sid = os.getsid(pid)
+        except OSError:
+            sid = a[1]
+        return a[0], a[1], sid
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 

@@ -253,7 +253,7 @@ class EvalRunnerTest(unittest.TestCase):
 
     def test_dirty_ignores_eval_outputs(self):
         """A run's own --json (or an earlier run's output) must not mark a clean tree dirty."""
-        repo = self.tmp / "repo"
+        repo = (self.tmp / "repo").resolve()  # as run.ROOT is (macOS's temp dir is a symlink)
         (repo / "evals").mkdir(parents=True)
         (repo / "a b.txt").write_text("x\n")
         g = ["git", "-c", "user.email=e@e", "-c", "user.name=t"]

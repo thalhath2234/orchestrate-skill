@@ -18,6 +18,7 @@ import textwrap
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,6 +55,18 @@ def pid_alive(pid: int) -> bool:
         return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
     except OSError:
         return True
+
+
+class ProcStatWithoutProcTest(unittest.TestCase):
+    def test_without_proc_the_session_comes_from_getsid_not_from_ps(self):
+        # macOS has no /proc, and its `ps -o sess=` doesn't print a session id
+        def ps(cmd, **kw):
+            out = "100 200" + (" c0dedbad" if "sess" in cmd[2] else "")
+            return U.subprocess.CompletedProcess(cmd, 0, stdout=out + "\n", stderr="")
+
+        with mock.patch.object(U.Path, "read_text", side_effect=OSError), \
+                mock.patch.object(U.subprocess, "run", ps), mock.patch.object(U.os, "getsid", return_value=300):
+            self.assertEqual(U._proc_stat(4242), (100, 200, 300))
 
 
 class FramingTest(unittest.TestCase):
@@ -664,7 +677,12 @@ class RealChromeTest(unittest.TestCase):
 
     def test_dev_server_that_dies_mid_capture_fails_closed(self):
         port = free_port()
-        plan = {"ui": {"dev": f"exec timeout 4 {sys.executable} -m http.server {port} --bind 127.0.0.1",
+        server = self.tmp / "dies.py"  # ends itself: macOS has no `timeout` command
+        server.write_text("import http.server, os, threading\n"
+                          "threading.Timer(4, os._exit, (124,)).start()\n"
+                          f"http.server.ThreadingHTTPServer(('127.0.0.1', {port}), "
+                          "http.server.SimpleHTTPRequestHandler).serve_forever()\n")
+        plan = {"ui": {"dev": f"exec {sys.executable} {server}",
                        "url": f"http://127.0.0.1:{port}", "ready_timeout_s": 20, "viewports": ["desktop"],
                        "pages": [{"path": "/", "steps": [{"wait_ms": 5000}]}, {"path": "/index.html"}]},
                 "tasks": []}
