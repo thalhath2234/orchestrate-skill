@@ -1560,6 +1560,49 @@ class OrchestrateTest(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(p.stdout.strip(), "0.25", "another process (a resumed job's manager): " + p.stderr)
 
+    def test_workers_die_with_their_orchestrator_however_it_stops(self):
+        exe = str(self.tmp / "claude").encode()
+
+        def workers():
+            found = []
+            for d in Path("/proc").glob("[0-9]*"):
+                with contextlib.suppress(OSError):
+                    if (d / "cmdline").read_bytes().split(b"\0")[1:2] == [exe] and (d / "cwd").resolve().name == "contract":
+                        found.append(int(d.name))
+            return found
+
+        n = 0
+        for sig in (signal.SIGKILL, signal.SIGTERM, signal.SIGINT):
+            for sandbox in (None, False):
+                n += 1
+                with self.subTest(sig=sig.name, confined=sandbox is None):
+                    plan = {**base_plan(self.repo), "job": f"stop-{n}"}
+                    if sandbox is False:
+                        plan["sandbox"] = False
+                    tasks = {**WRITES, "contract": {**WRITES["contract"], "sleep": 30}}
+                    self.cfg.write_text(json.dumps({"tasks": tasks}))
+                    p = subprocess.Popen([sys.executable, str(ORCH), "run", str(self.write_plan(plan)), "--workers", "headless"],
+                                         env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         start_new_session=True)
+                    try:
+                        end = time.time() + 40
+                        while not workers() and time.time() < end:
+                            time.sleep(0.2)
+                        self.assertTrue(workers(), "a worker started")
+                        os.kill(p.pid, sig)  # the orchestrator alone, not its group
+                        end = time.time() + 10
+                        while (workers() or p.poll() is None) and time.time() < end:
+                            time.sleep(0.2)
+                        self.assertEqual(workers(), [], "a worker outlived its orchestrator")
+                        self.assertIsNotNone(p.poll(), "the orchestrator waited for its workers")
+                    finally:
+                        for pid in workers():
+                            with contextlib.suppress(OSError):
+                                os.kill(pid, signal.SIGKILL)
+                        with contextlib.suppress(OSError):
+                            os.killpg(p.pid, signal.SIGKILL)
+                        p.wait()
+
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate
         v = orchestrate.settle_verdict({"verdict": "pass", "findings": [

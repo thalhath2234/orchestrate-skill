@@ -1412,18 +1412,40 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
     env = {**os.environ, "ORCHESTRATE_SLOT": str(slot), "ORCHESTRATE_JOB": job.id,
            "ORCHESTRATE_TASK": task["id"]}
     with open(logf, "a") as fh:
-        p = subprocess.run(cmd, cwd=wt, input=brief, stdout=subprocess.PIPE, stderr=fh, encoding="utf-8",
-                           errors="replace", env=env)
-    summary = extract_json(p.stdout) or {}
+        code, stdout = run_child(cmd, wt, brief, fh, env)
+    summary = extract_json(stdout) or {}
     report = summary.get("report")
     if not (isinstance(report, dict) and "summary" in report):
         report = extract_json(summary.get("final_message", "")) or {}
     cost = sum((s.get("cost_usd") or 0) + (s.get("classifier_cost_usd") or 0)
                for s in summary.get("steps", []))
-    return {"ok": p.returncode == 0, "result": summary.get("result", f"exit {p.returncode}"),
+    return {"ok": code == 0, "result": summary.get("result", f"exit {code}"),
             "steps": summary.get("steps", []), "proposals": summary.get("proposals", []),
             "report": report, "cost_usd": cost, "wt": str(wt), "branch": br,
             "final_message": (summary.get("final_message") or "")[-3000:]}
+
+
+_children: set = set()  # run_task processes, each the leader of its own group
+
+
+def run_child(cmd: list[str], cwd: Path, text: str, stderr, env: dict | None = None) -> tuple[int, str]:
+    """run_task.py in a group of its own, so it can be stopped with everything it started."""
+    p = subprocess.Popen([*cmd[:-1], "--parent", str(os.getpid()), cmd[-1]], cwd=cwd, env=env,
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, encoding="utf-8",
+                         errors="replace", start_new_session=True)
+    _children.add(p)
+    try:
+        out, _ = p.communicate(text)
+        return p.returncode, out
+    finally:
+        if p.poll() is None:  # interrupted while waiting
+            stop_child(p)
+        _children.discard(p)
+
+
+def stop_child(p: subprocess.Popen) -> None:
+    with contextlib.suppress(OSError):
+        os.killpg(p.pid, signal.SIGTERM)
 
 
 def read_claims(job: Job) -> dict:
@@ -1709,14 +1731,13 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
     if left is not None:
         cmd[-1:-1] = ["--budget-usd", f"{max(left, 0.01):.2f}"]
     with open(job.dir / "logs" / f"_fix-round-{rnd_no}.log", "a") as fh:
-        p = subprocess.run(cmd, cwd=integ, input=task, stdout=subprocess.PIPE, stderr=fh, encoding="utf-8",
-                           errors="replace")
+        _, stdout = run_child(cmd, integ, task, fh)
     if not on_branch(integ, job.state["branch"]):
         raise RuntimeError(f"review round {rnd_no}: the integration worktree left {job.state['branch']}; "
                            "nothing was committed")
     if git(integ, "rev-parse", "HEAD") != before:
         git(integ, "reset", "-q", "--soft", before)  # what it committed is judged like what it only edited
-    s = extract_json(p.stdout) or {}
+    s = extract_json(stdout) or {}
     for x in s.get("steps", []):
         record_call(job, "fix_round", {"total_cost_usd": (x.get("cost_usd") or 0) + (x.get("classifier_cost_usd") or 0),
                                        "metrics": x.get("metrics")}, None, x.get("config", ""))
@@ -4016,6 +4037,8 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                              "log_tail": logtail})
                 job.save()
     except KeyboardInterrupt:
+        for child in list(_children):  # in groups of their own, so Ctrl-C didn't reach them
+            stop_child(child)
         for fut, tid in running.items():
             job.state["tasks"][tid]["status"] = "pending"
         if mgr is not None and mgr.get("event"):
