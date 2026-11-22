@@ -1688,6 +1688,78 @@ class OrchestrateTest(unittest.TestCase):
         self.assertIn("usage limit", st["message"])
         self.assertTrue(st.get("pending_events"), "the event waits for the manager")
 
+    def test_setup_runs_again_on_the_merged_tree(self):
+        (self.repo / ".gitignore").write_text(".installed\n")
+        self._commit(self.repo, "ignore installs")
+        rewrite = '[ "$(basename "$PWD")" != _integration ] || echo "# relocked" >> AGENTS.md'
+        plan = base_plan(self.repo, baseline=["true"], verify=["test -f .installed"],
+                         setup=["test ! -f packages/contract/src/share/types.ts || touch .installed", rewrite])
+        code, out, err = self.cli("run", str(self.write_plan(plan)), "--workers", "headless", cfg={"tasks": WRITES})
+        self.assertEqual(code, 0, err[-2000:])
+        integ = self.state / "jobs/share/wt/_integration"
+        self.assertEqual(self.o.git(integ, "status", "--porcelain", "--untracked-files=no"), "",
+                         "what setup rewrote in tracked files is put back")
+        self.assertNotIn("relocked", (integ / "AGENTS.md").read_text())
+
+    def test_setup_that_fails_on_the_merged_tree_fails_the_final_verify(self):
+        plan = base_plan(self.repo, baseline=["true"], review_rounds=1,
+                         setup=['[ "$(basename "$PWD")" != _integration ] || test ! -f apps/api/share/handler.go'])
+        code, out, err = self.cli("run", str(self.write_plan(plan)), "--workers", "headless", cfg={"tasks": WRITES})
+        self.assertNotEqual(code, 0)
+        rnd = self.job_state()["review"]["rounds"][0]
+        self.assertFalse(rnd["final_verify_ok"])
+        self.assertIn("setup failed", rnd["final_verify_tail"])
+
+    def test_parallel_tasks_share_what_is_left_of_the_budget(self):
+        plan = base_plan(self.repo, budget_usd=3)
+        tasks = {**WRITES, "api": {**WRITES["api"], "sleep": 1}, "web": {**WRITES["web"], "sleep": 1}}
+        code, out, err = self.cli("run", str(self.write_plan(plan)), "--workers", "headless", cfg={"tasks": tasks})
+        self.assertEqual(code, 0, err[-2000:])
+        got = {c["tid"]: float(c["budget"]) for c in self.calls_of("worker")}
+        self.assertGreater(got["contract"], 2.8, "a task running alone gets what is left")
+        self.assertLessEqual(got["api"] + got["web"], 3.0, got)
+        self.assertGreater(min(got["api"], got["web"]), 1.0, got)
+
+    def test_area_reviewers_share_what_is_left_of_the_budget(self):
+        job, wt, base = self._changed({"apps/api/share/handler.go": "package share\n" + "// l\n" * 40,
+                                       "apps/web/src/share/Button.tsx": "export const B = 1\n" + "// l\n" * 40})
+        seen = self._replies(self._good_review())
+        self.o.review(job, {**self._review_plan(), "budget_usd": 4, "review_diff_chars": 80}, "ok")
+        areas = [kw["budget_usd"] for p, kw in seen if p.startswith("ORCHESTRATE_REVIEW_AREA")]
+        self.assertEqual(len(areas), 2)
+        self.assertLessEqual(sum(areas), 4.0)
+
+    def test_a_repos_commit_hook_is_reported_or_run_as_a_check(self):
+        hooks = self.repo / ".git" / "hooks"
+        hooks.mkdir(exist_ok=True)
+        hook = hooks / "pre-commit"
+        hook.write_text("#!/bin/sh\nif git diff --cached | grep -q '^+export const B'; then echo LINT-FAILED; exit 1; fi\n")
+        hook.chmod(0o755)
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), "--workers", "headless",
+                                  cfg={"tasks": WRITES})
+        self.assertEqual(code, 0, err[-2000:])
+        self.assertIn("pre-commit", (self.state / "jobs/share/report.md").read_text(), "a hook that didn't run is said")
+        for sandbox in (None, False):
+            with self.subTest(confined=sandbox is None):
+                self.tearDown()
+                self.setUp()
+                hook = self.repo / ".git" / "hooks" / "pre-commit"
+                hook.parent.mkdir(exist_ok=True)
+                refused = self.tmp / "hook-refused"
+                hook.write_text("#!/bin/sh\nif git diff --cached | grep -q '^+export const B'; then "
+                                f"touch '{refused}'; echo LINT-FAILED; exit 1; fi\n")
+                hook.chmod(0o755)
+                over = {"commit_hook": True, **({"sandbox": False} if sandbox is False else {})}
+                code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo, **over))), "--workers",
+                                          "headless", cfg={"tasks": WRITES})
+                st = self.job_state()
+                self.assertEqual(st["tasks"]["web"]["status"], "failed", err[-1500:])
+                self.assertEqual(st["tasks"]["api"]["status"], "done", "a task the hook accepts is untouched")
+                self.assertTrue([c for c in self.calls_of("worker") if c["tid"] == "web" and c["retry"]],
+                                "the failure went back to the worker")
+                self.assertTrue(refused.exists(), "the hook saw the change staged, and refused it")
+                self.assertEqual(self.o.git(self.repo, "fsck", "--no-dangling", "--no-progress"), "", "objects intact")
+
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate
         v = orchestrate.settle_verdict({"verdict": "pass", "findings": [

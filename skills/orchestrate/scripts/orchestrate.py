@@ -334,6 +334,17 @@ def budget_left(job, plan: dict) -> float | None:
     return None if b is None else max(float(b) - job.state.get("cost_usd", 0), 0.0)
 
 
+BUDGET_MIN = 0.05  # less free than this: wait for a running call to give back what it didn't spend
+MANAGER_BUDGET = 1.0  # held back for a manager call while tasks run beside it (one costs $0.10-0.40)
+
+
+def budget_free(job, plan: dict, held: dict) -> float | None:
+    """What no running call holds. Calls that run side by side split this: each one's
+    --max-budget-usd counts its own process alone, so whole remainders would add up past the cap."""
+    left = budget_left(job, plan)
+    return None if left is None else max(left - sum(held.values()), 0.0)
+
+
 # ================================================================ capacity ===
 def _cgroup() -> tuple[float | None, float | None]:
     """(memory headroom GB, cpu quota cores) from cgroup v2, tightest ancestor wins."""
@@ -1365,6 +1376,25 @@ def run_setup(cmds: list[str], cwd: Path, logf: Path, confine: Path | None = Non
     return True, ""
 
 
+def setup_integration(job: Job, plan: dict, integ: Path, confine: Path | None) -> tuple[bool, str]:
+    """plan.setup on the integration tree: at the start, and again wherever a merge may have changed
+    what it installs. What it rewrites in tracked files (a lockfile) is put back: verify and review
+    judge the commit, and a later `git add -A` must not pick it up."""
+    if not plan.get("setup"):
+        return True, ""
+
+    def unstaged() -> set[str]:
+        return set(git_paths(integ, "diff", "--name-only", "--no-renames"))
+
+    before = unstaged()
+    ok, err = run_setup(plan["setup"], integ, job.dir / "logs" / "_integration.log", confine)
+    edited = sorted(unstaged() - before)
+    if edited:
+        git(integ, "--literal-pathspecs", "checkout", "--", *edited)
+        log(f"setup rewrote tracked file(s), put back: {', '.join(printable(f) for f in edited[:8])}")
+    return ok, err
+
+
 def prepare_worktree(job: Job, tid: str, start_sha: str) -> tuple[Path, str]:
     """Main thread only: git worktree/branch operations are not safe to run concurrently."""
     repo = Path(job.state["repo"])
@@ -1377,6 +1407,28 @@ def prepare_worktree(job: Job, tid: str, start_sha: str) -> tuple[Path, str]:
     git(repo, "branch", "-D", br, check=False)
     git(repo, "worktree", "add", "-q", "-b", br, str(wt), start_sha)
     return wt, br
+
+
+# The repo's pre-commit hook as a check, where the worker's other checks run (the harness's own git
+# never runs hooks: a branch can write them). It sees the task's changes staged in a scratch index
+# and object dir, so it works where the repo's objects are read-only and touches neither.
+HOOK_CHECK = (
+    '(c=$(git rev-parse --path-format=absolute --git-common-dir) && '
+    'h=$(git rev-parse --git-path hooks)/pre-commit && if [ -x "$h" ]; then '
+    't=$(mktemp -d) && trap \'rm -rf "$t"\' EXIT && mkdir "$t/objects" && '
+    'export GIT_INDEX_FILE="$t/index" GIT_OBJECT_DIRECTORY="$t/objects" '
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES="$c/objects" && git read-tree HEAD && git add -A && "$h"; fi)')
+
+
+def task_checks(plan: dict, task: dict) -> list[str]:
+    return [*task["verify"], *([HOOK_CHECK] if plan.get("commit_hook") else [])]
+
+
+def has_commit_hook(repo: Path) -> bool:
+    # plain git, reading config only: jail.GIT would answer /dev/null
+    p = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=repo, capture_output=True, text=True)
+    hook = repo / p.stdout.strip() / "pre-commit"
+    return p.returncode == 0 and hook.is_file() and os.access(hook, os.X_OK)
 
 
 def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, budget: float | None) -> dict:
@@ -1405,7 +1457,7 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
         cmd += ["--max-model", plan["max_model"]]
     if plan.get("advisor"):
         cmd += ["--advisor", plan["advisor"]]
-    for v in task["verify"]:
+    for v in task_checks(plan, task):
         cmd += ["--verify", v]
     if isinstance(task.get("baseline"), list):
         for b in task["baseline"]:
@@ -1633,6 +1685,12 @@ Reply with the JSON object: resolved (true|false), notes."""
     busy = {s.get("slot") for t, s in job.state["tasks"].items() if s.get("status") == "running" and t != task["id"]}
     slot = next(i for i in range(len(busy) + 1) if i not in busy)
     env = {**os.environ, "ORCHESTRATE_SLOT": str(slot), "ORCHESTRATE_JOB": job.id, "ORCHESTRATE_TASK": task["id"]}
+    if cmds:
+        ok, err = setup_integration(job, plan, integ, confinement(plan))  # on the resolved tree
+        if not ok:
+            job.state["tasks"][task["id"]]["merge_verify"] = {"cmd": "setup", "ok": False, "tail": err[-3000:],
+                                                              "files": conflicted}
+            return False, f"integrator resolution fails verify: setup\n{err[-1500:]}"
     for c in cmds:  # commit_and_merge aborts the merge if this is interrupted
         code, out = sh(c, integ, 1800, env=env, confine=confinement(plan))
         if code:
@@ -1663,7 +1721,10 @@ def verify_and_review(job: Job, plan: dict, rnd_no: int) -> tuple[dict, list[dic
     integ = Path(job.state["integration_wt"])
     clear_unfinished_merge(integ)  # never verify or review a half-merged tree
     code, vout = 0, ""
-    for c in plan["verify"]:
+    ok, err = setup_integration(job, plan, integ, confinement(plan))  # merges may add a dependency
+    if not ok:
+        code, vout = 1, err[-4000:]
+    for c in plan["verify"] if ok else []:
         code, out = sh(c, integ, 1800, confine=confinement(plan))
         vout += f"$ {c}\n{out[-4000:]}\n"
         if code:
@@ -2870,10 +2931,13 @@ the other areas expect. Reply with the JSON object: edge_cases, findings, raise_
 verdict."""
 
     am, ae = models.role("area_reviewer", plan)
+    each = budget_left(job, plan)
+    if each is not None and areas:
+        each /= len(areas)  # they run side by side
     with cf.ThreadPoolExecutor(max_workers=min(4, len(areas) or 1)) as ex:
         futs = {a: ex.submit(claude, area_prompt(a, fs), am, ae, integ, perm="dontAsk",
                              tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY, schema=schemas.AREA_REVIEW,
-                             budget_usd=budget_left(job, plan)) for a, fs in areas.items()}
+                             budget_usd=each) for a, fs in areas.items()}
         try:
             results = {a: f.result() for a, f in futs.items()}
         except KeyboardInterrupt:
@@ -3869,6 +3933,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     repo = Path(job.state["repo"])
     budget = plan.get("budget_usd")
     running: dict[cf.Future, str] = {}
+    held: dict[str, float] = {}  # running call -> the budget it was given
     free_slots = list(range(cap))
     pool = cf.ThreadPoolExecutor(max_workers=cap)
     mgr_pool = cf.ThreadPoolExecutor(max_workers=1)
@@ -3877,7 +3942,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     mgr: dict | None = None
     holds: set[str] = set()
     stop_reason, human_q, abort_reason = None, None, None
-    limit_msg = ""
+    limit_msg = budget_msg = ""
 
     def tasks():
         return {t["id"]: t for t in plan["tasks"]}
@@ -3902,14 +3967,20 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
         m["interventions"] += 1
         prompt, full = manager_prompt(job, plan, event)
         log(f"manager: {event['kind']} {event.get('task', '')}".rstrip())
+        share = budget_free(job, plan, held)
+        if share is not None and running:
+            share = min(share, max(MANAGER_BUDGET, share / 4))
+        if share is not None:
+            held[""] = share  # "" is no task id
         fut = mgr_pool.submit(manager_call, mcfg, integ, prompt, full, m["session"],
-                              budget_left(job, plan), job.dir)
+                              share, job.dir)
         mgr = {"future": fut, "event": event, "stage": stage, "entry": entry, "started": time.time()}
         holds = affected_tasks(plan, event if stage == "first" else entry["_event"])
 
     def complete() -> None:
         nonlocal mgr, holds, stop_reason, limit_msg
         assert mgr is not None
+        held.pop("", None)
         if "done" in mgr:
             decision = mgr["done"]
         else:
@@ -3951,7 +4022,8 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
         while True:
             if mgr is not None and "done" in mgr:
                 complete()
-            if mgr is None and queue and not stop_reason:
+            if mgr is None and queue and not stop_reason \
+                    and (not running or budget is None or budget_free(job, plan, held) >= BUDGET_MIN):
                 ev = queue[0] if len(queue) == 1 else {"kind": "batch", "events": list(queue)}
                 queue.clear()
                 submit(ev, "first", None)
@@ -3962,6 +4034,10 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                 t for t in T if job.state["tasks"][t]["status"] in ("pending", "awaiting_approval")
                 and t not in holds and all(satisfied(d) for d in T[t].get("depends_on", []))]
             launched = False
+            share = budget_free(job, plan, held)
+            if share is not None:
+                open_now = [t for t in ready if not T[t].get("gate") or t in job.state["approved"]]
+                share /= max(min(len(open_now), cap - len(running)), 1)
             for tid in ready:
                 if len(running) >= cap:
                     break
@@ -3974,6 +4050,8 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                 if budget and job.state["cost_usd"] >= budget:
                     stop_reason = "budget"
                     break
+                if share is not None and share < BUDGET_MIN and (running or held):
+                    break  # all of it is with running calls
                 if running and not admission_ok(float(plan.get("mem_per_agent_gb", MEM_PER_AGENT_GB))):
                     break  # low memory right now: wait for a running task to finish
                 slot = free_slots.pop(0)
@@ -3982,8 +4060,9 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                 st.update(status="running", started=time.time(), start_sha=start_sha, slot=slot)
                 job.save()
                 log(f"start {tid} [{T[tid]['type']} {T[tid]['tier']}] slot {slot}")
-                running[pool.submit(exec_task, job, plan, T[tid], wt, br, slot,
-                                    budget_left(job, plan))] = tid
+                if share is not None:
+                    held[tid] = share
+                running[pool.submit(exec_task, job, plan, T[tid], wt, br, slot, share)] = tid
                 launched = True
             job.save()
             waits = list(running) + ([mgr["future"]] if mgr and "future" in mgr else [])
@@ -3997,6 +4076,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                 if fut not in running:
                     continue
                 tid = running.pop(fut)
+                given = held.pop(tid, None)
                 st = job.state["tasks"][tid]
                 free_slots.append(st["slot"])
                 free_slots.sort()
@@ -4031,6 +4111,8 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                 if res.get("result") == "budget":
                     st["status"] = "pending"
                     stop_reason = "budget"
+                    if given is not None:
+                        budget_msg = f"{tid} used up its ${given:.2f} share; resume gives it what is left"
                     log(f"STOP  {tid}: budget reached")
                 elif res.get("result") == "usage_limit":
                     st["status"] = "pending"
@@ -4104,7 +4186,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     T = tasks()
     statuses = {t: job.state["tasks"][t]["status"] for t in T}
     if stop_reason == "budget":
-        return finish(job, plan, "budget", f"budget ${budget} reached")
+        return finish(job, plan, "budget", f"budget ${budget} reached" + (f" ({budget_msg})" if budget_msg else ""))
     if stop_reason == "usage_limit":
         return usage_limit_stop(job, plan, limit_msg)
     if any(s in ("failed", "blocked") for s in statuses.values()):
@@ -4175,11 +4257,14 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
         return finish(job, plan, "environment",
                       f'plan.sandbox is true, but {why}. Install bubblewrap (or drop "sandbox"), then '
                       f"`orchestrate.py resume {job.id}`.")
+    job.state["commit_hook_skipped"] = not plan.get("commit_hook") and has_commit_hook(repo)
+    if job.state["commit_hook_skipped"]:
+        log('note: the repo\'s pre-commit hook will not run (set "commit_hook": true to run it as a check on each task)')
     job.state["unconfined"] = "plan.sandbox is false" if mode == "off" else why
     if job.state["unconfined"]:
         log(f"warning: workers are NOT confined ({job.state['unconfined']}): they can write anywhere you can")
     confine = confinement(plan) if has_worker_code(job, integ) else None  # a resume; first time it's the user's code
-    ok, err = run_setup(plan.get("setup", []), integ, logf, confine)
+    ok, err = setup_integration(job, plan, integ, confine)
     if not ok:
         return finish(job, plan, "environment", err)
     if not skip_baseline and not job.state.get("baseline_ok"):
@@ -4529,6 +4614,8 @@ def skipped_checks(s: dict, plan: dict) -> list[str]:
             out.append(f"advisor final check: overridden by the user (--approve advisor:final), round {r.get('round')}")
     if s.get("baseline_skipped") and not s.get("baseline_ok"):
         out.append("job baseline: not run (--skip-baseline)")
+    if s.get("commit_hook_skipped"):
+        out.append('repo pre-commit hook: not run (plan "commit_hook": true runs it as a check on each task)')
     if s.get("unconfined"):
         out.append(f"worker confinement: none ({s['unconfined']}); workers could write outside their worktrees")
     gates = {t["id"] for t in plan.get("tasks", []) if t.get("gate")}

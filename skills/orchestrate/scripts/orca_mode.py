@@ -331,7 +331,7 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
                           "or migrations. Revert these and report the need under open_issues instead:\n"
                           + "\n".join(f"  {b}" for b in bad) + "\nYou own: " + ", ".join(task["owns"]))
     if ok:
-        ok, out = RT.verify(task["verify"], wt, 1800, O.confinement(plan))
+        ok, out = RT.verify(O.task_checks(plan, task), wt, 1800, O.confinement(plan))
     if ok and report is None:
         ok, out = False, (f"The verify commands pass, but there is no readable report at {wt / REPORT_REL}. "
                           "Write the JSON report there, then send worker_done again.")
