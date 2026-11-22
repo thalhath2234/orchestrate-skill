@@ -415,6 +415,8 @@ def fail_attempt(job: O.Job, plan: dict, tid: str, out: str, *, report: dict | N
     final = ((report or {}).get("summary") or "") + "\n" + worker_tail(o.get("dispatch"))
     c = RT.classify(spec_for(job, plan, task), o["rung"], {"result": final}, out, Path(o["worktree"]),
                     1800, task["verify"])
+    if c["cause"] == "usage_limit":  # the classifier's own call: no evidence about the worker's model
+        c = {**c, "cause": "environment"}
     if c.get("classifier_cost"):
         O.record_call(job, "classifier", {"total_cost_usd": c["classifier_cost"]}, tid,
                       "/".join(RT.classifier_cfg()))

@@ -192,6 +192,8 @@ def classify(task: str, rung: int, worker: dict, vout: str, repo: Path, timeout:
     res = claude(prompt, *classifier_cfg(), repo, perm="plan", tools=[], only=[], resume=None,
                  timeout=timeout, schema=schemas.CLASSIFIER,
                  extra_args=["--exclude-dynamic-system-prompt-sections"])
+    if res.get("error_kind") == "usage_limit":
+        return {"cause": "usage_limit", "evidence": str(res.get("result"))[:300]}
     out = res.get("structured") or {}
     if out.get("cause") not in router.CAUSES:
         out = {"cause": "unknown", "evidence": f"classifier unparseable: {str(res.get('result'))[:200]}"}
@@ -480,7 +482,15 @@ def main(argv=None) -> int:
             log(f"refused at {model}/{effort} ({cat}); not routing evidence")
             break
 
-        c = classify(a.task, rung, worker, vout, repo, a.claude_timeout, a.verify)
+        if worker.get("error_kind") == "usage_limit":
+            c = {"cause": "usage_limit", "evidence": str(worker.get("result"))[:300]}
+        else:
+            c = classify(a.task, rung, worker, vout, repo, a.claude_timeout, a.verify)
+        if c["cause"] == "usage_limit":  # the plan's, not the model's: no evidence, no escalation
+            step.update(cause="usage_limit", evidence=c.get("evidence"))
+            summary["result"], summary["usage_limit"] = "usage_limit", c.get("evidence")
+            log(f"usage limit -> stopping: {c.get('evidence')}")
+            break
         spent += c.get("classifier_cost") or 0
         step.update(cause=c["cause"], evidence=c.get("evidence"),
                     classifier_cost_usd=c.get("classifier_cost"))
@@ -530,7 +540,7 @@ def main(argv=None) -> int:
     print(json.dumps(summary, indent=2))
     if summary["proposals"]:
         log(f"{len(summary['proposals'])} proposal(s) pending: router.py proposals")
-    return {"ok": 0, "environment": 3, "budget": 7, "refused": 9}.get(summary["result"], 4)
+    return {"ok": 0, "environment": 3, "usage_limit": 3, "budget": 7, "refused": 9}.get(summary["result"], 4)
 
 
 if __name__ == "__main__":

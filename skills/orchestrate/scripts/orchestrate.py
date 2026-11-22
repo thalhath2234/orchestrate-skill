@@ -298,9 +298,24 @@ def claude(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools:
            extra_args: list[str] | None = None, only: list[str] | None = None,
            confine: Path | None = None) -> dict:
     extra = list(extra_args or []) + models.fallback_args(model)  # no Fable access -> Opus
-    return claude_cli.call(prompt, model, effort, cwd, perm=perm, tools=tools, resume=resume,
-                           timeout=timeout, settings=settings, schema=schema,
-                           budget_usd=budget_usd, extra_args=extra, only=only, confine=confine)
+    res = claude_cli.call(prompt, model, effort, cwd, perm=perm, tools=tools, resume=resume,
+                          timeout=timeout, settings=settings, schema=schema,
+                          budget_usd=budget_usd, extra_args=extra, only=only, confine=confine)
+    if res.get("error_kind") == "usage_limit":  # no role can answer, so none is judged by it
+        raise UsageLimit(str(res.get("result"))[:300])
+    return res
+
+
+class UsageLimit(Exception):
+    """The user's plan limit, with a reset too far off to wait for: the job stops, resumable."""
+
+
+def usage_limit_stop(job, plan: dict, what) -> int:
+    return finish(job, plan, "environment",
+                  f"your Claude usage limit stopped the job: {what}\nNothing was judged failed, and finished work is kept. After "
+                  f"the reset: `orchestrate.py resume {job.id}`. (A reset within "
+                  f"{claude_cli.LIMIT_WAIT_H:g} hours is waited out; ORCHESTRATE_LIMIT_WAIT_H changes that.)",
+                  resumable=True)
 
 
 def record_call(job, role: str, res: dict, task: str | None = None, cfg: str = "") -> None:
@@ -1421,6 +1436,7 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
                for s in summary.get("steps", []))
     return {"ok": code == 0, "result": summary.get("result", f"exit {code}"),
             "steps": summary.get("steps", []), "proposals": summary.get("proposals", []),
+            "usage_limit": summary.get("usage_limit"),
             "report": report, "cost_usd": cost, "wt": str(wt), "branch": br,
             "final_message": (summary.get("final_message") or "")[-3000:]}
 
@@ -1742,6 +1758,10 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
         record_call(job, "fix_round", {"total_cost_usd": (x.get("cost_usd") or 0) + (x.get("classifier_cost_usd") or 0),
                                        "metrics": x.get("metrics")}, None, x.get("config", ""))
     job.state["review"]["rounds"][-1]["fix"] = {"result": s.get("result"), "steps": s.get("steps")}
+    if s.get("result") == "usage_limit":
+        job.state["review"]["owed_fix"] = {"round": rnd_no, "findings": blocking}
+        job.save()
+        raise UsageLimit(str(s.get("usage_limit") or ""))
     stray = scope_violations(integ, union)
     if stray:  # never commit what the fix (or anything else) left outside the job's files
         log(f"review round {rnd_no}: not committing {len(stray)} path(s) outside the job's files: "
@@ -2854,7 +2874,11 @@ verdict."""
         futs = {a: ex.submit(claude, area_prompt(a, fs), am, ae, integ, perm="dontAsk",
                              tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY, schema=schemas.AREA_REVIEW,
                              budget_usd=budget_left(job, plan)) for a, fs in areas.items()}
-        results = {a: f.result() for a, f in futs.items()}
+        try:
+            results = {a: f.result() for a, f in futs.items()}
+        except KeyboardInterrupt:
+            claude_cli.stopping.set()
+            raise
     area_v = {}
     for a, res in results.items():  # main thread: record_call and the re-ask update job state
         record_call(job, "reviewer_area", res, None, f"{am}/{ae}")
@@ -3853,6 +3877,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     mgr: dict | None = None
     holds: set[str] = set()
     stop_reason, human_q, abort_reason = None, None, None
+    limit_msg = ""
 
     def tasks():
         return {t["id"]: t for t in plan["tasks"]}
@@ -3883,12 +3908,20 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
         holds = affected_tasks(plan, event if stage == "first" else entry["_event"])
 
     def complete() -> None:
-        nonlocal mgr, holds
+        nonlocal mgr, holds, stop_reason, limit_msg
         assert mgr is not None
         if "done" in mgr:
             decision = mgr["done"]
         else:
-            decision = manager_finish(job, plan, mgr["future"].result(), mgr["event"])
+            try:
+                replies = mgr["future"].result()
+            except UsageLimit as e:
+                queue.insert(0, mgr["event"] if mgr["stage"] == "first" else mgr["entry"]["_event"])
+                manager_state(job)["interventions"] -= 1
+                stop_reason, limit_msg = "usage_limit", str(e)
+                mgr, holds = None, set()
+                return
+            decision = manager_finish(job, plan, replies, mgr["event"])
             m = manager_state(job)
             m["busy_s"] = round(m.get("busy_s", 0) + time.time() - mgr["started"], 1)
         if mgr["stage"] == "first":
@@ -3999,12 +4032,21 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                     st["status"] = "pending"
                     stop_reason = "budget"
                     log(f"STOP  {tid}: budget reached")
+                elif res.get("result") == "usage_limit":
+                    st["status"] = "pending"
+                    stop_reason, limit_msg = "usage_limit", str(res.get("usage_limit") or "")
+                    log(f"STOP  {tid}: usage limit")
                 elif res.get("ok"):
                     try:
                         ok, info = commit_and_merge(job, plan, T[tid], res)
+                    except UsageLimit as e:  # the integrator's: the merge was undone
+                        ok, info = None, str(e)
                     except Exception as e:  # noqa: BLE001
                         ok, info = False, f"commit/merge error: {e}"
-                    if ok:
+                    if ok is None:
+                        st["status"] = "pending"
+                        stop_reason, limit_msg = "usage_limit", info
+                    elif ok:
                         st.update(status="done", files=json.loads(info))
                         log(f"done  {tid} ({len(st['files'])} files merged)")
                         raise_bar(job, plan, (res.get("report") or {}).get("raise_bar") or [],
@@ -4037,6 +4079,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                              "log_tail": logtail})
                 job.save()
     except KeyboardInterrupt:
+        claude_cli.stopping.set()
         for child in list(_children):  # in groups of their own, so Ctrl-C didn't reach them
             stop_child(child)
         for fut, tid in running.items():
@@ -4062,6 +4105,8 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     statuses = {t: job.state["tasks"][t]["status"] for t in T}
     if stop_reason == "budget":
         return finish(job, plan, "budget", f"budget ${budget} reached")
+    if stop_reason == "usage_limit":
+        return usage_limit_stop(job, plan, limit_msg)
     if any(s in ("failed", "blocked") for s in statuses.values()):
         bad = {t: s for t, s in statuses.items() if s in ("failed", "blocked")}
         env = [t for t in bad if job.state["tasks"][t].get("result") == "environment"]
@@ -4251,6 +4296,15 @@ def run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
     """Headless mode: this process runs every worker itself (`claude -p` via run_task.py)."""
     job.state["pid"] = os.getpid()
     job.state["mode"] = "headless"
+    claude_cli.stopping.clear()
+    try:
+        return _run_job(job, plan, approve, max_parallel, skip_baseline, answer)
+    except UsageLimit as e:
+        return usage_limit_stop(job, plan, e)
+
+
+def _run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
+             skip_baseline: bool, answer: str | None = None) -> int:
     code = prepare_job(job, plan, approve, max_parallel, skip_baseline, answer)
     if code is not None:
         return code
@@ -4261,7 +4315,8 @@ def run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
         code = run_tasks(job, plan, job.state["capacity"]["cap"], ctx)
         if code is not None:
             return code
-        r = review_round(job, plan)
+        # a fix round a usage limit cut short is owed before anyone reviews the same code again
+        r = "fix_round" if job.state["review"].get("owed_fix") else review_round(job, plan)
         if isinstance(r, int):
             return r
         if r == "fix_round":
@@ -5584,4 +5639,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except UsageLimit as e:  # outside a headless job: plan, advise, an Orca step
+        print(f"your Claude usage limit stopped this: {e}\nRun it again after the reset.", file=sys.stderr)
+        sys.exit(3)

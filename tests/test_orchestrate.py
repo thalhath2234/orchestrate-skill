@@ -45,6 +45,15 @@ FAKE = textwrap.dedent(r'''
     cfg = json.loads(pathlib.Path(os.environ["FAKE_CFG"]).read_text())
     calls = pathlib.Path(os.environ["FAKE_CALLS"])
     cwd = pathlib.Path.cwd()
+    limited = cfg.get("limited", [])  # prompt prefixes ("worker": a worker's) that hit the plan's usage limit
+    known = ("ORCHESTRATE_", "FAILURE_CLASSIFIER")
+    if any(prompt.startswith(x) or (x == "worker" and not prompt.startswith(known)) for x in limited):
+        with open(calls, "a") as fh:
+            fh.write(json.dumps({"kind": "limited", "model": model}) + "\n")
+        print(json.dumps({"is_error": True, "subtype": "success", "session_id": "s-" + cwd.name, "num_turns": 1,
+                          "api_error_status": cfg.get("limit_status"), "total_cost_usd": 0,
+                          "result": "You've hit your weekly limit \u00b7 " + cfg.get("limit_resets", "try later")}))
+        sys.exit(1)
     def out(result):
         if cfg.get("garbage_for") and any(prompt.startswith(g) for g in cfg["garbage_for"]):
             result = "I could not decide, sorry."
@@ -1602,6 +1611,82 @@ class OrchestrateTest(unittest.TestCase):
                         with contextlib.suppress(OSError):
                             os.killpg(p.pid, signal.SIGKILL)
                         p.wait()
+
+    def test_the_reset_time_is_read_from_the_limit_message(self):
+        import datetime
+        import zoneinfo
+        C = self.o.claude_cli
+        tz = zoneinfo.ZoneInfo("Asia/Tokyo")
+        at = lambda *x: datetime.datetime(2026, 11, *x, tzinfo=tz).timestamp()
+        msg = "You've hit your %s limit \u00b7 resets %s (Asia/Tokyo)"
+        for text, now, want in ((msg % ("5-hour", "7am"), at(22, 4, 0), 3 * 3600),
+                                (msg % ("5-hour", "2:10am"), at(22, 23, 10), 3 * 3600),
+                                (msg % ("5-hour", "12pm"), at(22, 11, 30), 1800),
+                                (msg % ("5-hour", "12am"), at(22, 23, 0), 3600),
+                                (msg % ("5-hour", "7am"), at(22, 7, 3), 0),
+                                (msg % ("weekly", "Nov 24, 2am"), at(22, 2, 0), 48 * 3600)):
+            with self.subTest(text, now=now):
+                self.assertAlmostEqual(C.reset_wait(text, now), want, delta=1)
+        for text in ("You've hit your limit", "resets whenever", msg.replace("Asia/Tokyo", "No/Where") % ("5-hour", "7am")):
+            self.assertIsNone(C.reset_wait(text, at(22, 4, 0)), text)
+
+    def test_a_short_limit_window_is_waited_out_and_the_session_continued(self):
+        fake, seen = self.tmp / "limit-claude", self.tmp / "limit-seen"
+        fake.write_text("#!/usr/bin/env python3\nimport sys, json, pathlib\n"
+                        f"f = pathlib.Path({str(seen)!r})\n"
+                        "n = len(f.read_text().splitlines()) if f.exists() else 0\n"
+                        "open(f, 'a').write(json.dumps(sys.argv) + '\\n')\n"
+                        "limit = {'is_error': True, 'session_id': 'sess-1', 'num_turns': 9, 'total_cost_usd': 0.5, "
+                        "'api_error_status': 429, 'result': \"You've hit your 5-hour limit \\u00b7 resets 7am (Asia/Tokyo)\"}\n"
+                        "ok = {'is_error': False, 'session_id': 'sess-1', 'num_turns': 2, 'total_cost_usd': 0.75, 'result': 'done'}\n"
+                        "print(json.dumps(ok if n else limit))\n")
+        fake.chmod(0o755)
+        old = os.environ["ROUTER_CLAUDE_BIN"]
+        os.environ["ROUTER_CLAUDE_BIN"] = str(fake)
+        self.addCleanup(os.environ.__setitem__, "ROUTER_CLAUDE_BIN", old)
+        C = self.o.claude_cli
+        slept, real = [], (C.reset_wait, C.pause)
+        C.reset_wait, C.pause = (lambda text, now=None: 3600.0), (lambda s: slept.append(s) or True)
+        self.addCleanup(lambda: (setattr(C, "reset_wait", real[0]), setattr(C, "pause", real[1])))
+        r = C.call("do the task", "opus", "medium", self.repo, perm="dontAsk", tools=[])
+        self.assertFalse(r.get("is_error"), r)
+        self.assertEqual(len(slept), 1)
+        self.assertGreaterEqual(slept[0], 3600)
+        first, second = [json.loads(x) for x in seen.read_text().splitlines()]
+        self.assertEqual(second[second.index("--resume") + 1], "sess-1")
+        self.assertNotIn("do the task", second, "the session already has the prompt")
+        self.assertEqual(r["total_cost_usd"], 0.75, "both sides of the pause")
+
+    def test_a_usage_limit_stops_the_job_resumable_without_blaming_anyone(self):
+        for who, status in ((["worker"], None), (["worker"], 429), (["ORCHESTRATE_ADVISE_PLAN"], 429),
+                            (["ORCHESTRATE_REVIEW"], None), (["ORCHESTRATE_ADVISE_FINAL"], 429)):
+            with self.subTest(who=who, status=status):
+                self.tearDown()
+                self.setUp()
+                plan = self.write_plan(base_plan(self.repo))
+                code, out, err = self.cli("run", str(plan), "--workers", "headless",
+                                          cfg={"tasks": WRITES, "limited": who, "limit_status": status})
+                st = self.job_state()
+                self.assertEqual((code, st["status"]), (3, "environment"), err[-1500:])
+                self.assertIn("usage limit", st["message"])
+                self.assertIn("resume share", st["message"])
+                self.assertNotIn("failed", [t.get("status") for t in st["tasks"].values()])
+                self.assertFalse(self.calls_of("manage"), "nothing for a manager to decide")
+                self.assertFalse(self.calls_of("classifier"))
+                self.assertFalse(self.calls_of("lessons"))
+                self.assertEqual({c["model"] for c in self.calls_of("limited")} - {"opus", "fable"}, set())
+                self.assertLessEqual(len(self.calls_of("limited")), 2, "no retries, no escalation")
+                code, out, err = self.cli("resume", "share", cfg={"tasks": WRITES})
+                self.assertEqual(code, 0, err[-1500:])
+
+    def test_a_manager_at_its_usage_limit_is_asked_again_on_resume(self):
+        tasks = {**WRITES, "contract": {**WRITES["contract"], "fail_until_note": True}}
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), "--workers", "headless",
+                                  cfg={"tasks": tasks, "limited": ["ORCHESTRATE_MANAGE"]})
+        st = self.job_state()
+        self.assertEqual((code, st["status"]), (3, "environment"), err[-1500:])
+        self.assertIn("usage limit", st["message"])
+        self.assertTrue(st.get("pending_events"), "the event waits for the manager")
 
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate
