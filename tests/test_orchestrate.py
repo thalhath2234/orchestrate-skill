@@ -1255,6 +1255,28 @@ class OrchestrateTest(unittest.TestCase):
             for k, v in (given or {}).get("permissions", {}).items():
                 self.assertIs(perms[k], v)
 
+    def test_the_ui_reviewer_can_open_the_screenshots_wherever_they_are(self):
+        job, wt, base = self._changed({"apps/web/page.html": "<p>hi</p>\n"})
+        root = job.dir / "screenshots"  # outside the cwd, where the read confinement stops Read
+        ok = {"verdict": "pass", "summary": "fine", "findings": [], "edge_cases": [],
+              "pages": [{"shot": "round-1/home--desktop", "observations": "fine", "ok": True}]}
+        seen = self._replies(None, {**ok, "pages": []}, ok)  # unparseable, then a skipped shot, then whole
+        job.state.update(screenshots_root=str(root))
+        ui = {"ran": True, "skipped": None, "error": None, "app_failed": False, "url": "http://127.0.0.1:1",
+              "dir": str(root / "round-1"), "page_failures": [], "restored": [], "verdict": None,
+              "shots": [{"id": "round-1/home--desktop", "file": "round-1/home--desktop.png", "name": "home",
+                         "path": "/", "viewport": "desktop", "step": None, "status": 200, "title": "", "console": [],
+                         "page_errors": [], "failed_requests": [], "step_errors": [], "notes": [], "tiles": [],
+                         "tasks": []}]}
+        job.state["review"]["rounds"] = [{"ui": ui}]
+        plan = {**self._review_plan(), "ui": {"dev": "true", "url": "http://127.0.0.1:1"}}
+        self.o.ui_judge_step(job, plan, ui, {"verdict": "pass", "findings": [], "summary": "ok"})
+        self.assertGreaterEqual(len(seen), 3, "the call, the re-ask and the missing-shot turn")
+        for prompt, kw in seen:
+            args = kw.get("extra_args") or []
+            self.assertIn("--add-dir", args, prompt[:60])
+            self.assertEqual(args[args.index("--add-dir") + 1], str(root))
+
     def test_cleanup_never_loads_the_branchs_settings_skills_or_styles(self):
         job, wt, base = self._changed({"apps/api/x.go": "package x\n"})
         seen = self._replies({"changed": False})
@@ -1375,6 +1397,10 @@ class OrchestrateTest(unittest.TestCase):
         v = self.o.review(job, self._review_plan(), "ok")
         self.assertEqual((v["verdict"], len(seen)), ("pass", 2), "a doubt it stands by doesn't block")
         self.assertIn(low, v["findings"])
+        sure = {"severity": "blocker", "confidence": "high", "file": "auth.go", "issue": "owner never checked"}
+        seen = self._replies(self._good_review(findings=[low, sure]))
+        self.assertEqual(self.o.review(job, self._review_plan(), "ok")["verdict"], "changes_requested")
+        self.assertEqual(len(seen), 1, "not questioned when the review blocks anyway")
 
     def test_asking_again_can_add_to_a_review_never_take_away(self):
         job, wt, base = self._changed({"auth.go": "package auth\n"})

@@ -1824,6 +1824,7 @@ def ui_judge_step(job: Job, plan: dict, ui: dict, verdict: dict) -> dict:
     if ui["shots"]:
         keep: dict = {}
         v = _ask_reviewer(job, plan, ui_review_prompt(job, plan, ui, earlier), schemas.UI_REVIEW, "ui_reviewer",
+                          add_dir=job.state["screenshots_root"],
                           cfg=models.role("ui_reviewer", plan), tag="ORCHESTRATE_UI_REVIEW", keep=keep)
         if v is None:
             return ui_failed(job, ui, verdict, "the UI reviewer produced no verdict: unparseable or failed output")
@@ -1917,7 +1918,8 @@ def _reask_missing(job: Job, plan: dict, keep: dict, missing: list[str]) -> dict
                  "complete JSON object again: a `pages` entry for every screenshot (these and the ones you "
                  "already judged), every finding, expected entry, earlier answer, summary and verdict.",
                  model, effort, Path(job.state["integration_wt"]), perm="dontAsk", tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY,
-                 resume=keep["session"], schema=schemas.UI_REVIEW, budget_usd=budget_left(job, plan))
+                 resume=keep["session"], schema=schemas.UI_REVIEW, budget_usd=budget_left(job, plan),
+                 extra_args=["--add-dir", str(root)])
     record_call(job, "ui_reviewer", res, None, f"{model}/{effort}")
     v = res.get("structured")
     return v if isinstance(v, dict) and v.get("verdict") in ("pass", "changes_requested") else None
@@ -2271,15 +2273,18 @@ def reviewer_cfg(plan: dict) -> tuple[str, str]:
 
 def _ask_reviewer(job: Job, plan: dict, prompt: str, schema: dict, role: str,
                   cfg: tuple[str, str] | None = None, tag: str = "ORCHESTRATE_REVIEW",
-                  keep: dict | None = None, resume: str | None = None) -> dict | None:
+                  keep: dict | None = None, resume: str | None = None,
+                  add_dir: str | None = None) -> dict | None:
     """One reviewer call, plus one re-ask if the reply doesn't parse. None = no verdict (P0.1).
+    `add_dir`: a dir it may read besides the integration worktree (the screenshots).
     `keep` gets the session id, for a follow-up turn."""
     integ = Path(job.state["integration_wt"])
     model, effort = cfg or reviewer_cfg(plan)
     res = claude(prompt, model, effort, integ, perm="dontAsk", tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY,
-                 resume=resume, schema=schema, budget_usd=budget_left(job, plan))
+                 resume=resume, schema=schema, budget_usd=budget_left(job, plan),
+                 extra_args=["--add-dir", str(add_dir)] if add_dir else None)
     record_call(job, role, res, None, f"{model}/{effort}")
-    res = _reask(job, plan, res, (model, effort), schema, tag, role)
+    res = _reask(job, plan, res, (model, effort), schema, tag, role, add_dir)
     if keep is not None:
         keep["session"] = res.get("session_id")
     v = res.get("structured")
@@ -2293,7 +2298,8 @@ def _is_verdict(v) -> bool:
     return isinstance(v, dict) and v.get("verdict") in ("pass", "changes_requested")
 
 
-def _reask(job: Job, plan: dict, res: dict, cfg: tuple[str, str], schema: dict, tag: str, role: str) -> dict:
+def _reask(job: Job, plan: dict, res: dict, cfg: tuple[str, str], schema: dict, tag: str, role: str,
+           add_dir: str | None = None) -> dict:
     """A reviewer reply with no verdict object gets one re-ask in the same session (not when the
     budget ran out, and not without a session: a fresh session would get only the retry line and
     review nothing). Returns the reply to use. Main thread only: record_call updates job state."""
@@ -2304,7 +2310,7 @@ def _reask(job: Job, plan: dict, res: dict, cfg: tuple[str, str], schema: dict, 
                   "Reply with ONLY that JSON object.",
                   model, effort, Path(job.state["integration_wt"]), perm="dontAsk",
                   tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY, resume=res.get("session_id"), schema=schema,
-                  budget_usd=budget_left(job, plan))
+                  budget_usd=budget_left(job, plan), extra_args=["--add-dir", str(add_dir)] if add_dir else None)
     record_call(job, role, res2, None, f"{model}/{effort}")
     return res2
 
@@ -2420,6 +2426,9 @@ def review_gaps(plan: dict, v: dict, need_edges: bool) -> list[str]:
             gaps.append(f"no `acceptance` row for this criterion (one row each, quoted): {c}")
         elif all(r.get("met") is True and not schemas.has_evidence(r.get("evidence")) for r in rows):
             gaps.append(f"met without evidence (a file:line or a test): {c}")
+    rows = [r for r in v.get("acceptance") or [] if isinstance(r, dict)]
+    if blocking_findings(enforce_edge_cases(v).get("findings")) or any(r.get("met") is not True for r in rows):
+        return gaps  # it blocks anyway: a doubt is worth another turn only when it decides the verdict
     for x in (v.get("findings") or []) + [e for e in v.get("edge_cases") or []
                                            if isinstance(e, dict) and e.get("handled") is not True]:
         if isinstance(x, dict) and x.get("severity") == "blocker" and x.get("confidence") == "low":
