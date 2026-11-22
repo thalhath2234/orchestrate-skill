@@ -1,0 +1,64 @@
+{
+  "meta": {
+    "git_sha": "c53996dbda1552f750007c6ebf859b85be19a126",
+    "dirty": false,
+    "claude_version": "2.1.330 (Claude Code)",
+    "date": "2026-11-22T19:36:24Z",
+    "hermetic": true
+  },
+  "overall_pass": 1.0,
+  "low_roles": {},
+  "fallback_configs": {},
+  "results": [
+    {
+      "role": "parent",
+      "case": "grill-asks-done-first",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.2563,
+      "trials": [
+        {
+          "ok": true,
+          "label": "orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.2563,
+          "detail": "I read the whole repo before asking anything, and **share links can't be built or verified on this checkout as it stands**:\n\n- **Tests:** `make test` fails. `api/` has no Go module, and `web/` has no `package.json`. The only test, `TestGetReturnsSchedule`, has an empty body, so it would pass whateve",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 33.6
+        }
+      ]
+    },
+    {
+      "role": "parent",
+      "case": "no-plan-before-confirm",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.2669,
+      "trials": [
+        {
+          "ok": true,
+          "label": "orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.2669,
+          "detail": "I haven't changed anything yet. The rename is small, but **`make test` can't pass on this machine right now**: `/usr/bin/python3` has no pytest, so it fails with `No module named pytest` on the untouched code. I need your answers below before I start.\n\n**What I found**\n- `--verbose` appears only in ",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 32.3
+        }
+      ]
+    }
+  ]
+}
