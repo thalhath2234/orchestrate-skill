@@ -58,6 +58,7 @@ import argparse
 import concurrent.futures as cf
 import contextlib
 import functools
+import hashlib
 import json
 import math
 import os
@@ -78,6 +79,10 @@ HERE = Path(__file__).resolve().parent
 # harness Pythons: no PYTHON* variables and no user site, both places a worker can plant code
 PY = [sys.executable, "-E", "-s"]
 sys.path.insert(0, str(HERE))
+if __name__ == "__main__":
+    # `import orchestrate` (orca_mode, dashboard) gets this module: a second copy has its own state
+    # and exception classes, so this one's handlers would never catch what that one raises
+    sys.modules["orchestrate"] = sys.modules[__name__]
 import claude_cli  # noqa: E402
 import jail  # noqa: E402
 import models  # noqa: E402
@@ -336,7 +341,7 @@ def budget_left(job, plan: dict) -> float | None:
     left = max(float(b) - job.state.get("cost_usd", 0), 0.0)
     held = sum((getattr(job, "held", None) or {}).values())
     # beside running tasks (the integrator, say): what they don't hold, but always enough for one call
-    return max(left - held, min(left, MANAGER_BUDGET)) if held else left
+    return max(left - held, min(left, MANAGER_BUDGET, float(b) / 4)) if held else left
 
 
 BUDGET_MIN = 0.05  # less free than this: wait for a running call to give back what it didn't spend
@@ -1428,10 +1433,16 @@ HOOK_CHECK = (
     'c=$(git rev-parse --path-format=absolute --git-common-dir) && sha=$(git rev-parse HEAD) && '
     'br=$(git symbolic-ref -q HEAD || true) && '
     't=$(mktemp -d) && trap \'rm -rf "$t"\' EXIT && mkdir -p "$t/g/objects/info" && '
-    'cp -R "$c/refs" "$t/g/refs" && { [ ! -f "$c/packed-refs" ] || cp "$c/packed-refs" "$t/g/"; } && '
-    'cp "$c/config" "$t/g/config" && echo "$c/objects" > "$t/g/objects/info/alternates" && '
+    'git for-each-ref --format="create %%(refname) %%(objectname)" > "$t/refs" && '
+    'mkdir -p "$t/g/refs/heads" "$t/g/info" && cp "$c/config" "$t/g/config" && '
+    '{ git config --file "$t/g/config" --unset extensions.refstorage || true; } && '
+    '{ [ ! -f "$c/info/exclude" ] || cp "$c/info/exclude" "$t/g/info/"; } && '
+    '{ [ ! -f "$c/info/attributes" ] || cp "$c/info/attributes" "$t/g/info/"; } && '
+    '{ [ ! -f "$c/shallow" ] || cp "$c/shallow" "$t/g/"; } && '
+    'echo "$c/objects" > "$t/g/objects/info/alternates" && '
     'if [ -n "$br" ]; then echo "ref: $br"; else echo "$sha"; fi > "$t/g/HEAD" && export GIT_DIR="$t/g" GIT_WORK_TREE="$PWD" && '
-    'git config core.bare false && git read-tree HEAD && git add -A && "$h")')
+    'git config core.bare false && git update-ref --stdin < "$t/refs" && '
+    'git read-tree HEAD && git add -A && "$h")')
 
 
 def commit_hook_path(repo: Path) -> Path | None:
@@ -3403,14 +3414,27 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
     return out
 
 
+def _judged(job: Job) -> tuple[str, str]:
+    """What a kept verdict is about: the commit, and the plan it was judged against."""
+    plan = json.dumps(job.plan, sort_keys=True).encode("utf-8", "surrogateescape")
+    return (git(Path(job.state["integration_wt"]), "rev-parse", "HEAD"),
+            hashlib.sha256(plan).hexdigest())
+
+
+def _still_judged(job: Job) -> None:
+    """The harness's own edits (cleanup, a raised bar) don't make a kept verdict stale; the user's do."""
+    kept = job.state["review"].get("undecided")
+    if kept:
+        kept["head"], kept["plan"] = _judged(job)
+        job.save()
+
+
 def final_gate(job: Job, plan: dict, rnd_no: int, review_v: dict | None) -> tuple[list[dict], str | None]:
     """After the reviewer passes: cleanup, then the advisor's check before hand-over.
     Returns (blocking findings, error). An advisor with no usable answer is an error (fail closed)."""
     cleanup_pass(job, plan)
     integ = Path(job.state["integration_wt"])
-    if job.state["review"].get("undecided"):  # the harness's own commit: the verdict still stands
-        job.state["review"]["undecided"]["head"] = git(integ, "rev-parse", "HEAD")
-        job.save()
+    _still_judged(job)  # cleanup's commit
     rnd = job.state["review"]["rounds"][-1]
     if "advisor:final" in job.state.get("approved", []):
         log("advisor final check overridden by the user (--approve advisor:final)")
@@ -3432,6 +3456,7 @@ def final_gate(job: Job, plan: dict, rnd_no: int, review_v: dict | None) -> tupl
     if blocking:
         raise_bar(job, plan, regression_criteria(blocking, rnd_no), f"advisor-finding:round{rnd_no}",
                   BAR_MAX_REGRESSION)
+        _still_judged(job)  # the criteria it just added
     job.save()
     return blocking, None
 
@@ -4331,6 +4356,7 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
         job.state["ui_preflight_ok"] = True
         job.save()
 
+    event = None
     if job.state.get("human_question"):
         if not answer:
             return finish(job, plan, "awaiting_human",
@@ -4339,6 +4365,12 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
         q = job.state.pop("human_question")
         record_answer(job, plan, q, answer)
         event = {"kind": "human_answer", "question": q, "answer": answer}
+    else:  # an answer the manager couldn't take yet is still decided before any task restarts
+        queued = job.state.get("pending_events") or []
+        event = next((e for e in queued if e.get("kind") == "human_answer"), None)
+        if event:
+            queued.remove(event)
+    if event:
         try:
             r = manage(job, plan, event)
         except (UsageLimit, KeyboardInterrupt):
@@ -4373,7 +4405,7 @@ def _review_round(job: Job, plan: dict) -> int | str:
     rounds = int(plan.get("review_rounds", 2))
     integ = Path(job.state["integration_wt"])
     kept = job.state["review"].get("undecided")
-    if kept and kept["head"] == git(integ, "rev-parse", "HEAD"):
+    if kept and (kept["head"], kept.get("plan")) == _judged(job):
         rnd_no, verdict, blocking = kept["round"], kept["verdict"], kept["blocking"]
         log(f"round {rnd_no} was reviewed but not decided on; going on from its verdict")
     else:
@@ -4381,9 +4413,8 @@ def _review_round(job: Job, plan: dict) -> int | str:
         log(f"all tasks merged; final verify + review (round {rnd_no})")
         verdict, blocking = verify_and_review(job, plan, rnd_no)
         if not verdict.get("reviewer_error"):
-            job.state["review"]["undecided"] = {"round": rnd_no, "head": git(integ, "rev-parse", "HEAD"),
-                                                "verdict": verdict, "blocking": blocking}
-            job.save()
+            job.state["review"]["undecided"] = {"round": rnd_no, "verdict": verdict, "blocking": blocking}
+            _still_judged(job)
     if verdict.get("reviewer_error"):
         what = verdict.get("not_reviewed")
         return finish(job, plan, "review_failed",

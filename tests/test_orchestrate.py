@@ -1804,14 +1804,16 @@ class OrchestrateTest(unittest.TestCase):
         self.assertEqual(self.o.manager_state(job)["interventions"], 0, "a call never answered isn't an intervention")
 
     def test_lessons_never_wait_for_a_reset(self):
-        got = []
-        real = self.o.claude_cli.call
-        self.o.claude_cli.call = lambda *a, **kw: (got.append(kw), {"structured": {"lessons": []}, "result": ""})[1]
-        self.addCleanup(setattr, self.o.claude_cli, "call", real)
-        self.o.claude("ORCHESTRATE_LESSONS x", "haiku", "medium", self.repo, perm="plan", tools=[], wait=False)
-        self.assertIs(got[0]["wait"], False)
-        import inspect
-        self.assertIn("wait=False", inspect.getsource(self.o.extract_lessons))
+        soon = time.gmtime(time.time() + 2 * 3600)
+        resets = "resets %d:%02d%s (UTC)" % ((soon.tm_hour % 12) or 12, soon.tm_min, "pm" if soon.tm_hour >= 12 else "am")
+        doubt = {"verdict": "pass", "summary": "ok",  # something for lessons to learn from
+                 "findings": [{"severity": "major", "confidence": "low", "issue": "the export may be unused"}]}
+        self.cfg.write_text(json.dumps({"tasks": WRITES, "reviews": [doubt], "limited": ["ORCHESTRATE_LESSONS"],
+                                        "limit_resets": resets}))
+        p = subprocess.run([sys.executable, str(ORCH), "run", str(self.write_plan(base_plan(self.repo))),
+                            "--workers", "headless"], env=self.env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(p.returncode, 0, p.stderr[-1500:])
+        self.assertTrue(self.calls_of("limited"), "lessons were asked, and didn't wait two hours")
 
     def test_an_interrupt_while_waiting_for_a_reset_is_recorded(self):
         soon = time.gmtime(time.time() + 2 * 3600)
@@ -1961,10 +1963,126 @@ class OrchestrateTest(unittest.TestCase):
         self.cfg.write_text(json.dumps({"limited": ["ORCHESTRATE_MERGE"]}))
         with self.assertRaises(self.o.UsageLimit):
             self.o.commit_and_merge(job, plan, plan["tasks"][2], {"wt": str(wt), "branch": br})
-        import inspect
-        import orca_mode
-        self.assertIn("except O.UsageLimit", inspect.getsource(orca_mode.check))
-        self.assertIn("task_checks", inspect.getsource(orca_mode.check))
+
+    def test_a_limit_during_a_merge_leaves_the_task_to_resume(self):
+        plan = base_plan(self.repo)
+        self.cfg.write_text(json.dumps({"tasks": WRITES}))
+        job = self.o.start_job(plan, self.write_plan(plan))
+        real = self.o.commit_and_merge
+
+        def limited(*a, **kw):
+            raise self.o.UsageLimit("You've hit your weekly limit")
+        self.o.commit_and_merge = limited
+        self.addCleanup(setattr, self.o, "commit_and_merge", real)
+        with contextlib.redirect_stdout(open(os.devnull, "w")):
+            self.assertEqual(self.o.run_job(job, plan, [], None, True), 3)
+        self.assertEqual(job.state["tasks"]["contract"]["status"], "pending")
+
+    def test_orca_stops_at_a_usage_limit_and_a_resume_goes_on(self):
+        bad = {"verdict": "changes_requested", "summary": "bug",
+               "findings": [{"severity": "blocker", "confidence": "high", "issue": "owner never checked"}]}
+        stuck = {**WRITES, "api": {**WRITES["api"], "fail_until_effort": "high"}}
+        for who, extra in (("ORCHESTRATE_ADVISE_PLAN", {}), ("ORCHESTRATE_REVIEW", {}), ("ORCHESTRATE_ADVISE_FINAL", {}),
+                           ("ORCHESTRATE_MANAGE", {"reviews": [bad, {"verdict": "pass", "summary": "ok", "findings": []}]}),
+                           ("FAILURE_CLASSIFIER", {"cause": "effort", "tasks": stuck})):
+            with self.subTest(who):
+                self.tearDown()
+                self.setUp()
+                self.orca_env()
+                cfg = {"tasks": WRITES, **extra}
+                code, out = self.drive_orca(("run", str(self.write_plan(base_plan(self.repo)))), {**cfg, "limited": [who]})
+                st = self.job_state()
+                self.assertEqual((code, st["status"]), (3, "environment"), out[-2500:])
+                self.assertNotIn("Traceback", out)
+                self.assertIn("resume share", st["message"])
+                self.cfg.write_text(json.dumps(cfg))
+                code, out, err = self.cli("resume", "share")
+                self.assertNotIn("Traceback", err)
+                if who == "ORCHESTRATE_ADVISE_PLAN":
+                    self.assertEqual(code, 10, err[-1500:])
+                elif who == "FAILURE_CLASSIFIER":
+                    self.assertTrue(self.calls_of("classifier"), "the report cut short is judged on resume")
+                elif who == "ORCHESTRATE_MANAGE":
+                    self.assertTrue(self.calls_of("manage"), "the event waited for the manager")
+                    self.assertEqual(len(self.calls_of("review")), 1)
+                else:
+                    self.assertEqual(code, 0, err[-1500:])
+                    self.assertEqual(len(self.calls_of("review")), 1)
+
+    def test_orca_checks_run_the_commit_hook(self):
+        hook = self.repo / ".git" / "hooks" / "pre-commit"
+        hook.parent.mkdir(exist_ok=True)
+        mark = self.tmp / "orca-hook-ran"
+        hook.write_text(f"#!/bin/sh\ntouch '{mark}'\n")
+        hook.chmod(0o755)
+        self.orca_env()
+        code, out = self.drive_orca(("run", str(self.write_plan(base_plan(self.repo, commit_hook=True)))), {"tasks": WRITES})
+        self.assertEqual(code, 0, out[-2000:])
+        self.assertTrue(mark.exists())
+
+    def test_a_queued_answer_is_decided_before_any_task_restarts(self):
+        plan = base_plan(self.repo)
+        self.cfg.write_text(json.dumps({"tasks": WRITES}))
+        job = self.o.start_job(plan, self.write_plan(plan))
+        job.state["pending_events"] = [{"kind": "human_answer", "question": "Which colour?", "answer": "blue"}]
+        seen, real = [], self.o.manage
+        self.o.manage = lambda j, p, ev: (seen.append((ev["kind"], len(self.calls_of("worker")))), {"hint": None})[1]
+        self.addCleanup(setattr, self.o, "manage", real)
+        with contextlib.redirect_stdout(open(os.devnull, "w")):
+            self.o.run_job(job, plan, [], None, True)
+        self.assertEqual(seen[:1], [("human_answer", 0)])
+
+    def test_an_edited_plan_gets_its_own_review(self):
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), "--workers", "headless",
+                                  cfg={"tasks": WRITES, "limited": ["ORCHESTRATE_ADVISE_FINAL"]})
+        self.assertEqual((code, len(self.calls_of("review"))), (3, 1), err[-1500:])
+        f = self.state / "jobs/share/plan.json"
+        plan = json.loads(f.read_text())
+        plan["acceptance"].append("An expired link returns 404")
+        f.write_text(json.dumps(plan))
+        code, out, err = self.cli("resume", "share", cfg={"tasks": WRITES})
+        self.assertEqual(len(self.calls_of("review")), 2, "the new criterion was never judged")
+
+    def test_the_hook_sees_the_repo_as_git_would(self):
+        for variant in ("exclude", "shallow", "reftable"):
+            with self.subTest(variant):
+                r = self.tmp / f"hookrepo-{variant}"
+                src = self.tmp / f"hooksrc-{variant}"
+                init = ["git", "init", "-q", "-b", "main"] + (["--ref-format=reftable"] if variant == "reftable" else [])
+                if subprocess.run([*init, str(src)], capture_output=True).returncode:
+                    continue  # this git has no reftable
+                (src / "a").write_text("a")
+                self._as_worker(src, "add", "-A")
+                self._as_worker(src, "commit", "-qm", "one")
+                (src / "a").write_text("b")
+                self._as_worker(src, "commit", "-qam", "two")
+                if variant == "shallow":
+                    subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{src}", str(r)], check=True)
+                else:
+                    r = src
+                (r / ".git" / "info").mkdir(exist_ok=True)
+                (r / ".git" / "info" / "exclude").write_text("/private/\n")
+                hook = r / ".git" / "hooks" / "pre-commit"
+                hook.parent.mkdir(exist_ok=True)
+                hook.write_text("#!/bin/sh\nset -e\ngit log --oneline HEAD >/dev/null\n"
+                                "git rev-parse --verify -q refs/heads/main >/dev/null\n"
+                                "! git diff --cached --name-only | grep -q '^private/'\n"
+                                "git diff --cached --name-only | grep -q '^new$'\n")
+                hook.chmod(0o755)
+                (r / "private").mkdir()
+                (r / "private" / "n").write_text("mine")
+                (r / "new").write_text("n")
+                check = self.o.task_checks({"commit_hook": True, "repo": str(r)}, {"verify": []})[0]
+                p = subprocess.run(["sh", "-c", check], cwd=r, capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                hook.unlink()
+                p = subprocess.run(["sh", "-c", check], cwd=r, capture_output=True, text=True)
+                self.assertNotEqual(p.returncode, 0, "a hook that went missing never passes")
+
+    def test_the_budget_floor_is_small_on_a_small_budget(self):
+        job = type("J", (), {})()
+        job.state, job.held = {"cost_usd": 0.0}, {"web": 0.8}
+        self.assertLessEqual(self.o.budget_left(job, {"budget_usd": 0.8}), 0.21)
 
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate
