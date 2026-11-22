@@ -4326,7 +4326,8 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
     job.state["commit_hook_skipped"] = not plan.get("commit_hook") and has_commit_hook(repo)
     if job.state["commit_hook_skipped"]:
         log('note: the repo\'s pre-commit hook will not run (set "commit_hook": true to run it as a check on each task)')
-    job.state["unconfined"] = "plan.sandbox is false" if mode == "off" else why
+    orca = job.state.get("mode") == "orca"
+    job.state["unconfined"] = ORCA_UNCONFINED if orca else "plan.sandbox is false" if mode == "off" else why
     if job.state["unconfined"]:
         log(f"warning: workers are NOT confined ({job.state['unconfined']}): they can write anywhere you can")
     confine = confinement(plan) if has_worker_code(job, integ) else None  # a resume; first time it's the user's code
@@ -5299,14 +5300,26 @@ def cmd_validate(a) -> int:
     return 0 if not errs else 2
 
 
-def workers_mode(a, job: Job | None = None) -> str:
+ORCA_UNCONFINED = "Orca starts its own workers; --workers headless confines them"
+
+
+def workers_mode(a, job: Job | None = None, plan: dict | None = None) -> str:
     """orca: the parent agent coordinates Orca workers (inside Orca); headless: a detached process
-    runs `claude -p` workers itself. A resumed job keeps the mode it started in."""
+    runs `claude -p` workers itself. A resumed job keeps the mode it started in. Orca can't confine
+    a worker (it reports through Orca's socket, which can open any terminal), so `auto` picks
+    headless for a plan whose sandbox is required."""
     import orca_mode
     if job is not None and job.state and (job.state.get("mode") or job.state.get("tasks")):
         return job.state.get("mode") or "headless"  # jobs from before Orca mode ran headless
     w = getattr(a, "workers", None) or "auto"
-    return ("orca" if orca_mode.in_orca() else "headless") if w == "auto" else w
+    if w != "auto":
+        return w
+    if not orca_mode.in_orca():
+        return "headless"
+    if jail.mode_of(plan or {}) == "required":
+        log("plan.sandbox is true, so workers run headless: Orca's can't be confined")
+        return "headless"
+    return "orca"
 
 
 def cmd_run(a, resume: bool = False) -> int:
@@ -5353,7 +5366,12 @@ def cmd_run(a, resume: bool = False) -> int:
     dash = ensure_dashboard(plan["job"])  # before any work, so the user can watch from the start
     if dash:
         log(f"dashboard: {dash}")
-    mode = workers_mode(a, Job(plan["job"]))  # an existing job keeps the mode it started in
+    mode = workers_mode(a, Job(plan["job"]), plan)  # an existing job keeps the mode it started in
+    if mode == "orca" and jail.mode_of(plan) == "required":
+        print(f'plan.sandbox is true, and Orca workers can\'t be confined ({ORCA_UNCONFINED}). Start it with '
+              '--workers headless (a job that already started in Orca keeps that mode: use a new plan.job), or '
+              'have the user drop "sandbox".', file=sys.stderr)
+        return 2
     if (mode == "orca" or not a.detach) and not hold_job(plan["job"]):  # a detached child takes it itself
         print(f"another orchestrate process is working on job {plan['job']}: `orchestrate.py status "
               f"{plan['job']}`", file=sys.stderr)

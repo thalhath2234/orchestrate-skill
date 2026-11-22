@@ -2218,6 +2218,26 @@ class OrchestrateTest(unittest.TestCase):
         p = subprocess.run([sys.executable, "-c", code], env=self.env, capture_output=True, text=True)
         self.assertIn("one module True", p.stdout, p.stderr)
 
+    def test_orca_never_passes_for_confined(self):
+        import jail
+        self.orca_env()
+        code, out = self.drive_orca(("run", str(self.write_plan(base_plan(self.repo)))), {"tasks": WRITES})
+        self.assertEqual(code, 0, out[-1500:])
+        self.assertIn("worker confinement: none", (self.state / "jobs/share/report.md").read_text(),
+                      "Orca's workers run unjailed, and the report must say so")
+        self.tearDown()
+        self.setUp()
+        self.orca_env()
+        strict = str(self.write_plan(base_plan(self.repo, sandbox=True)))
+        code, out, err = self.cli("run", strict, "--workers", "orca", cfg={"tasks": WRITES})
+        self.assertEqual(code, 2, err[-1500:])
+        self.assertIn("--workers headless", err)
+        self.assertFalse(self.orca_of("worker-start"), "a required sandbox never starts an unjailed worker")
+        if not jail.available():
+            code, out, err = self.cli("run", strict, cfg={"tasks": WRITES})  # auto, inside Orca
+            self.assertFalse(self.orca_of("worker-start"))
+            self.assertEqual(self.job_state()["mode"], "headless", err[-1500:])
+
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate
         v = orchestrate.settle_verdict({"verdict": "pass", "findings": [

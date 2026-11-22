@@ -179,6 +179,8 @@ def start_worker(job: O.Job, plan: dict, tid: str, rung: int, *, fresh: bool, hi
     integration head; otherwise the task's existing worktree (an escalation keeps the work).
     Returns an error message, or None."""
     task = next(t for t in plan["tasks"] if t["id"] == tid)
+    if O.jail.mode_of(plan) == "required":  # the plan can be edited while the job runs
+        return f"plan.sandbox is true and Orca workers can't be confined ({O.ORCA_UNCONFINED})"
     st = job.state["tasks"][tid]
     o = st.setdefault("orca", {"starts": 0, "escalations": 0})
     model, effort = router.cfg(rung)
