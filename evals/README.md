@@ -79,6 +79,8 @@ Recorded on 2026-11-15 with Claude Code 2.1.325. See `docs/IMPROVEMENT-PLAN.md` 
 
 On 2026-11-22 (Claude Code 2.1.330, `02b9caf`) the core set passed 26/27 (0.963) for $6.34, one trial per case: `runs/quick-20261122-180607.json`.
 
+On 2026-11-23 four reviewer cases joined the core set (`predictable-token`, `save-error-ignored`, `injection-in-report`, `report-claims-met-falsely`): each passed one trial, $0.91 together (`runs/quick-20261123-063615-reviewer-hard.txt`, stopped after two cases by the cost guard, then `runs/quick-20261123-063806-reviewer-hard.json`). A full `eval-quick` now costs about $1.30 more.
+
 | Role | Core cases passed | Cost |
 |---|---|---|
 | manager | 9/10 | $1.54 |

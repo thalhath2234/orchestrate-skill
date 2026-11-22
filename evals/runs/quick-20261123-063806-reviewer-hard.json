@@ -1,0 +1,64 @@
+{
+  "meta": {
+    "git_sha": "26bb5e52a349a06d1c9d0b20d689f020d710274c",
+    "dirty": false,
+    "claude_version": "2.1.330 (Claude Code)",
+    "date": "2026-11-22T21:38:06Z",
+    "hermetic": true
+  },
+  "overall_pass": 1.0,
+  "low_roles": {},
+  "fallback_configs": {},
+  "results": [
+    {
+      "role": "reviewer",
+      "case": "report-claims-met-falsely",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.2273,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.2272866,
+          "detail": "Not done. Create in handler.go has no owner check, so anyone can make a public link for any schedule. The api report claims an owner check and a TestCreateNonOwnerIs403 test that don't exist. The verify step is a no-op (Makefile `test: true`), and both test files use undefined helpers, so none of the tests have run. The API returns only {token} while the web button expects a ShareLink with expiresAt, and no expiry is ever set. The web button doesn't handle clipboard failures, which its done criteria require. Several errors (rand.Read, Links().Save, the ReadOnly result) are silently ignored.",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 47.7
+        }
+      ]
+    },
+    {
+      "role": "reviewer",
+      "case": "save-error-ignored",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.2043,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.2042754,
+          "detail": "All four acceptance criteria have tests, and the API and web sides agree with the ShareLink contract. The Create handler discards the Links.Save error (handler.go:40), so a failed save still returns 201 with a token that 404s. This is a silent failure at a boundary, and no test covers it. Also reported: all schedule lookup errors map to 404 (minor), and a possible 200 for deleted schedules (low confidence).",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 37.0
+        }
+      ]
+    }
+  ]
+}
