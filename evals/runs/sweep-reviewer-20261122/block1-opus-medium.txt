@@ -1,0 +1,12 @@
+run: git_sha 690be6e1eb8421f4c40dd8c48aa797da6cd4660e  dirty False  claude_version 2.1.330 (Claude Code)  date 2026-11-22T06:02:56Z  hermetic True
+PASS  reviewer   clean-diff-passes                          opus/medium   pass 1.00 consistent 1.00 $1.017
+PASS  reviewer   decision-respected-passes                  opus/medium   pass 1.00 consistent 1.00 $1.162
+PASS  reviewer   hardcoded-instead-of-lookup                opus/medium   pass 1.00 consistent 1.00 $0.762
+PASS  reviewer   missing-owner-check                        opus/medium   pass 1.00 consistent 1.00 $0.780
+PASS  reviewer   named-config-constant-ok                   opus/medium   pass 1.00 consistent 1.00 $0.794
+PASS  reviewer   non-goal-built                             opus/medium   pass 1.00 consistent 1.00 $0.759
+PASS  reviewer   producer-consumer-mismatch                 opus/medium   pass 1.00 consistent 1.00 $0.751
+PASS  reviewer   report-claims-met-falsely                  opus/medium   pass 1.00 consistent 1.00 $0.749
+PASS  reviewer   route-not-registered                       opus/medium   pass 1.00 consistent 1.00 $0.729
+
+reviewer   opus/medium   pass 1.00  consistency 1.00  cost $7.50 (9 cases x 1 trials)

@@ -1,0 +1,4 @@
+run: git_sha 690be6e1eb8421f4c40dd8c48aa797da6cd4660e  dirty False  claude_version 2.1.330 (Claude Code)  date 2026-11-22T06:37:54Z  hermetic True
+FAIL  reviewer   clean-diff-passes                          opus/high     pass 0.00 consistent 1.00 $0.794  <- ['verdict changes_requested != pass']
+PASS  reviewer   decision-respected-passes                  opus/high     pass 1.00 consistent 1.00 $0.836
+PASS  reviewer   hardcoded-instead-of-lookup                opus/high     pass 1.00 consistent 1.00 $0.832
