@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 
 import jail
+import router
 
 OVERLOAD_RE = re.compile(r"overloaded_error|\b529\b|Overloaded", re.I)
 RATE_RE = re.compile(r"rate_limit_error|\b429\b|rate limit", re.I)
@@ -81,6 +82,26 @@ def _metrics(data: dict, wall: float) -> dict:
             "output": u.get("output_tokens"), "cache_read": u.get("cache_read_input_tokens"),
             "cache_creation": u.get("cache_creation_input_tokens"),
             "duration_ms": data.get("duration_ms"), "wall_s": round(wall, 1)}
+
+
+def _cost_of_this_call(data: dict, resume: str | None) -> None:
+    """On --resume the CLI reports the session's running total (its usage, and --max-budget-usd,
+    count this process alone), so the total last reported is taken off. It's kept on disk: a resumed
+    job's manager continues a session another process started. A total never seen counts in full."""
+    sid, total = data.get("session_id"), data.get("total_cost_usd")
+    if not isinstance(sid, str) or not re.fullmatch(r"[\w-]{1,100}", sid) or not isinstance(total, (int, float)):
+        return
+    seen = router.DIR / "sessions" / sid
+    if resume == sid:
+        with contextlib.suppress(OSError, ValueError):
+            before = float(seen.read_text())
+            if total >= before:  # less would be a CLI that reports per call
+                data["total_cost_usd"] = total - before
+    with contextlib.suppress(OSError):
+        seen.parent.mkdir(parents=True, exist_ok=True)
+        tmp = seen.with_name(f"{sid}.{os.getpid()}.{threading.get_ident()}")
+        tmp.write_text(repr(float(total)))
+        os.replace(tmp, seen)
 
 
 def _kind(data: dict) -> str | None:
@@ -266,6 +287,7 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
     usage = data.get("modelUsage") or {}
     data["model_id"] = next((k for k in usage if model in k), next(iter(usage), None))
     data["metrics"] = _metrics(data, time.time() - t0)
+    _cost_of_this_call(data, resume)
     so = data.get("structured_output")
     data["structured"] = so if isinstance(so, dict) else extract_json(str(data.get("result", "")))
     if kind == "cut_off":

@@ -1532,6 +1532,34 @@ class OrchestrateTest(unittest.TestCase):
                 self.assertEqual(self.o.git(wt, "rev-parse", "HEAD"), head)
                 self.assertEqual((wt / "other.go").read_text(), "package other\n")
 
+    # ------------------------------------------------- v0.9: reliability, cost
+    def test_a_resumed_call_costs_what_it_added_to_its_session(self):
+        # the real CLI reports a session's running total on --resume; usage is per call
+        fake, totals = self.tmp / "meter-claude", self.tmp / "totals"
+        fake.write_text("#!/usr/bin/env python3\nimport sys, json, pathlib\n"
+                        "a = sys.argv\n"
+                        "sid = a[a.index('--resume') + 1] if '--resume' in a else 'sess-%d' % __import__('time').time_ns()\n"
+                        f"f = pathlib.Path({str(totals)!r} + sid)\n"
+                        "t = (float(f.read_text()) if f.exists() else 0.0) + 0.25\n"
+                        "f.write_text(str(t))\n"
+                        "print(json.dumps({'result': 'ok', 'is_error': False, 'session_id': sid, 'total_cost_usd': t}))\n")
+        fake.chmod(0o755)
+        old = os.environ["ROUTER_CLAUDE_BIN"]
+        os.environ["ROUTER_CLAUDE_BIN"] = str(fake)
+        self.addCleanup(os.environ.__setitem__, "ROUTER_CLAUDE_BIN", old)
+        kw = dict(perm="dontAsk", tools=[])
+        first = self.o.claude_cli.call("x", "opus", "medium", self.repo, **kw)
+        costs = [first["total_cost_usd"]]
+        for _ in range(2):
+            costs.append(self.o.claude_cli.call("x", "opus", "medium", self.repo, resume=first["session_id"], **kw)["total_cost_usd"])
+        self.assertEqual(costs, [0.25, 0.25, 0.25])
+        code = ("import sys, json; sys.path.insert(0, %r); import claude_cli; "
+                "print(claude_cli.call('x', 'opus', 'medium', %r, perm='dontAsk', tools=[], resume=%r)['total_cost_usd'])"
+                % (str(SCRIPTS), str(self.repo), first["session_id"]))
+        p = subprocess.run([sys.executable, "-c", code], env={**self.env, "ROUTER_CLAUDE_BIN": str(fake)},
+                           capture_output=True, text=True)
+        self.assertEqual(p.stdout.strip(), "0.25", "another process (a resumed job's manager): " + p.stderr)
+
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate
         v = orchestrate.settle_verdict({"verdict": "pass", "findings": [
