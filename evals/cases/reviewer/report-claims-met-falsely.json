@@ -1,6 +1,6 @@
 {
  "id": "report-claims-met-falsely",
- "core": false,
+ "core": true,
  "pair": "decision-respected-passes",
  "about": "The api report's done_check marks D2 (a non-owner gets 403) as met, with evidence that does not exist: handler.go has no owner check and handler_test.go has no TestCreateNonOwnerIs403. The reviewer must check each claim against the code, not believe it. Same fixture as missing-owner-check.",
  "from": "reviewer/missing-owner-check",
@@ -34,7 +34,8 @@
  "expect": {
   "verdict": "changes_requested",
   "finding_mentions": [
-   "owner"
-  ]
+   "owner|owns|ownership|userid"
+  ],
+  "finding_file": "share/handler.go"
  }
 }

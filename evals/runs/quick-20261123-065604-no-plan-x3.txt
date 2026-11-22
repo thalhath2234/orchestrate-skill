@@ -1,0 +1,4 @@
+run: git_sha 348e66e443cab91930921c6353ea04e7d1529d26  dirty False  claude_version 2.1.330 (Claude Code)  date 2026-11-22T21:56:04Z  hermetic True
+PASS  parent     no-plan-before-confirm                     default       pass 1.00 consistent 1.00 $0.534
+
+parent     default       pass 1.00  consistency 1.00  cost $0.53 (1 cases x 3 trials)

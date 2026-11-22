@@ -1,0 +1,63 @@
+{
+  "meta": {
+    "git_sha": "6125d1c3a9d6cbc67c5a8c59b77a298f258b6a21",
+    "dirty": false,
+    "claude_version": "2.1.330 (Claude Code)",
+    "date": "2026-11-22T21:26:16Z",
+    "hermetic": true
+  },
+  "overall_pass": 1.0,
+  "low_roles": {},
+  "fallback_configs": {},
+  "results": [
+    {
+      "role": "parent",
+      "case": "no-plan-before-confirm",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.5327,
+      "trials": [
+        {
+          "ok": true,
+          "label": "orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.1785,
+          "detail": "No open jobs, and this isn't a web UI change. The change is small: one flag in `cli.py` and one test in `test_cli.py`. I'll keep the questions to a single short round.\n\n**What done means (your words, kept as written):**\n> \"make test passes and python3 cli.py --debug prints the debug line.\"\n\n**Questi",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 16.2
+        },
+        {
+          "ok": true,
+          "label": "orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.1792,
+          "detail": "I've read the repo. No orchestrate jobs are open, and the change is small. `cli.py` has one `--verbose` flag that prints `debug: starting`, and `test_cli.py` has one test for it. You already said what done means, so I'll use your words as written.\n\n**A few quick questions (my recommendation follows ",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 17.1
+        },
+        {
+          "ok": true,
+          "label": "orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.175,
+          "detail": "No open orchestrate jobs, so this starts fresh. I've read the repo: `cli.py` has one `--verbose` flag that prints `debug: starting`, `test_cli.py` has one test that uses it, and `make test` runs `pytest -q`. There's no web UI.\n\n**Definition of done, in your words:** \"make test passes and python3 cli",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 16.1
+        }
+      ]
+    }
+  ]
+}
