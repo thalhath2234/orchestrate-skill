@@ -204,6 +204,12 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
     hermetic = os.environ.get("ORCHESTRATE_HERMETIC") == "1"
     if hermetic:
         settings = {**(settings or {}), "disableAllHooks": True}
+    if only is not None:
+        # these roles judge text workers wrote, which can tell them to open any file the user can.
+        # Reads stay in the cwd and the --add-dir dirs. Not --restricted: that drops the user's
+        # settings, where a provider or login helper may be set.
+        perms = {**(settings or {}).get("permissions", {}), "blockReadsOutsideWorkingDirectories": True}
+        settings = {**(settings or {}), "permissions": perms}
     if settings:
         cmd += ["--settings", json.dumps(settings)]
     if only is not None:

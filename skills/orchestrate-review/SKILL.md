@@ -52,7 +52,7 @@ Give each finding a file and, where possible, a line, plus a concrete fix. A fix
 
 ### Acceptance, with evidence
 
-For **every** job acceptance criterion, return one `acceptance` entry: the criterion, the `evidence` (a `file:line` or a test name that shows it), and whether it is `met`. The harness turns any criterion that is unassessed, unmet, or marked met without evidence into a blocker, so "looks fine" without a citation fails the job. If you can't find evidence, say `met: false` and what is missing.
+For **every** job acceptance criterion, return one `acceptance` entry: the criterion, the `evidence` (a `file:line` or a test name that shows it), and whether it is `met`. The harness turns any criterion that is unassessed, unmet, or marked met without evidence into a blocker, so "looks fine", "none" or "verified" without a citation fails the job. One entry answers one criterion: quote each criterion, even when two read alike. If you can't find evidence, say `met: false` and what is missing.
 
 ### Large jobs
 

@@ -1,0 +1,164 @@
+{
+  "meta": {
+    "git_sha": "5b58b61af81023b611f7ec5fba7b51f98bb9a4f0",
+    "dirty": false,
+    "claude_version": "2.1.330 (Claude Code)",
+    "date": "2026-11-22T16:22:46Z",
+    "hermetic": true
+  },
+  "overall_pass": 1.0,
+  "low_roles": {},
+  "fallback_configs": {},
+  "results": [
+    {
+      "role": "ui_reviewer",
+      "case": "clean-share-page-passes",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.1624,
+      "trials": [
+        {
+          "ok": true,
+          "label": "pass",
+          "fails": [],
+          "cost": 0.162367,
+          "detail": "code review: pass | UI review: Both shots meet the visual acceptance criteria: the Share card, link and Copy link button are visible at desktop and mobile, the URL wraps on mobile, and nothing is cut off or overflowing. No browser errors were recorded. Two non-blocking caveats: the source gives Copy link no click behavior, so it will not copy anything (no click was exercised), and the share URL is a hard-coded example.com value. The pass covers what is displayed, not a working share or copy flow.",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 30.3
+        }
+      ]
+    },
+    {
+      "role": "ui_reviewer",
+      "case": "mobile-text-cut-off",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.1819,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.18194180000000001,
+          "detail": "code review: pass | UI review: Mobile fails acceptance: a fixed 620px main, a no-wrap link and hidden horizontal overflow cut off every event time, the description and the share link, with no way to scroll to them. The desktop screenshot looks fine but doesn't match the current source (different card width and URL), so desktop is unverified and likely overflows too. From the source, the Copy link button also has no click handler; clicking it was not tested.",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 40.1
+        }
+      ]
+    },
+    {
+      "role": "reviewer",
+      "case": "clean-diff-passes",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.3196,
+      "trials": [
+        {
+          "ok": true,
+          "label": "pass",
+          "fails": [],
+          "cost": 0.319592,
+          "detail": "All four acceptance criteria and both subtasks' done criteria are met with tests. The owner check, expiry boundary, opaque tokens and API/contract field names are correct, and the non-goal is respected. The major concerns are all low confidence because they depend on code absent from this checkout (router, auth, stores, web shell). The confirmed issues are minor test gaps and a small click race. I reviewed by reading only and did not run the checks. The checkout has no go.mod or package.json, so I could not corroborate the supplied verify output.",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 57.0
+        }
+      ]
+    },
+    {
+      "role": "reviewer",
+      "case": "missing-owner-check",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.3092,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.30919300000000005,
+          "detail": "Changes requested. The most serious problem is a security hole: POST /schedules/:id/share has no authentication or owner check, so anyone with a schedule id can publish and read another user's schedule, and no test covers it.\n\nThree of the four acceptance criteria are unmet: owner-only creation is absent, and the token and read-only tests assert only status codes. The fourth (copy link) is met by reading the code and test only.\n\nAcross tasks, POST returns only {token} where the button needs a full ShareLink, the button is not mounted, nothing calls the endpoint, and no web page serves the copied URL. Both subtasks miss done criteria: the 403, 404 and expiry tests, and the copy-failure message.\n\nThe green verify is not evidence. `make test` runs only `true`, and the new Go package and the tests reference symbols defined nowhere in the repo. I reviewed by reading and ran nothing.",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 81.4
+        }
+      ]
+    },
+    {
+      "role": "reviewer",
+      "case": "producer-consumer-mismatch",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.3352,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.3352234,
+          "detail": "Changes requested: none of the four acceptance criteria is demonstrated. This review was done by reading only; nothing was run.\n\n- **Contract mismatch:** ShareButton reads `expires_at` where the contract says `expiresAt`. The create endpoint returns only `token`, and nothing sets an expiry.\n- **Not wired:** nothing renders ShareButton or calls the create endpoint, and the copied URL has no web page or proxy in this repo.\n- **Missing done criteria:** there is no copy-failure message or test, and no tests for an expired token or an unknown schedule.\n- **Errors:** random-source and save failures are unchecked, lookup outages become 404, and deleted schedules are not handled.\n- **Verification is empty:** `make test` is just `true`. The Go tests use undefined helpers, and the share package references undeclared types, so the reported pass is not evidence.\n\nThe owner check and the opaque-token decision are implemented correctly as far as the visible code shows. Auth middleware, the store and ReadOnly are not in the repo, so most concerns that depend on them are marked low confidence.",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 84.9
+        }
+      ]
+    },
+    {
+      "role": "reviewer",
+      "case": "route-not-registered",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.3516,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.35156160000000003,
+          "detail": "The share feature does not work end to end, so changes are requested. This review is from reading the code; nothing was run.\n\n- **API not wired:** share.Register is never called, so both endpoints are unreachable, although the api task reported the routes as registered.\n- **Contract mismatch:** POST returns only `token`, while the web ShareLink type also needs `scheduleId` and `expiresAt`.\n- **Web not wired:** ShareButton is mounted nowhere, nothing calls the POST, and the required copy-failure message is missing.\n- **Weak tests:** they check status codes only, omit the required expired-token and unknown-schedule cases, and the share package lacks the definitions it needs to compile.\n- **Verify proves nothing:** `make test` is just `true`, so its ok is not evidence that any test passed.\n\nThe ownership check and the opaque random token follow the spec in code. Of the four job criteria, only the copy-link one is met, and only at component level.",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 96.7
+        }
+      ]
+    }
+  ]
+}

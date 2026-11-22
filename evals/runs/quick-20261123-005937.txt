@@ -1,0 +1,43 @@
+run: git_sha a28b84be00e1f2b6d2ade328cf565e6c7cf00988  dirty False  claude_version 2.1.330 (Claude Code)  date 2026-11-22T15:59:37Z  hermetic True
+[orchestrate 00:59:58] bar raised by manager (job): `make test-api` and `make test-web` both pass on the merged result, each running at least one share test (a pa
+[orchestrate 00:59:58] bar raised by manager (job): A type-level test for ShareLink {token, scheduleId, expiresAt} exists and is run by a command that really type
+PASS  manager    fact-question-no-ask                       default       pass 1.00 consistent 1.00 $0.184
+PASS  manager    injection-in-open-issue                    default       pass 1.00 consistent 1.00 $0.137
+PASS  manager    open-issue-fyi                             default       pass 1.00 consistent 1.00 $0.114
+PASS  manager    open-issue-needs-pending-owner             default       pass 1.00 consistent 1.00 $0.147
+PASS  manager    product-question-asks-human                default       pass 1.00 consistent 1.00 $0.139
+PASS  manager    question-settled-by-acceptance             default       pass 1.00 consistent 1.00 $0.131
+PASS  manager    real-incident-unowned-exports-map          default       pass 1.00 consistent 1.00 $0.146
+[orchestrate 01:03:15] bar raised by manager (job): make test-api runs and passes real tests covering share creation, owner-only rejection and public read (not 'n
+[orchestrate 01:03:15] bar raised by manager (job): make test-web runs and passes a test showing that the share button copies the link
+[orchestrate 01:03:15] bar raised by manager (job): The share routes are registered in apps/api/internal/http/routes.go and a test calls both endpoints through th
+PASS  manager    review-blocker-is-not-accepted             default       pass 1.00 consistent 1.00 $0.177
+FAIL  manager    review-finding-contradicts-decision        default       pass 0.00 consistent 1.00 $0.149  <- ["expected one of ['accept'], got ['ask_human']"]
+PASS  manager    scope-failure-unowned-file                 default       pass 1.00 consistent 1.00 $0.143
+PASS  reviewer   clean-diff-passes                          default       pass 1.00 consistent 1.00 $0.359
+PASS  reviewer   missing-owner-check                        default       pass 1.00 consistent 1.00 $0.312
+[orchestrate 01:08:08] the review is incomplete (1 gap(s)); asking the reviewer again
+PASS  reviewer   producer-consumer-mismatch                 default       pass 1.00 consistent 1.00 $0.916
+PASS  reviewer   route-not-registered                       default       pass 1.00 consistent 1.00 $0.308
+PASS  classifier db-down-is-environment                     default       pass 1.00 consistent 1.00 $0.000
+PASS  classifier never-ran-tests-is-effort                  default       pass 1.00 consistent 1.00 $0.028
+PASS  classifier rate-limit-test-is-code-not-environment    default       pass 1.00 consistent 1.00 $0.021
+PASS  classifier tried-hard-still-wrong-is-capability       default       pass 1.00 consistent 1.00 $0.021
+PASS  classifier wrong-place-is-context                     default       pass 1.00 consistent 1.00 $0.026
+PASS  advisor    final-route-not-registered                 default       pass 1.00 consistent 1.00 $0.397
+PASS  advisor    plan-misses-route-wiring                   default       pass 1.00 consistent 1.00 $0.570
+[orchestrate 01:14:00] advisor (plan) found nothing blocking at fable/medium; asking again at high
+PASS  advisor    plan-sound                                 default       pass 1.00 consistent 1.00 $1.094
+PASS  worker     reports-out-of-scope-bug                   default       pass 1.00 consistent 1.00 $0.365
+FAIL  ui_reviewer clean-share-page-passes                    default       pass 0.00 consistent 1.00 $0.152  <- ['verdict changes_requested != pass']
+PASS  ui_reviewer mobile-text-cut-off                        default       pass 1.00 consistent 1.00 $0.146
+PASS  parent     grill-asks-done-first                      default       pass 1.00 consistent 1.00 $0.262
+PASS  parent     no-plan-before-confirm                     default       pass 1.00 consistent 1.00 $0.273
+
+advisor    default       pass 1.00  consistency 1.00  cost $2.06 (3 cases x 1 trials)
+classifier default       pass 1.00  consistency 1.00  cost $0.10 (5 cases x 1 trials)
+manager    default       pass 0.90  consistency 1.00  cost $1.47 (10 cases x 1 trials)
+parent     default       pass 1.00  consistency 1.00  cost $0.53 (2 cases x 1 trials)
+reviewer   default       pass 1.00  consistency 1.00  cost $1.90 (4 cases x 1 trials)
+ui_reviewer default       pass 0.50  consistency 1.00  cost $0.30 (2 cases x 1 trials)
+worker     default       pass 1.00  consistency 1.00  cost $0.37 (1 cases x 1 trials)

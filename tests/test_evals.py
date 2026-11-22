@@ -81,6 +81,7 @@ FAKE = textwrap.dedent(r'''
     elif prompt.startswith("ORCHESTRATE_REVIEW"):
         block = prompt.split("Job acceptance criteria:\n", 1)[1].split("\n\n", 1)[0]
         r = {"verdict": "pass", "summary": "fine", "findings": [],
+             "edge_cases": [{"case": "empty input", "handled": True, "evidence": "x_test.go:2"}],
              "acceptance": [{"criterion": l[2:], "met": True, "evidence": "x_test.go:1"}
                             for l in block.splitlines() if l.startswith("- ")]}
     elif prompt.startswith("ORCHESTRATE_ADVISE"):
