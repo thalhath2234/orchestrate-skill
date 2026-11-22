@@ -75,6 +75,8 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# harness Pythons: no PYTHON* variables and no user site, both places a worker can plant code
+PY = [sys.executable, "-E", "-s"]
 sys.path.insert(0, str(HERE))
 import claude_cli  # noqa: E402
 import jail  # noqa: E402
@@ -1331,7 +1333,12 @@ def ensure_integration(job: Job) -> Path:
 
 def run_setup(cmds: list[str], cwd: Path, logf: Path, confine: Path | None = None) -> tuple[bool, str]:
     # git hooks and config are read-only in the jail, so hook installers are told to stand down
-    env = {**os.environ, "HUSKY": "0", "LEFTHOOK": "0"} if confine else None
+    env = dict(os.environ)
+    if not jail.available():  # workers edit this tree: a hard link would be the user's package store
+        env.update(npm_config_package_import_method="copy", pnpm_config_package_import_method="copy",
+                   UV_LINK_MODE="copy")
+    if confine:
+        env.update(HUSKY="0", LEFTHOOK="0")
     for c in cmds:
         code, out = sh(c, cwd, 1800, env=env, confine=confine)
         with open(logf, "a") as fh:
@@ -1371,11 +1378,11 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
     brief = build_brief(plan, task, wt, upstream)
     (job.dir / "briefs" / f"{task['id']}.md").write_text(brief, encoding="utf-8", errors="replace")
     start = (job.state["tasks"].get(task["id"]) or {}).get("start_sha")
-    scope = (f"{shlex.quote(sys.executable)} {shlex.quote(str(HERE / 'orchestrate.py'))} scope-check "
+    scope = (f"{shlex.join(PY)} {shlex.quote(str(HERE / 'orchestrate.py'))} scope-check "
              f"--job {shlex.quote(job.id)} --task {shlex.quote(task['id'])} "
              + (f"--base {shlex.quote(start)} " if start else "")
              + " ".join(f"--owns {shlex.quote(p)}" for p in task["owns"]))
-    cmd = [sys.executable, str(HERE / "run_task.py"), "--repo", str(wt), "--type", task["type"],
+    cmd = [*PY, str(HERE / "run_task.py"), "--repo", str(wt), "--type", task["type"],
            "--tier", task["tier"], "--verify", scope, "--report-schema", json.dumps(schemas.REPORT)]
     cmd += ["--done-ids", *done_ids(plan, task)]
     cmd += ["--start", "/".join(models.role("worker", plan))]
@@ -1435,6 +1442,8 @@ def commit_and_merge(job: Job, plan: dict, task: dict, res: dict,
     repo, wt = Path(job.state["repo"]), Path(res["wt"])
     integ = Path(job.state["integration_wt"])
     ident = git_ident(repo)
+    if not on_branch(wt, res["branch"]):  # committing would move whatever branch HEAD names
+        return False, f"not merged: the worktree is no longer on its task branch {res['branch']}"
     git(wt, "add", "-A")
     if git(wt, "diff", "--cached", "--name-only"):
         git(wt, *ident, "commit", "-q", "-m", f"orchestrate({job.id}): {task['id']}: {task['title']}")
@@ -1442,6 +1451,12 @@ def commit_and_merge(job: Job, plan: dict, task: dict, res: dict,
     if git(wt, "merge-base", start, tip, check=False) != start:
         return False, (f"not merged: the worktree's history was rewritten (HEAD no longer descends from "
                        f"{start[:10]}, where the task started)")
+    # start..tip is all a merge changes only while start is the one base of that merge. A tip built on
+    # other tasks' merged work would take theirs as the base and could undo it.
+    bases = set(git(integ, "merge-base", "--all", "HEAD", tip, check=False).split())
+    if bases not in ({start}, {tip}):
+        return False, ("not merged: the branch takes in other tasks' work (its commits don't grow only from "
+                       f"{start[:10]}, where the task started), so merging it could undo theirs")
     changed = git_paths(wt, "diff", "--name-only", "--no-renames", f"{start}..{tip}")
     # The worker's own scope check runs where the worker can commit, switch branches or edit what it
     # reads: this one judges exactly the commit that gets merged.
@@ -1469,6 +1484,7 @@ def commit_and_merge(job: Job, plan: dict, task: dict, res: dict,
                 return False, f"merge conflict not resolved: {why}"
     if remove_worktree:  # Orca-managed worktrees are removed through Orca instead
         git(repo, "worktree", "remove", "--force", str(wt), check=False)
+        jail.forget(wt, router.DIR)
     # files this task claimed because no task owned them now belong to it in the plan (P2.3)
     mine = sorted(f for f, t in read_claims(job).items() if t == task["id"] and f in changed)
     if mine:
@@ -1476,6 +1492,10 @@ def commit_and_merge(job: Job, plan: dict, task: dict, res: dict,
         job.state["tasks"][task["id"]]["claimed"] = mine
         write_json(job.dir / "plan.json", plan)
     return True, json.dumps(files)
+
+
+def on_branch(wt: Path, branch: str) -> bool:
+    return git(wt, "symbolic-ref", "-q", "HEAD", check=False) == f"refs/heads/{branch}"
 
 
 def tracked_clean(integ: Path) -> bool:
@@ -1651,7 +1671,7 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
     union = sorted({p for t in plan["tasks"] for p in t["owns"]} | set(plan.get("review_may_edit", [])))
     log(f"review round {rnd_no}: {len(blocking)} blocking finding(s); running a fix subagent")
     before = git(integ, "rev-parse", "HEAD")
-    scope = (f"{shlex.quote(sys.executable)} {shlex.quote(str(HERE / 'orchestrate.py'))} scope-check "
+    scope = (f"{shlex.join(PY)} {shlex.quote(str(HERE / 'orchestrate.py'))} scope-check "
              f"--base {shlex.quote(before)} " + " ".join(f"--owns {shlex.quote(p)}" for p in union))
     task = ("Fix these review findings on the integration branch of job "
             f"\"{job.id}\" ({plan['goal']}). Do not commit.\n\n"
@@ -1659,7 +1679,7 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
             + json.dumps(blocking, indent=2)
             + "\n\nAcceptance criteria for the whole job:\n"
             + "\n".join(f"- {a}" for a in plan.get("acceptance", [])))
-    cmd = [sys.executable, str(HERE / "run_task.py"), "--repo", str(integ), "--type",
+    cmd = [*PY, str(HERE / "run_task.py"), "--repo", str(integ), "--type",
            f"bugfix:{area}", "--tier", "T2", "--no-baseline", "--max-escalations", "1",
            "--verify", scope, *sum((["--verify", v] for v in plan["verify"]), []),
            "--jail", jail.mode_of(plan), "--trusted-verify", scope,
@@ -1672,6 +1692,9 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
     with open(job.dir / "logs" / f"_fix-round-{rnd_no}.log", "a") as fh:
         p = subprocess.run(cmd, cwd=integ, input=task, stdout=subprocess.PIPE, stderr=fh, encoding="utf-8",
                            errors="replace")
+    if not on_branch(integ, job.state["branch"]):
+        raise RuntimeError(f"review round {rnd_no}: the integration worktree left {job.state['branch']}; "
+                           "nothing was committed")
     if git(integ, "rev-parse", "HEAD") != before:
         git(integ, "reset", "-q", "--soft", before)  # what it committed is judged like what it only edited
     s = extract_json(p.stdout) or {}
@@ -2970,6 +2993,8 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
                  confine=confinement(plan))
     record_call(job, "cleanup", res, None, f"{m}/{e}")
     out = {"config": f"{m}/{e}", "report": res.get("structured") or {}}
+    if not on_branch(integ, job.state["branch"]):
+        raise RuntimeError(f"cleanup: the integration worktree left {job.state['branch']}; nothing was committed")
     new_files = untracked() - before
     touched = sorted(set(git_paths(integ, "diff", "--name-only", "--no-renames", "HEAD")) | new_files)
 
@@ -4456,7 +4481,7 @@ def _runs_this_dashboard(pid: int) -> bool:
         cwd = Path(os.readlink(f"/proc/{pid}/cwd"))
     except OSError:
         return False
-    for a in argv[1:3]:
+    for a in argv[1:5]:  # after PY's flags
         a = os.fsdecode(a)
         if a.endswith("dashboard.py"):
             with contextlib.suppress(OSError):
@@ -4472,7 +4497,7 @@ def _runs_a_dashboard(pid: int) -> bool | None:
         argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except OSError:
         return None if not Path("/proc/self").exists() else False
-    return any(os.fsdecode(a).endswith("dashboard.py") for a in argv[1:3])
+    return any(os.fsdecode(a).endswith("dashboard.py") for a in argv[1:5])
 
 
 def _dash_killable(r: dict, port: int, recs: list[dict]) -> bool:
@@ -4549,7 +4574,7 @@ def _ensure_dashboard_locked(port: int, start: bool) -> int | None:
         if pings.get(p) is not None:
             continue
         with open(router.DIR / "dashboard.log", "a") as fh:
-            proc = subprocess.Popen([sys.executable, str(HERE / "dashboard.py"), "--port", str(p)],
+            proc = subprocess.Popen([*PY, str(HERE / "dashboard.py"), "--port", str(p)],
                                     stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     start_new_session=True, cwd=str(router.DIR))
         end = time.time() + 5
@@ -4829,7 +4854,7 @@ def cmd_run(a, resume: bool = False) -> int:
         return fn(job, job.plan, a.approve or [], a.max_parallel, a.skip_baseline, getattr(a, "answer", None))
     if a.detach:
         JOBS.mkdir(parents=True, exist_ok=True)
-        argv = [sys.executable, str(Path(__file__).resolve())] + [x for x in sys.argv[1:] if x != "--detach"]
+        argv = [*PY, str(Path(__file__).resolve())] + [x for x in sys.argv[1:] if x != "--detach"]
         logp = JOBS / f"{plan['job']}.out"
         if resume:
             # `wait` right after this must not read the status the job stopped with: it is running now
@@ -4970,6 +4995,7 @@ def cmd_clean(a) -> int:
     kept = keep_screenshots(job)
     if wt_root.exists():
         for d in wt_root.iterdir():
+            jail.forget(d, router.DIR)
             git(repo, "worktree", "remove", "--force", str(d), check=False)
         shutil.rmtree(wt_root, ignore_errors=True)
     git(repo, "worktree", "prune")
@@ -4991,7 +5017,7 @@ def guard_hook_config() -> dict:
     # python3 exits 2 for a missing file, and exit 2 from a PreToolUse hook blocks the call: without
     # the guard a removed or mid-update skill blocks every Bash command in every session.
     return {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
-        {"type": "command", "command": f"[ ! -r {gate} ] || python3 {gate}"}]}]}}
+        {"type": "command", "command": f"[ ! -r {gate} ] || python3 -I {gate}"}]}]}}
 
 
 def claude_config_dir() -> Path:

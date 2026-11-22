@@ -72,10 +72,22 @@ class JailTest(unittest.TestCase):
     def writes(self, path):
         return self.py(f"open({str(path)!r}, 'w').write('x')")
 
+    def unchanged_by(self, path, code=None):
+        """What the machine sees at `path` after a jailed attack: a write into the jail's own copy is no escape."""
+        look = lambda: (os.path.lexists(path), Path(path).read_bytes() if os.path.isfile(path) else None)
+        was = look()
+        self.py(code or f"import os; os.makedirs({str(Path(path).parent)!r}, exist_ok=True); open({str(path)!r}, 'w').write('x')")
+        return was == look()
+
     def test_a_worker_keeps_what_it_needs(self):
         self.assertTrue(self.writes(self.wt / "new.txt"))
-        self.assertTrue(self.writes(self.home / ".cache" / "x"), "package caches")
-        for args in (("status", "--porcelain"), ("diff",), ("add", "new.txt"), ("checkout", "--", "f.txt")):
+        cached = self.home / ".cache" / "tool" / "x"
+        self.assertTrue(self.py(f"import os; os.makedirs({str(cached.parent)!r}); open({str(cached)!r}, 'w').write('x')"))
+        self.assertTrue(self.py(f"open({str(cached)!r}).read()"), "a package cache outlives one command")
+        self.assertFalse(cached.exists(), "and is not the user's cache")
+        self.assertNotEqual(self.jailed("cat", str(cached), wt=self.sibling).returncode, 0, "or another task's")
+        self.assertTrue(self.py("import tempfile; tempfile.NamedTemporaryFile().write(b'x')"), "temp files")
+        for args in (("status", "--porcelain"), ("diff",), ("checkout", "--", "f.txt")):
             p = self.jailed("git", *args)
             self.assertEqual(p.returncode, 0, (args, p.stderr))
         srv = socket.socket()
@@ -95,7 +107,67 @@ class JailTest(unittest.TestCase):
                   h / ".ssh/authorized_keys", h / ".local/bin/claude",
                   self.wt / ".git", self.gitdir / "commondir", self.gitdir / "gitdir"):
             with self.subTest(str(p)):
-                self.assertFalse(self.writes(p))
+                self.assertTrue(self.unchanged_by(p))
+
+    def test_only_the_worktree_changes_on_the_machine(self):
+        h = self.home
+        version = h / ".local/share/claude/versions/9.9.9"
+        version.parent.mkdir(parents=True)
+        version.write_text("the binary the harness runs")
+        cases = {"the claude binary": version,
+                 "a git earlier on PATH": h / "go/bin/git",
+                 "a .pth in the user site": h / ".local/lib/python3.99/site-packages/evil.pth",
+                 "a config that didn't exist": h / ".npmrc",
+                 "claude settings that didn't exist": h / ".claude/settings.local.json",
+                 "a service": h / ".config/systemd/user/evil.service",
+                 "autostart": h / ".config/autostart/evil.desktop",
+                 "somewhere else in the home": self.d / "dev" / "other-project.txt"}
+        for what, p in cases.items():
+            with self.subTest(what):
+                self.assertTrue(self.unchanged_by(p))
+
+    def test_it_cannot_delete_the_repos_objects(self):
+        self.py(f"import shutil; shutil.rmtree({str(self.repo / '.git/objects')!r}, ignore_errors=True)")
+        self.g("cat-file", "-p", "main:f.txt")
+
+    def test_what_it_writes_in_its_gitdir_never_reaches_the_harness(self):
+        head = self.gitdir / "HEAD"
+        self.assertTrue(self.unchanged_by(head, f"open({str(head)!r}, 'w').write('ref: refs/heads/main\\n')"))
+        log, victim = self.gitdir / "logs" / "HEAD", self.home / "victim"
+        self.py(f"import os; os.makedirs({str(log.parent)!r}, exist_ok=True); "
+                f"os.path.lexists({str(log)!r}) and os.unlink({str(log)!r}); os.symlink({str(victim)!r}, {str(log)!r})")
+        self.assertFalse(log.is_symlink())
+
+    def test_it_cannot_reach_the_users_session_or_processes(self):
+        run = Path(f"/run/user/{os.getuid()}")
+        if run.is_dir() and os.listdir(run):
+            self.assertFalse(self.py(f"import os, sys; sys.exit(0 if os.listdir({str(run)!r}) else 1)"), "session bus, agents")
+        fd, name = tempfile.mkstemp(prefix="orch-jail-host-", dir="/tmp")
+        os.close(fd)
+        self.addCleanup(os.unlink, name)
+        self.assertFalse(self.py(f"open({name!r}).read()"), "sockets in the host's /tmp")
+        other = subprocess.Popen(["sleep", "20"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        self.py(f"import os; os.kill({other.pid}, 9)")
+        time.sleep(0.3)
+        self.assertIsNone(other.poll(), "a process outside the jail")
+
+    def test_it_cannot_drive_the_users_agents_through_their_sockets(self):
+        for rel in (".agent.sock", ".config/ide/daemon/d.sock", ".gateway/g.sock"):
+            with self.subTest(rel):
+                p = self.home / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                (p.parent / "beside").write_text("still here")
+                srv = socket.socket(socket.AF_UNIX)
+                self.addCleanup(srv.close)
+                if len(str(p)) >= 108:
+                    self.skipTest("the home's path is too long for a socket")
+                srv.bind(str(p))
+                srv.listen(1)
+                self.assertFalse(self.py(f"import os, socket; os.chdir({str(p.parent)!r}); "
+                                         f"socket.socket(socket.AF_UNIX).connect({p.name!r})"))
+                self.assertTrue(self.py(f"assert open({str(p.parent / 'beside')!r}).read() == 'still here'"))
 
     def test_it_cannot_commit_or_move_refs(self):
         for args in (("-c", "user.email=w@w", "-c", "user.name=w", "commit", "--allow-empty", "-m", "x"),
@@ -106,9 +178,10 @@ class JailTest(unittest.TestCase):
         h = self.home
         for p in (self.state, self.state.parent, self.repo, self.repo.parent, h / ".claude", h / ".config", h / ".local"):
             with self.subTest(str(p)):
-                self.assertFalse(self.py(f"import os; os.rename({str(p)!r}, {str(p) + '-moved'!r})"))
+                self.py(f"import os; os.rename({str(p)!r}, {str(p) + '-moved'!r})")
                 self.assertTrue(p.exists())
-        self.assertFalse(self.py(f"import os; open('t','w').write('x'); os.replace('t', {str(h / '.claude/settings.json')!r})"))
+        settings = h / ".claude/settings.json"
+        self.assertTrue(self.unchanged_by(settings, f"import os; open('t','w').write('x'); os.replace('t', {str(settings)!r})"))
 
     def test_it_cannot_undo_the_mounts(self):
         j = self.job / "job.json"
@@ -124,6 +197,8 @@ class JailTest(unittest.TestCase):
         self.assertTrue(ok(self.repo / "new.txt"))
         self.assertFalse(ok(common / "config"))
         self.assertFalse(ok(common / "hooks" / "pre-commit"))
+        self.assertFalse(ok(common / "HEAD"))
+        self.assertFalse(ok(common / "objects" / "x"))
         self.assertFalse(ok(self.job / "job.json"))
 
     def test_it_dies_with_the_process_that_started_it(self):

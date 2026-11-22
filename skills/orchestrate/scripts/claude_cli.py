@@ -32,10 +32,12 @@ error_kind: None | timeout | budget | max_turns | overloaded | rate_limit | api 
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -149,6 +151,37 @@ def project_rules(cwd: Path) -> str:
     return ""
 
 
+REFRESH_S = 240  # the CLI refreshes a login in its last 5 minutes
+
+
+def refresh_login() -> None:
+    """The jail can't save a refreshed login, so a free command refreshes it out here; the jailed
+    CLI reads the replaced file before its next request. Output (the account's email) is discarded,
+    and the cwd is the home: a worktree's settings could run hooks."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run([claude_bin(), "auth", "status"], cwd=Path.home(), env=child_env(),
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+
+
+@contextlib.contextmanager
+def login_kept_fresh(on: bool):
+    if not on:
+        yield
+        return
+    done = threading.Event()
+
+    def keep() -> None:
+        while not done.wait(REFRESH_S):
+            refresh_login()
+
+    refresh_login()
+    threading.Thread(target=keep, daemon=True).start()
+    try:
+        yield
+    finally:
+        done.set()
+
+
 def child_env(extra_args: list[str] | None = None) -> dict:
     """The environment for one claude child: no advisor tool unless this call asked for one."""
     env = dict(os.environ)
@@ -202,8 +235,9 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
     for attempt in range(max(tries, 0) + 1):
         t0 = time.time()
         try:
-            p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, input=piped, encoding="utf-8",
-                               errors="replace", timeout=timeout)
+            with login_kept_fresh(bool(confine)):
+                p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, input=piped, encoding="utf-8",
+                                   errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
             return {"is_error": True, "error_kind": "timeout", "timeout": True,
                     "result": f"claude timed out after {timeout}s", "structured": None,

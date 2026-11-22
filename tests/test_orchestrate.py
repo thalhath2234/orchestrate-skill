@@ -387,6 +387,8 @@ class OrchestrateTest(unittest.TestCase):
                                                     "ORCHESTRATE_DASHBOARD", "ORCHESTRATE_MEM_PER_AGENT_GB",
                                                     "ORCHESTRATE_CPU_PER_AGENT", "ORCHESTRATE_API_BACKOFF_S",
                                                     "ORCHESTRATE_DASHBOARD_IDLE_HOURS")})
+        self.env["ORCHESTRATE_SANDBOX_WRITE"] = str(self.tmp)  # the fake CLI keeps its records here
+        os.environ["ORCHESTRATE_SANDBOX_WRITE"] = str(self.tmp)
         os.environ.pop("ORCHESTRATE_CHROME", None)
         self.env.pop("ORCHESTRATE_CHROME", None)
         import router
@@ -924,6 +926,78 @@ class OrchestrateTest(unittest.TestCase):
         self.o.commit_and_merge(job, plan, plan["tasks"][2], {"wt": str(wt), "branch": br})
         self.assertNotIn("stolen.go", self.o.git(integ, "ls-files"))
 
+    def test_a_commit_built_on_other_tasks_work_cannot_revert_it(self):
+        # start..tip shows nothing of another task, yet the merge's base is their work: it would undo it
+        for shape in ("two parents", "linear"):
+            with self.subTest(shape):
+                if shape == "linear":
+                    self.tearDown()
+                    self.setUp()
+                job, plan, integ, start, wt, br = self._web_worker()
+                theirs = integ / "apps/api/share"
+                theirs.mkdir(parents=True, exist_ok=True)
+                (theirs / "theirs.go").write_text("package share\n")
+                self._as_worker(integ, "add", "apps/api")
+                self._as_worker(integ, "commit", "-qm", "their task")
+                other = self.o.git(integ, "rev-parse", "HEAD")
+                self._as_worker(wt, "add", "-A")
+                tree = self.o.git(wt, "write-tree")
+                parents = ["-p", start, "-p", other] if shape == "two parents" else ["-p", other]
+                sha = subprocess.run(["git", "-c", "user.email=w@w", "-c", "user.name=w", "commit-tree", tree,
+                                      *parents, "-m", "x"], cwd=wt, capture_output=True, text=True, check=True).stdout.strip()
+                self._as_worker(wt, "reset", "-q", "--hard", sha)
+                ok, info = self.o.commit_and_merge(job, plan, plan["tasks"][2], {"wt": str(wt), "branch": br})
+                self.assertFalse(ok, info)
+                self.assertTrue((theirs / "theirs.go").exists())
+                self.assertEqual(self.o.git(integ, "rev-parse", "HEAD"), other)
+
+    def test_a_forged_head_never_moves_the_users_branch(self):
+        job, plan, integ, start, wt, br = self._web_worker()
+        mine = self.o.git(self.repo, "rev-parse", "HEAD")
+        name = self.o.git(self.repo, "symbolic-ref", "HEAD")
+        (Path(self.o.git(wt, "rev-parse", "--absolute-git-dir")) / "HEAD").write_text(f"ref: {name}\n")
+        ok, info = self.o.commit_and_merge(job, plan, plan["tasks"][2], {"wt": str(wt), "branch": br})
+        self.assertFalse(ok, info)
+        self.assertEqual(self.o.git(self.repo, "rev-parse", "HEAD"), mine)
+
+    def test_the_harness_never_runs_a_planted_user_site(self):
+        home = self.tmp / "evil-home"
+        ran = self.tmp / "pth-ran"
+        usite = subprocess.run([sys.executable, "-c", "import site; print(site.getusersitepackages())"],
+                               env={**os.environ, "HOME": str(home)}, capture_output=True, text=True).stdout.strip()
+        Path(usite).mkdir(parents=True)
+        (Path(usite) / "evil.pth").write_text(f"import pathlib; pathlib.Path({str(ran)!r}).touch()\n")
+        env = {**os.environ, "HOME": str(home)}
+        ours = self.o.guard_hook_config()["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        root = SCRIPTS.parents[2]
+        plugin = json.loads((root / "hooks" / "hooks.json").read_text())["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        for cmd in (ours, plugin):
+            subprocess.run(["sh", "-c", cmd], input="{}", env={**env, "CLAUDE_PLUGIN_ROOT": str(root)},
+                           capture_output=True, text=True)
+            self.assertFalse(ran.exists(), cmd)
+        subprocess.run([*self.o.PY, str(ORCH), "--help"], env=env, capture_output=True, text=True)
+        self.assertFalse(ran.exists(), "harness-started Python")
+
+    def test_a_jailed_call_has_its_login_refreshed_outside(self):
+        import jail
+        if jail.available():
+            self.skipTest(jail.available())
+        fake, seen = self.tmp / "auth-claude", self.tmp / "auth-calls"
+        fake.write_text("#!/usr/bin/env python3\nimport sys, json\n"
+                        "if sys.argv[1:3] == ['auth', 'status']:\n"
+                        f"    open({str(seen)!r}, 'a').write('x')\n"
+                        "    sys.exit(0)\n"
+                        "print(json.dumps({'result': 'ok', 'is_error': False}))\n")
+        fake.chmod(0o755)
+        old = os.environ["ROUTER_CLAUDE_BIN"]
+        os.environ["ROUTER_CLAUDE_BIN"] = str(fake)
+        try:
+            r = self.o.claude_cli.call("hi", "opus", "medium", self.repo, perm="dontAsk", tools=[], confine=self.state)
+        finally:
+            os.environ["ROUTER_CLAUDE_BIN"] = old
+        self.assertFalse(r.get("is_error"), str(r)[:300])
+        self.assertTrue(seen.exists(), "a jailed CLI can't save a refreshed login, so the harness refreshes it")
+
     def test_the_scope_check_sees_what_the_worker_committed(self):
         job, plan, integ, start, wt, br = self._web_worker()
         (wt / "apps/api/share").mkdir(parents=True, exist_ok=True)
@@ -1068,7 +1142,8 @@ class OrchestrateTest(unittest.TestCase):
         target = job.dir / "job.json"
         before = target.read_text()
         fake = self.tmp / "evil-claude"
-        fake.write_text("#!/usr/bin/env python3\nimport json\n"
+        fake.write_text("#!/usr/bin/env python3\nimport json, sys\n"
+                        "if 'auth' in sys.argv:\n    sys.exit()  # the login refresh: the real CLI, outside the jail\n"
                         f"try:\n    open({str(target)!r}, 'w').write('pwn')\nexcept OSError:\n    pass\n"
                         "print(json.dumps({'result': 'ok', 'is_error': False}))\n")
         fake.chmod(0o755)
@@ -3912,7 +3987,7 @@ class OrchestrateTest(unittest.TestCase):
         child = subprocess.Popen(["sleep", "30"])
         real = self.o.subprocess.Popen
         self.o.subprocess.Popen = lambda argv, *a, **k: (
-            child if isinstance(argv, list) and len(argv) > 1 and str(argv[1]).endswith("orchestrate.py")
+            child if isinstance(argv, list) and any(str(x).endswith("orchestrate.py") for x in argv[1:4])
             else real(argv, *a, **k))
         try:
             import io

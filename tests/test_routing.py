@@ -76,7 +76,8 @@ class RoutingTest(unittest.TestCase):
         self.cfg = self.tmp / "cfg.json"
         self.calls = self.tmp / "calls.jsonl"
         self.env = {**os.environ, "ORCHESTRATE_DIR": str(self.state), "ROUTER_CLAUDE_BIN": str(fake),
-                    "FAKE_CFG": str(self.cfg), "FAKE_CALLS": str(self.calls), "ROUTER_PROBE_RATE": "0"}
+                    "FAKE_CFG": str(self.cfg), "FAKE_CALLS": str(self.calls), "ROUTER_PROBE_RATE": "0",
+                    "ORCHESTRATE_SANDBOX_WRITE": str(self.tmp)}  # the fake CLI keeps its records here
         os.environ.update({k: self.env[k] for k in ("ORCHESTRATE_DIR", "ROUTER_PROBE_RATE")})
         import router
         self.router = importlib.reload(router)

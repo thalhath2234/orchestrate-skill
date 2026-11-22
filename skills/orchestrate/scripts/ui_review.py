@@ -482,7 +482,7 @@ class Chrome:
             launcher = ("import os,sys\nr,w=int(sys.argv[1]),int(sys.argv[2])\nos.dup2(r,3)\nos.dup2(w,4)\n"
                         "os.close(r)\nos.close(w)\nos.execv(sys.argv[3],sys.argv[3:])")
             try:
-                self.proc = subprocess.Popen([sys.executable, "-c", launcher, str(child[0]), str(child[1]),
+                self.proc = subprocess.Popen([sys.executable, "-I", "-c", launcher, str(child[0]), str(child[1]),
                                               self.binary, *args], stdout=self._log, stderr=subprocess.STDOUT,
                                              stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=child)
             except OSError as e:
