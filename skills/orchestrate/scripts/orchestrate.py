@@ -1797,9 +1797,9 @@ def verify_and_review(job: Job, plan: dict, rnd_no: int) -> tuple[dict, list[dic
 def reviewed_rounds(job: Job) -> int:
     """Review rounds that produced a verdict. A round that failed closed (no reviewer verdict, a UI
     review that could not run) doesn't use up plan.review_rounds: after the fix and a resume,
-    the job still gets its fix rounds."""
+    the job still gets its fix rounds. Nor does one an edit superseded before anything acted on it."""
     return sum(1 for r in job.state["review"]["rounds"]
-               if r.get("verdict") and not r["verdict"].get("reviewer_error"))
+               if r.get("verdict") and not r["verdict"].get("reviewer_error") and not r.get("superseded"))
 
 
 def fix_round_context(plan: dict) -> str:
@@ -4409,6 +4409,10 @@ def _review_round(job: Job, plan: dict) -> int | str:
         rnd_no, verdict, blocking = kept["round"], kept["verdict"], kept["blocking"]
         log(f"round {rnd_no} was reviewed but not decided on; going on from its verdict")
     else:
+        if kept:  # the plan or the code was edited since, so nothing will act on that verdict
+            for r in job.state["review"]["rounds"]:
+                if r.get("round") == kept["round"]:
+                    r["superseded"] = True
         rnd_no = len(job.state["review"]["rounds"]) + 1
         log(f"all tasks merged; final verify + review (round {rnd_no})")
         verdict, blocking = verify_and_review(job, plan, rnd_no)

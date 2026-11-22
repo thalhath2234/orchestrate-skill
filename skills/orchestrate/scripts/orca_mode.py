@@ -253,13 +253,29 @@ def start(job: O.Job, plan: dict, approve: list[str], max_parallel: int | None,
             code = O.prepare_job(job, plan, approve, max_parallel, skip_baseline, answer)
             if code is not None:
                 return code
-            while orca_state(job).get("undelivered"):  # reports a usage limit cut short
-                deliver(job, job.plan, orca_state(job)["undelivered"][0])
-                orca_state(job)["undelivered"].pop(0)
-                job.save()
+            deliver_kept(job)
             return pump(job, plan)
         except O.UsageLimit as e:
             return O.usage_limit_stop(job, plan, e)
+
+
+def deliver_kept(job: O.Job) -> None:
+    """Reports a usage limit cut short. Every step that takes a report delivers them: Orca won't
+    send them again, and `waiting on workers` would wait for them forever."""
+    while orca_state(job).get("undelivered"):
+        event = orca_state(job)["undelivered"][0]
+        try:
+            deliver(job, job.plan, event)
+        except O.UsageLimit:
+            raise
+        except Exception as e:  # noqa: BLE001  (its worktree is gone: every resume would raise again)
+            tid = orca_state(job)["dispatches"].get(event["dispatch"])
+            job.state["tasks"][tid].update(status="failed", result="error",
+                                           error=f"its report could not be checked: {e}")
+            O.log(f"FAIL  {tid}: its report could not be checked: {e}")
+            queue_event(job, task_failed_event(job, job.plan, tid))
+        orca_state(job)["undelivered"].pop(0)
+        job.save()
 
 
 def deliver(job: O.Job, plan: dict, event: dict) -> None:
@@ -312,6 +328,7 @@ def worker_done(job: O.Job, plan: dict, payload: dict) -> int:
                             f"{tid} ran. Job stopped. Inspect them before resuming.")
         try:
             check(job, plan, tid, payload)
+            deliver_kept(job)
             return pump(job, plan)
         except O.UsageLimit as e:
             return limit_stop(job, plan, {"dispatch": did, "payload": payload}, e)
@@ -328,6 +345,7 @@ def worker_lost(job: O.Job, plan: dict, did: str, reason: str) -> int:
             return pump(job, plan)
         try:
             lost(job, plan, tid, reason)
+            deliver_kept(job)
             return pump(job, plan)
         except O.UsageLimit as e:
             return limit_stop(job, plan, {"dispatch": did, "lost": reason}, e)
@@ -391,12 +409,17 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
                + (f"\n{out[-6000:]}" if out else "")
                + (f"\nreport summary: {report.get('summary')}" if report else ""))
     if not ok:
-        fail_attempt(job, plan, tid, out, report=report, step=step)
+        try:
+            fail_attempt(job, plan, tid, out, report=report, step=step)
+        except O.UsageLimit:  # nothing was judged: the replay records the attempt
+            st["steps"].remove(step)
+            raise
         return
     res = {"wt": str(wt), "branch": o["branch"], "report": report}
     try:
         merged, info = O.commit_and_merge(job, plan, task, res, remove_worktree=False)
     except O.UsageLimit:  # the integrator's: the merge was undone and the task still waits for this step
+        st["steps"].remove(step)
         raise
     except Exception as e:  # noqa: BLE001
         merged, info = False, f"commit/merge error: {e}"
