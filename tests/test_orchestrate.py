@@ -47,7 +47,8 @@ FAKE = textwrap.dedent(r'''
     cwd = pathlib.Path.cwd()
     limited = cfg.get("limited", [])  # prompt prefixes ("worker": a worker's) that hit the plan's usage limit
     known = ("ORCHESTRATE_", "FAILURE_CLASSIFIER")
-    if any(prompt.startswith(x) or (x == "worker" and not prompt.startswith(known)) for x in limited):
+    if cfg.get("limited_in", cwd.name) == cwd.name \
+            and any(prompt.startswith(x) or (x == "worker" and not prompt.startswith(known)) for x in limited):
         with open(calls, "a") as fh:
             fh.write(json.dumps({"kind": "limited", "model": model}) + "\n")
         print(json.dumps({"is_error": True, "subtype": "success", "session_id": "s-" + cwd.name, "num_turns": 1,
@@ -1759,6 +1760,211 @@ class OrchestrateTest(unittest.TestCase):
                                 "the failure went back to the worker")
                 self.assertTrue(refused.exists(), "the hook saw the change staged, and refused it")
                 self.assertEqual(self.o.git(self.repo, "fsck", "--no-dangling", "--no-progress"), "", "objects intact")
+
+    def test_a_stop_between_review_and_fix_never_costs_the_fix_round(self):
+        bad = {"verdict": "changes_requested", "summary": "bug",
+               "findings": [{"severity": "blocker", "confidence": "high", "issue": "owner never checked"}]}
+        good = {"verdict": "pass", "summary": "ok", "findings": []}
+        fix = {"packages/contract/src/share/types.ts": "export type S = { owner: string }\n"}
+        for limited in ("ORCHESTRATE_MANAGE", "worker"):
+            with self.subTest(limited):
+                self.tearDown()
+                self.setUp()
+                cfg = {"tasks": WRITES, "reviews": [bad, good], "fix": fix}
+                plan = str(self.write_plan(base_plan(self.repo)))
+                if limited == "worker":  # only the fix round's: the tasks are through by then
+                    cfg["limited_in"] = "_integration"
+                code, out, err = self.cli("run", plan, "--workers", "headless", cfg={**cfg, "limited": [limited]})
+                self.assertEqual((code, len(self.calls_of("review"))), (3, 1), err[-1500:])
+                code, out, err = self.cli("resume", "share", cfg={"tasks": WRITES, "reviews": [bad, good], "fix": fix})
+                self.assertEqual(code, 0, err[-1500:])
+                self.assertTrue(list(self.tmp.glob("calls.jsonl.fix_prompt*")), "the fix the first review asked for ran")
+                self.assertIn("owner", self.o.git(self.repo, "show",
+                              "orchestrate/share:packages/contract/src/share/types.ts"))
+                self.assertEqual(len(self.calls_of("review")), 2, "the review of the unfixed code isn't bought twice")
+                self.assertEqual(self.job_state()["review"].get("owed_fix"), None)
+
+    def test_a_limit_at_the_final_check_keeps_the_review(self):
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), "--workers", "headless",
+                                  cfg={"tasks": WRITES, "limited": ["ORCHESTRATE_ADVISE_FINAL"],
+                                       "cleanup_write": {"apps/api/share/handler.go": "package share // tidy\n"}})
+        self.assertEqual((code, len(self.calls_of("review"))), (3, 1), err[-1500:])
+        code, out, err = self.cli("resume", "share", cfg={"tasks": WRITES})
+        self.assertEqual(code, 0, err[-1500:])
+        self.assertEqual(len(self.calls_of("review")), 1)
+
+    def test_an_answer_waits_for_a_limited_manager(self):
+        plan = base_plan(self.repo)
+        self.cfg.write_text(json.dumps({"tasks": WRITES, "limited": ["ORCHESTRATE_MANAGE"]}))
+        job = self.o.start_job(plan, self.write_plan(plan))
+        job.state["human_question"] = "Which colour?"
+        with contextlib.redirect_stdout(open(os.devnull, "w")):
+            self.assertEqual(self.o.run_job(job, plan, [], None, True, "blue"), 3)
+        self.assertEqual([e["kind"] for e in job.state.get("pending_events", [])], ["human_answer"])
+        self.assertEqual(self.o.manager_state(job)["interventions"], 0, "a call never answered isn't an intervention")
+
+    def test_lessons_never_wait_for_a_reset(self):
+        got = []
+        real = self.o.claude_cli.call
+        self.o.claude_cli.call = lambda *a, **kw: (got.append(kw), {"structured": {"lessons": []}, "result": ""})[1]
+        self.addCleanup(setattr, self.o.claude_cli, "call", real)
+        self.o.claude("ORCHESTRATE_LESSONS x", "haiku", "medium", self.repo, perm="plan", tools=[], wait=False)
+        self.assertIs(got[0]["wait"], False)
+        import inspect
+        self.assertIn("wait=False", inspect.getsource(self.o.extract_lessons))
+
+    def test_an_interrupt_while_waiting_for_a_reset_is_recorded(self):
+        soon = time.gmtime(time.time() + 2 * 3600)
+        resets = "resets %d:%02d%s (UTC)" % ((soon.tm_hour % 12) or 12, soon.tm_min, "pm" if soon.tm_hour >= 12 else "am")
+        self.cfg.write_text(json.dumps({"tasks": WRITES, "limited": ["ORCHESTRATE_ADVISE_PLAN"], "limit_resets": resets}))
+        p = subprocess.Popen([sys.executable, str(ORCH), "run", str(self.write_plan(base_plan(self.repo))),
+                              "--workers", "headless"], env=self.env, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            end = time.time() + 30
+            while not self.calls_of("limited") and time.time() < end:
+                time.sleep(0.2)
+            self.assertTrue(self.calls_of("limited"))
+            time.sleep(1)
+            os.kill(p.pid, signal.SIGINT)
+            err = p.communicate(timeout=20)[1]
+        finally:
+            with contextlib.suppress(OSError):
+                os.killpg(p.pid, signal.SIGKILL)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(self.job_state()["status"], "interrupted")
+
+    def test_no_worker_starts_after_an_interrupt(self):
+        job, plan, integ, start, wt, br = self._web_worker()
+        self.o.claude_cli.stopping.set()
+        self.addCleanup(self.o.claude_cli.stopping.clear)
+        res = self.o.exec_task(job, plan, plan["tasks"][2], wt, br, 0, None)
+        self.assertEqual(res["result"], "interrupted")
+        self.assertFalse(self.calls_of("worker"))
+
+    def test_the_hook_check_cannot_touch_the_repos_refs(self):
+        hook = self.repo / ".git" / "hooks" / "pre-commit"
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text("#!/bin/sh\nset -e\ns=$(git -c user.email=h@h -c user.name=h stash create)\n"
+                        "git update-ref refs/heads/hook-made-this HEAD\n"
+                        'if [ -n "$s" ]; then git update-ref refs/stash "$s"; fi\n')
+        hook.chmod(0o755)
+        for sandbox in (None, False):
+            with self.subTest(confined=sandbox is None):
+                over = {"job": f"hook-{sandbox}".lower(), "commit_hook": True}
+                if sandbox is False:
+                    over["sandbox"] = False
+                code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo, **over))), "--workers",
+                                          "headless", cfg={"tasks": WRITES})
+                self.assertEqual(code, 0, err[-1500:])  # a hook that stashes works confined too
+                refs = self.o.git(self.repo, "for-each-ref", "--format=%(refname)")
+                self.assertNotIn("hook-made-this", refs)
+                self.assertNotIn("refs/stash", refs)
+
+    def test_the_hook_is_the_main_checkouts_even_where_a_worktree_has_none(self):
+        (self.repo / ".gitignore").write_text(".hk/\n")
+        self._commit(self.repo, "ignore hooks dir")
+        self.o.git(self.repo, "config", "core.hooksPath", ".hk")
+        (self.repo / ".hk").mkdir()
+        hook = self.repo / ".hk" / "pre-commit"
+        hook.write_text("#!/bin/sh\necho always refuses\nexit 1\n")
+        hook.chmod(0o755)
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo, commit_hook=True))), "--workers",
+                                  "headless", cfg={"tasks": WRITES})
+        self.assertEqual(self.job_state()["tasks"]["contract"]["status"], "failed", err[-1500:])
+
+    def test_commit_hook_without_a_hook_says_so(self):
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo, commit_hook=True))), "--workers",
+                                  "headless", cfg={"tasks": WRITES})
+        self.assertEqual(code, 3, err[-1500:])
+        self.assertIn("pre-commit", self.job_state()["message"])
+
+    def test_a_flaky_setup_on_the_merged_tree_is_tried_again(self):
+        mark = self.tmp / "setup-failed-once"
+        flaky = (f'if [ "$(basename "$PWD")" = _integration ] && [ -f apps/api/share/handler.go ] && [ ! -f {mark} ]; '
+                 f'then touch {mark}; exit 1; fi')
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo, baseline=["true"], setup=[flaky]))),
+                                  "--workers", "headless", cfg={"tasks": WRITES})
+        self.assertEqual(code, 0, err[-1500:])
+        self.assertTrue(mark.exists())
+
+    def test_setup_runs_on_a_resolved_conflict_before_its_verify(self):
+        job, wt, base = self._changed({"a.txt": "base\n", ".gitignore": ".installed\n"})
+        self._as_worker(wt, "checkout", "-q", "-b", "side2")
+        (wt / "a.txt").write_text("side\n")
+        self._as_worker(wt, "commit", "-qam", "side")
+        self._as_worker(wt, "checkout", "-q", job.state["branch"])
+        (wt / "a.txt").write_text("ours\n")
+        self._as_worker(wt, "commit", "-qam", "ours")
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "merge", "side2"], cwd=wt, capture_output=True)
+
+        def integrator(*a, **kw):
+            (wt / "a.txt").write_text("ours\nside\n")
+            return {"structured": {"resolved": True}, "result": "", "metrics": {}}
+        real, self.o.claude = self.o.claude, integrator
+        self.addCleanup(setattr, self.o, "claude", real)
+        (job.dir / "logs").mkdir()
+        plan = {**base_plan(self.repo), "setup": ["touch .installed"]}
+        task = {**plan["tasks"][0], "verify": ["test -f .installed"]}
+        job.state["tasks"][task["id"]] = {"status": "running"}
+        ok, why = self.o.resolve_conflicts(job, plan, task, ["-c", "user.email=t@t", "-c", "user.name=t"])
+        self.assertTrue(ok, why)
+
+    def test_budgets_hold_across_an_integrator_a_manager_and_a_wait(self):
+        job = type("J", (), {})()
+        job.state, job.held = {"cost_usd": 1.0}, {"web": 6.0}
+        self.assertAlmostEqual(self.o.budget_left(job, {"budget_usd": 10}), 3.0)
+        job.held = {"web": 9.0}
+        self.assertAlmostEqual(self.o.budget_left(job, {"budget_usd": 10}), self.o.MANAGER_BUDGET,
+                               msg="a call the main thread can't put off still gets to run")
+        given = []
+
+        def fake(*a, **kw):
+            given.append(kw["budget_usd"])
+            return {"structured": None, "session_id": "s", "total_cost_usd": 0.4, "result": ""}
+        real, self.o.claude = self.o.claude, fake
+        self.addCleanup(setattr, self.o, "claude", real)
+        self.o.manager_call({"model": "opus", "effort": "medium"}, self.repo, "p", "full", None, 1.0, self.tmp)
+        self.assertEqual([round(x, 2) for x in given], [1.0, 0.6])
+
+        C = self.o.claude_cli
+        replies = [{"error_kind": "usage_limit", "result": "limit", "total_cost_usd": 0.5},
+                   {"error_kind": None, "result": "ok", "total_cost_usd": 0.1}]
+        budgets, saved = [], (C._call, C.reset_wait, C.pause)
+        C._call = lambda *a, **kw: (budgets.append(kw["budget_usd"]), replies.pop(0))[1]
+        C.reset_wait, C.pause = (lambda *a: 60.0), (lambda s: True)
+        self.addCleanup(lambda: (setattr(C, "_call", saved[0]), setattr(C, "reset_wait", saved[1]), setattr(C, "pause", saved[2])))
+        C.call("x", "opus", "medium", self.repo, perm="dontAsk", tools=[], budget_usd=2.0)
+        self.assertEqual(budgets, [2.0, 1.5])
+
+    def test_a_cli_that_reports_per_call_is_not_undercounted(self):
+        C = self.o.claude_cli
+        turn = lambda cost, out, total_out: {"session_id": "per-call", "total_cost_usd": cost,
+                                              "usage": {"output_tokens": out},
+                                              "modelUsage": {"m": {"outputTokens": total_out}}}
+        first = turn(0.10, 100, 100)
+        C._cost_of_this_call(first, None)
+        second = turn(0.30, 300, 300)  # usage and modelUsage agree: this call's own figures
+        C._cost_of_this_call(second, "per-call")
+        self.assertAlmostEqual(second["total_cost_usd"], 0.30)
+        third = turn(0.50, 200, 500)
+        C._cost_of_this_call(third, "per-call")
+        self.assertAlmostEqual(third["total_cost_usd"], 0.20)
+
+    def test_an_integrators_usage_limit_fails_no_task(self):
+        job, plan, integ, start, wt, br = self._web_worker()
+        theirs = integ / "apps/web/src/share"
+        theirs.mkdir(parents=True, exist_ok=True)
+        (theirs / "Button.tsx").write_text("export const B = 2\n")
+        self._as_worker(integ, "add", "-A")
+        self._as_worker(integ, "commit", "-qm", "theirs")
+        self.cfg.write_text(json.dumps({"limited": ["ORCHESTRATE_MERGE"]}))
+        with self.assertRaises(self.o.UsageLimit):
+            self.o.commit_and_merge(job, plan, plan["tasks"][2], {"wt": str(wt), "branch": br})
+        import inspect
+        import orca_mode
+        self.assertIn("except O.UsageLimit", inspect.getsource(orca_mode.check))
+        self.assertIn("task_checks", inspect.getsource(orca_mode.check))
 
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate

@@ -353,13 +353,15 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
     if not ok:
         fail_attempt(job, plan, tid, out, report=report, step=step)
         return
-    router.record(task_id=f"{job.id}/{tid}", task_type=task["type"], tier=task["tier"], rung=o["rung"],
-                  ok=True, cause=None, model_id=models.MODEL_IDS[model], probe=o.get("probe", False))
     res = {"wt": str(wt), "branch": o["branch"], "report": report}
     try:
         merged, info = O.commit_and_merge(job, plan, task, res, remove_worktree=False)
+    except O.UsageLimit:  # the integrator's: the merge was undone and the task still waits for this step
+        raise
     except Exception as e:  # noqa: BLE001
         merged, info = False, f"commit/merge error: {e}"
+    router.record(task_id=f"{job.id}/{tid}", task_type=task["type"], tier=task["tier"], rung=o["rung"],
+                  ok=True, cause=None, model_id=models.MODEL_IDS[model], probe=o.get("probe", False))
     st.update(ended=time.time(), result="ok" if merged else "merge_failed")
     O.task_log(job, tid, ("merged into the integration branch" if merged else f"merge FAILED: {info}"))
     if not merged:

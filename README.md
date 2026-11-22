@@ -218,7 +218,7 @@ Validation rejects plans where tasks that can run at the same time own overlappi
 - **Reviews fail closed.** Every acceptance criterion needs its own entry with evidence (a `file:line` or a test; "none" and "verified" don't count), and a change to code needs edge cases checked with evidence. `.gitattributes` can't turn code into an unseen "binary" diff, and binary data in a code file blocks (obfuscated but printable code is left to the reviewer's judgement). A blocker the reviewer is unsure of is questioned once when it would decide the verdict; if still unsure it is reported and doesn't block. A reviewer that returns no verdict (after one re-ask) ends the job as `review_failed`, never `done`, and so does a configured UI review that can't run.
 - **A conflict resolution must pass verify.** The integrator's resolution is committed only if the merging task's verify and that of every finished task owning a conflicted file still pass; otherwise the merge is aborted and the task fails with the output.
 - **Nothing skipped reads as passed.** `report.md` lists every check that didn't run or that you overrode: a baseline skipped with `--skip-baseline`, an advisor check you overrode, gated tasks you approved.
-- **The budget holds per call.** Each call gets `--max-budget-usd`; tasks and reviewers that start together split what is left, so their limits don't add up past `budget_usd`. A single response can still overshoot its limit. There is no budget unless you set one.
+- **The budget holds per call.** Each call gets `--max-budget-usd`; tasks and reviewers that start together split what is left. It can still be passed a little: a single response can overshoot its limit, and a merge-conflict or manager call beside running tasks may always take up to $1. There is no budget unless you set one.
 - **Risky tasks wait for you.** Gated tasks (for example migrations) pause the job until you approve them.
 - **A job starts from your last commit and only writes to `orchestrate/<job>` branches.**
 - **You stay in charge of routing.** Routing changes and AGENTS.md notes are proposals that you approve.
@@ -269,7 +269,7 @@ The ladder is `haiku/low → haiku/medium → sonnet/medium → sonnet/high → 
 
 Below a model's default effort, any failure first restores the effort.
 
-API overloads and rate limits are retried with backoff and never count against a model. A plan usage limit that resets within 6 hours (`ORCHESTRATE_LIMIT_WAIT_H`) is waited out and the same session continues; a longer one stops the job for you to resume. And and a test about rate limits is code, not a broken environment.
+API overloads and rate limits are retried with backoff and never count against a model. A plan usage limit that resets within 6 hours (`ORCHESTRATE_LIMIT_WAIT_H`) is waited out and the same session continues; a longer one stops the job for you to resume. A test about rate limits is code, not a broken environment.
 
 Floor raises need repeated evidence (≥2 failed tasks and more than half failing, within 30 days). They expire when the window ends or a new model version ships. About 10% of tasks probe one rung cheaper, so floors can come back down. After each job, a cheap extractor turns what the agents learned into proposed AGENTS.md notes, and `router.py status` shows the cost per completed task including the coordination it caused. All of it is proposals you approve. State lives in `~/.local/share/orchestrate` (or `$ORCHESTRATE_DIR`).
 

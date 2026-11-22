@@ -97,9 +97,9 @@ When `scan` returns a `ui_suggestion` and the job changes the UI, add a `ui` blo
   "max_parallel": 4,                          // optional cap (machine cap still applies)
   "mem_per_agent_gb": 2.5,                    // optional, heavier verify -> bigger
   "budget_usd": 15,                           // optional cap; tasks started together split what is left
-  // "commit_hook": true,                     // optional: the repo's pre-commit hook as a check on every task
-                                              //   (changes staged in a scratch index). Offer it when the repo
-                                              //   has one; hooks that stash or need refs fail in the sandbox
+  // "commit_hook": true,                     // optional: the main checkout's pre-commit hook as a check on
+                                              //   every task (run in a scratch git dir). Offer it when the repo
+                                              //   has one; a hook that writes outside the worktree fails there
   "review_rounds": 2,                         // review -> fix -> review (default 2)
   "manager": {"enabled": true, "max_interventions": 12, "max_task_retries": 2},  // optional; defaults
   "models": {"reviewer": "opus/high"},        // optional per-role override, "<model>/<effort>". Roles and

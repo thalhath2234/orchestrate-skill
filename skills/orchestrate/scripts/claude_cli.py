@@ -102,7 +102,11 @@ def _cost_of_this_call(data: dict, resume: str | None) -> None:
     if not isinstance(sid, str) or not re.fullmatch(r"[\w-]{1,100}", sid) or not isinstance(total, (int, float)):
         return
     seen = router.DIR / "sessions" / sid
-    if resume == sid:
+    used = data.get("modelUsage") or {}
+    out = (data.get("usage") or {}).get("output_tokens")
+    # a CLI that reports per call: its per-model totals are this call's usage, not the session's
+    per_call = bool(out) and bool(used) and sum(u.get("outputTokens") or 0 for u in used.values()) <= out
+    if resume == sid and not per_call:
         with contextlib.suppress(OSError, ValueError):
             before = float(seen.read_text())
             if total >= before:  # less would be a CLI that reports per call
@@ -258,7 +262,7 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
          resume: str | None = None, timeout: int = 3600, settings: dict | None = None,
          schema: dict | None = None, budget_usd: float | None = None,
          extra_args: list[str] | None = None, retries: int | None = None,
-         only: list[str] | None = None, confine: Path | None = None) -> dict:
+         only: list[str] | None = None, confine: Path | None = None, wait: bool = True) -> dict:
     """One model call. A plan usage limit that resets within ORCHESTRATE_LIMIT_WAIT_H hours is
     waited out here, for every role, and the session continued; a longer one is `usage_limit`."""
     try:
@@ -267,17 +271,19 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
         left = LIMIT_WAIT_H * 3600
     kw = dict(perm=perm, tools=tools, timeout=timeout, settings=settings, schema=schema, budget_usd=budget_usd,
               extra_args=extra_args, retries=retries, only=only, confine=confine)
+    if not wait:
+        left = 0.0
     paid = 0.0
     while True:
         data = _call(prompt, model, effort, cwd, resume=resume, **kw)
         if data.get("error_kind") == "usage_limit":
-            wait = reset_wait(str(data.get("result")))
-            if wait is not None and wait + 60 <= left:
-                wait += 60  # past the minute it names
-                print(f"[claude] usage limit: {str(data.get('result'))[:160]}; waiting {wait / 60:.0f} min "
+            secs = reset_wait(str(data.get("result")))
+            if secs is not None and secs + 60 <= left:
+                secs += 60  # past the minute it names
+                print(f"[claude] usage limit: {str(data.get('result'))[:160]}; waiting {secs / 60:.0f} min "
                       "for the reset", file=sys.stderr, flush=True)
-                left -= wait
-                if pause(wait):
+                left -= secs
+                if pause(secs):
                     spent = data.get("total_cost_usd") or 0.0
                     paid += spent
                     if kw["budget_usd"] is not None:

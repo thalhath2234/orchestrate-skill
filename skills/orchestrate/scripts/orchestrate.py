@@ -296,11 +296,11 @@ def claude(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools:
            resume: str | None = None, timeout: int = 3600, settings: dict | None = None,
            schema: dict | None = None, budget_usd: float | None = None,
            extra_args: list[str] | None = None, only: list[str] | None = None,
-           confine: Path | None = None) -> dict:
+           confine: Path | None = None, wait: bool = True) -> dict:
     extra = list(extra_args or []) + models.fallback_args(model)  # no Fable access -> Opus
     res = claude_cli.call(prompt, model, effort, cwd, perm=perm, tools=tools, resume=resume,
                           timeout=timeout, settings=settings, schema=schema,
-                          budget_usd=budget_usd, extra_args=extra, only=only, confine=confine)
+                          budget_usd=budget_usd, extra_args=extra, only=only, confine=confine, wait=wait)
     if res.get("error_kind") == "usage_limit":  # no role can answer, so none is judged by it
         raise UsageLimit(str(res.get("result"))[:300])
     return res
@@ -331,18 +331,23 @@ def record_call(job, role: str, res: dict, task: str | None = None, cfg: str = "
 
 def budget_left(job, plan: dict) -> float | None:
     b = plan.get("budget_usd")
-    return None if b is None else max(float(b) - job.state.get("cost_usd", 0), 0.0)
+    if b is None:
+        return None
+    left = max(float(b) - job.state.get("cost_usd", 0), 0.0)
+    held = sum((getattr(job, "held", None) or {}).values())
+    # beside running tasks (the integrator, say): what they don't hold, but always enough for one call
+    return max(left - held, min(left, MANAGER_BUDGET)) if held else left
 
 
 BUDGET_MIN = 0.05  # less free than this: wait for a running call to give back what it didn't spend
-MANAGER_BUDGET = 1.0  # held back for a manager call while tasks run beside it (one costs $0.10-0.40)
+MANAGER_BUDGET = 1.0  # what one call beside running tasks may take (one costs $0.10-0.40)
 
 
 def budget_free(job, plan: dict, held: dict) -> float | None:
     """What no running call holds. Calls that run side by side split this: each one's
     --max-budget-usd counts its own process alone, so whole remainders would add up past the cap."""
-    left = budget_left(job, plan)
-    return None if left is None else max(left - sum(held.values()), 0.0)
+    b = plan.get("budget_usd")
+    return None if b is None else max(float(b) - job.state.get("cost_usd", 0) - sum(held.values()), 0.0)
 
 
 # ================================================================ capacity ===
@@ -1387,7 +1392,11 @@ def setup_integration(job: Job, plan: dict, integ: Path, confine: Path | None) -
         return set(git_paths(integ, "diff", "--name-only", "--no-renames"))
 
     before = unstaged()
-    ok, err = run_setup(plan["setup"], integ, job.dir / "logs" / "_integration.log", confine)
+    logf = job.dir / "logs" / "_integration.log"
+    ok, err = run_setup(plan["setup"], integ, logf, confine)
+    if not ok and has_worker_code(job, integ):  # on merged code a failure is judged as the code's: rule out a flaky install
+        log("setup failed on the merged tree; trying once more")
+        ok, err = run_setup(plan["setup"], integ, logf, confine)
     edited = sorted(unstaged() - before)
     if edited:
         git(integ, "--literal-pathspecs", "checkout", "--", *edited)
@@ -1410,25 +1419,37 @@ def prepare_worktree(job: Job, tid: str, start_sha: str) -> tuple[Path, str]:
 
 
 # The repo's pre-commit hook as a check, where the worker's other checks run (the harness's own git
-# never runs hooks: a branch can write them). It sees the task's changes staged in a scratch index
-# and object dir, so it works where the repo's objects are read-only and touches neither.
+# never runs hooks: a branch can write them). It is the main checkout's hook: a worktree may have none
+# (husky's dir is ignored) and a worker could delete its copy. It runs in a scratch git dir that holds
+# copies of refs and config and reads the repo's objects, with the task's changes staged there, so a
+# hook that stashes or moves refs works where the repo is read-only, and reaches none of the repo's.
 HOOK_CHECK = (
-    '(c=$(git rev-parse --path-format=absolute --git-common-dir) && '
-    'h=$(git rev-parse --git-path hooks)/pre-commit && if [ -x "$h" ]; then '
-    't=$(mktemp -d) && trap \'rm -rf "$t"\' EXIT && mkdir "$t/objects" && '
-    'export GIT_INDEX_FILE="$t/index" GIT_OBJECT_DIRECTORY="$t/objects" '
-    'GIT_ALTERNATE_OBJECT_DIRECTORIES="$c/objects" && git read-tree HEAD && git add -A && "$h"; fi)')
+    '(h=%s; [ -x "$h" ] || { echo "commit_hook: no executable pre-commit hook at $h"; exit 1; }; '
+    'c=$(git rev-parse --path-format=absolute --git-common-dir) && sha=$(git rev-parse HEAD) && '
+    'br=$(git symbolic-ref -q HEAD || true) && '
+    't=$(mktemp -d) && trap \'rm -rf "$t"\' EXIT && mkdir -p "$t/g/objects/info" && '
+    'cp -R "$c/refs" "$t/g/refs" && { [ ! -f "$c/packed-refs" ] || cp "$c/packed-refs" "$t/g/"; } && '
+    'cp "$c/config" "$t/g/config" && echo "$c/objects" > "$t/g/objects/info/alternates" && '
+    'if [ -n "$br" ]; then echo "ref: $br"; else echo "$sha"; fi > "$t/g/HEAD" && export GIT_DIR="$t/g" GIT_WORK_TREE="$PWD" && '
+    'git config core.bare false && git read-tree HEAD && git add -A && "$h")')
+
+
+def commit_hook_path(repo: Path) -> Path | None:
+    # plain git, reading config only: jail.GIT would answer /dev/null
+    p = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=repo, capture_output=True, text=True)
+    return (repo / p.stdout.strip() / "pre-commit").absolute() if p.returncode == 0 and p.stdout.strip() else None
 
 
 def task_checks(plan: dict, task: dict) -> list[str]:
-    return [*task["verify"], *([HOOK_CHECK] if plan.get("commit_hook") else [])]
+    if not plan.get("commit_hook"):
+        return list(task["verify"])
+    hook = commit_hook_path(Path(plan["repo"]))
+    return [*task["verify"], HOOK_CHECK % shlex.quote(str(hook or "pre-commit"))]
 
 
 def has_commit_hook(repo: Path) -> bool:
-    # plain git, reading config only: jail.GIT would answer /dev/null
-    p = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=repo, capture_output=True, text=True)
-    hook = repo / p.stdout.strip() / "pre-commit"
-    return p.returncode == 0 and hook.is_file() and os.access(hook, os.X_OK)
+    hook = commit_hook_path(repo)
+    return bool(hook) and hook.is_file() and os.access(hook, os.X_OK)
 
 
 def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, budget: float | None) -> dict:
@@ -1439,6 +1460,8 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
     # on the user's own base commit setup is their code; with merged work in it, it is workers' code
     ok, err = run_setup(plan.get("setup", []), wt, logf,
                         confinement(plan) if has_worker_code(job, wt) else None)
+    if claude_cli.stopping.is_set():
+        return {"ok": False, "result": "interrupted", "wt": str(wt), "branch": br}
     if not ok:
         return {"ok": False, "result": "environment", "error": err, "wt": str(wt), "branch": br}
     upstream = {d: job.state["tasks"].get(d, {}) for d in task.get("depends_on", [])}
@@ -1502,6 +1525,8 @@ def run_child(cmd: list[str], cwd: Path, text: str, stderr, env: dict | None = N
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, encoding="utf-8",
                          errors="replace", start_new_session=True)
     _children.add(p)
+    if claude_cli.stopping.is_set():  # interrupted while this one was being started
+        stop_child(p)
     try:
         out, _ = p.communicate(text)
         return p.returncode, out
@@ -1820,7 +1845,6 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
                                        "metrics": x.get("metrics")}, None, x.get("config", ""))
     job.state["review"]["rounds"][-1]["fix"] = {"result": s.get("result"), "steps": s.get("steps")}
     if s.get("result") == "usage_limit":
-        job.state["review"]["owed_fix"] = {"round": rnd_no, "findings": blocking}
         job.save()
         raise UsageLimit(str(s.get("usage_limit") or ""))
     stray = scope_violations(integ, union)
@@ -3384,6 +3408,9 @@ def final_gate(job: Job, plan: dict, rnd_no: int, review_v: dict | None) -> tupl
     Returns (blocking findings, error). An advisor with no usable answer is an error (fail closed)."""
     cleanup_pass(job, plan)
     integ = Path(job.state["integration_wt"])
+    if job.state["review"].get("undecided"):  # the harness's own commit: the verdict still stands
+        job.state["review"]["undecided"]["head"] = git(integ, "rev-parse", "HEAD")
+        job.save()
     rnd = job.state["review"]["rounds"][-1]
     if "advisor:final" in job.state.get("approved", []):
         log("advisor final check overridden by the user (--approve advisor:final)")
@@ -3519,15 +3546,19 @@ def manager_call(cfg: dict, integ: Path, prompt: str, full: str, session: str | 
               extra_args=["--add-dir", str(job_dir)])
     res = claude(prompt, cfg["model"], cfg["effort"], integ, resume=session, budget_usd=budget, **kw)
     out = [res]
+
+    def left() -> float | None:  # one share for up to three calls
+        return None if budget is None else max(budget - sum(r.get("total_cost_usd") or 0 for r in out), 0.0)
+
     if res.get("is_error") and session and res.get("error_kind") not in ("budget",):
-        res = claude(full, cfg["model"], cfg["effort"], integ, budget_usd=budget, **kw)  # lost session
+        res = claude(full, cfg["model"], cfg["effort"], integ, budget_usd=left(), **kw)  # lost session
         out.append(res)
     d = res.get("structured")
     if not (isinstance(d, dict) and isinstance(d.get("actions"), list)) and res.get("error_kind") != "budget":
         res = claude("ORCHESTRATE_MANAGE\nEVENT: invalid_reply\nYour reply was not a valid decision. "
                      "Reply with ONLY the JSON object described in \"Manager output\".",
                      cfg["model"], cfg["effort"], integ,
-                     resume=res.get("session_id") or session, budget_usd=budget, **kw)
+                     resume=res.get("session_id") or session, budget_usd=left(), **kw)
         out.append(res)
     return out
 
@@ -3565,8 +3596,12 @@ def ask_manager(job: Job, plan: dict, event: dict) -> dict:
                              f"Latest event: {event.get('kind')} {event.get('task', '')}. How should we proceed?"}]}
     m["interventions"] += 1
     prompt, full = manager_prompt(job, plan, event)
-    results = manager_call(cfg, Path(job.state["integration_wt"]), prompt, full, m["session"],
-                           budget_left(job, plan), job.dir)
+    try:
+        results = manager_call(cfg, Path(job.state["integration_wt"]), prompt, full, m["session"],
+                               budget_left(job, plan), job.dir)
+    except UsageLimit:
+        m["interventions"] -= 1
+        raise
     return manager_finish(job, plan, results, event)
 
 
@@ -3934,6 +3969,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     budget = plan.get("budget_usd")
     running: dict[cf.Future, str] = {}
     held: dict[str, float] = {}  # running call -> the budget it was given
+    job.held = held
     free_slots = list(range(cap))
     pool = cf.ThreadPoolExecutor(max_workers=cap)
     mgr_pool = cf.ThreadPoolExecutor(max_workers=1)
@@ -4173,6 +4209,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
         mgr_pool.shutdown(wait=True, cancel_futures=True)
+        job.held = {}
 
     if queue:
         job.state["pending_events"] = queue  # handled after the user answers / resumes
@@ -4257,6 +4294,10 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
         return finish(job, plan, "environment",
                       f'plan.sandbox is true, but {why}. Install bubblewrap (or drop "sandbox"), then '
                       f"`orchestrate.py resume {job.id}`.")
+    if plan.get("commit_hook") and not has_commit_hook(repo):
+        return finish(job, plan, "environment",
+                      "plan.commit_hook is true, but the repo has no executable pre-commit hook. Install it (or "
+                      f'drop "commit_hook"), then `orchestrate.py resume {job.id}`.')
     job.state["commit_hook_skipped"] = not plan.get("commit_hook") and has_commit_hook(repo)
     if job.state["commit_hook_skipped"]:
         log('note: the repo\'s pre-commit hook will not run (set "commit_hook": true to run it as a check on each task)')
@@ -4297,7 +4338,12 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
                           f"Answer with: orchestrate.py resume {job.id} --answer \"...\"")
         q = job.state.pop("human_question")
         record_answer(job, plan, q, answer)
-        r = manage(job, plan, {"kind": "human_answer", "question": q, "answer": answer})
+        event = {"kind": "human_answer", "question": q, "answer": answer}
+        try:
+            r = manage(job, plan, event)
+        except (UsageLimit, KeyboardInterrupt):
+            job.state.setdefault("pending_events", []).insert(0, event)
+            raise
         if r.get("hint") == "ask_human":
             job.state["human_question"] = r.get("question")
             return finish(job, plan, "awaiting_human", f"the manager needs your input: {r.get('question')}")
@@ -4316,10 +4362,28 @@ def review_round(job: Job, plan: dict) -> int | str:
     """One review round once every task has merged: final verify, reviewer, cleanup and the
     advisor's final check, then the manager on what blocks. Returns an exit code, or "more_tasks"
     when the manager queued fix tasks, or "fix_round" when nobody did and a fix is still owed."""
+    r = _review_round(job, plan)
+    # only a decision clears it: an exception (a usage limit, Ctrl-C) or a kill leaves it for resume
+    if job.state["review"].pop("undecided", None) is not None:
+        job.save()
+    return r
+
+
+def _review_round(job: Job, plan: dict) -> int | str:
     rounds = int(plan.get("review_rounds", 2))
-    rnd_no = len(job.state["review"]["rounds"]) + 1
-    log(f"all tasks merged; final verify + review (round {rnd_no})")
-    verdict, blocking = verify_and_review(job, plan, rnd_no)
+    integ = Path(job.state["integration_wt"])
+    kept = job.state["review"].get("undecided")
+    if kept and kept["head"] == git(integ, "rev-parse", "HEAD"):
+        rnd_no, verdict, blocking = kept["round"], kept["verdict"], kept["blocking"]
+        log(f"round {rnd_no} was reviewed but not decided on; going on from its verdict")
+    else:
+        rnd_no = len(job.state["review"]["rounds"]) + 1
+        log(f"all tasks merged; final verify + review (round {rnd_no})")
+        verdict, blocking = verify_and_review(job, plan, rnd_no)
+        if not verdict.get("reviewer_error"):
+            job.state["review"]["undecided"] = {"round": rnd_no, "head": git(integ, "rev-parse", "HEAD"),
+                                                "verdict": verdict, "blocking": blocking}
+            job.save()
     if verdict.get("reviewer_error"):
         what = verdict.get("not_reviewed")
         return finish(job, plan, "review_failed",
@@ -4386,6 +4450,11 @@ def run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
         return _run_job(job, plan, approve, max_parallel, skip_baseline, answer)
     except UsageLimit as e:
         return usage_limit_stop(job, plan, e)
+    except KeyboardInterrupt:  # anywhere outside the scheduler, e.g. waiting for a reset
+        claude_cli.stopping.set()
+        for child in list(_children):
+            stop_child(child)
+        return finish(job, plan, "interrupted", "interrupted by user")
 
 
 def _run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
@@ -4405,8 +4474,11 @@ def _run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
         if isinstance(r, int):
             return r
         if r == "fix_round":
-            owed = job.state["review"].pop("owed_fix")
-            if not legacy_fix_round(job, plan, owed["round"], owed["findings"]):
+            owed = job.state["review"]["owed_fix"]
+            fixed = legacy_fix_round(job, plan, owed["round"], owed["findings"])
+            job.state["review"].pop("owed_fix", None)  # only once it ran: until then a resume owes it
+            job.save()
+            if not fixed:
                 # the same code again would only get a fresh reviewer's second opinion on it
                 return finish(job, plan, "review_failed",
                               f"the fix subagent changed nothing, so round {owed['round']}'s findings still "
@@ -4490,7 +4562,7 @@ Return {{"lessons": []}} if nothing qualifies.
 
 {fence('job notes', fit_json(material, 16000), 18000)}"""
     res = claude(prompt, cfg["model"], cfg["effort"], repo, perm="plan", tools=[], only=[],
-                 schema=schemas.LESSONS, budget_usd=None, timeout=600)
+                 schema=schemas.LESSONS, budget_usd=None, timeout=600, wait=False)  # best-effort
     record_call(job, "lessons", res, None, f"{cfg['model']}/{cfg['effort']}")
     lessons = (res.get("structured") or {}).get("lessons") or []
     area = plan.get("area", "cross") if router.AREA_RE.match(plan.get("area", "cross")) else "cross"
