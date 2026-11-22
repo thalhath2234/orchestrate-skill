@@ -18,6 +18,7 @@ import argparse
 import collections
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import random
@@ -30,11 +31,30 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import models  # noqa: E402
 
+HERE = Path(__file__).resolve().parent
+# The code a long-running process (the dashboard) depends on: an update to any of these, or a new
+# install path (a versioned plugin cache), means a running one serves stale code and commands.
+CODE_FILES = ("dashboard.py", "orchestrate.py", "router.py", "models.py", "schemas.py", "claude_cli.py",
+              "ui_review.py", "orca_mode.py")
+
+
+def code_fingerprint() -> str:
+    """A short hash of CODE_FILES and the directory they are in."""
+    h = hashlib.sha256(str(HERE).encode())
+    for name in CODE_FILES:
+        try:
+            h.update(name.encode() + b"\0" + (HERE / name).read_bytes())
+        except OSError:
+            h.update(name.encode() + b"\0-")
+    return h.hexdigest()[:16]
+
+
 DIR = Path(os.environ.get("ORCHESTRATE_DIR")
            or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "orchestrate")
 ROUTING = DIR / "routing.json"
 LEDGER = DIR / "ledger.jsonl"
 TASK_COSTS = DIR / "task_costs.jsonl"  # per orchestrate task: subagent + coordination cost
+ADVICE = DIR / "advice.jsonl"  # per finished job: what the advisor's high re-check found and cost
 PROPOSALS = DIR / "proposals.json"
 ALIASES = DIR / "aliases.json"
 LOCK = DIR / ".lock"
@@ -286,10 +306,42 @@ def record_task_total(*, job: str, task_id: str, task_type: str, tier: str, stat
             fh.write(json.dumps(entry) + "\n")
 
 
+def _latest(rows: list[dict], *keys: str) -> list[dict]:
+    """The last row per key: a job records again each time it ends (a resumed job ends twice),
+    and only how it ended last counts. Rows without a job id are all kept."""
+    out: dict = {}
+    for i, r in enumerate(rows):
+        k = tuple(r.get(x) for x in keys) if r.get("job") is not None else ("#", i)
+        out.pop(k, None)
+        out[k] = r
+    return list(out.values())
+
+
 def _task_costs() -> list[dict]:
     if not TASK_COSTS.exists():
         return []
-    return [json.loads(line) for line in TASK_COSTS.read_text().splitlines() if line.strip()]
+    rows = []
+    for line in TASK_COSTS.read_text().splitlines():
+        with contextlib.suppress(ValueError):
+            e = json.loads(line)
+            if isinstance(e, dict):
+                rows.append(e)
+    return _latest(rows, "job", "task_id")
+
+
+def _advice() -> list[dict]:
+    """Rows of advice.jsonl; a line that isn't a JSON object is skipped."""
+    if not ADVICE.exists():
+        return []
+    rows = []
+    for line in ADVICE.read_text().splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict):
+            rows.append(e)
+    return _latest(rows, "job")
 
 
 def _check_raise(task_type: str, rung: int, model_id: str | None) -> list[dict]:
@@ -371,6 +423,29 @@ def _find(pid: str) -> tuple[list[dict], dict]:
     raise SystemExit(f"no proposal {pid}")
 
 
+NOTES_HEADING = "## Agent notes (learned)"
+
+
+def _add_note(text: str, note: str) -> str:
+    """Add `- note` as the last line of the learned-notes section: before the next # or ## heading,
+    or at EOF. Every other byte stays as it was. A file without the section gets it at the end."""
+    nl = "\r\n" if "\r\n" in text else "\n"
+    h = re.search(r"^" + re.escape(NOTES_HEADING) + r"[ \t]*\r?$", text, re.M)
+    if not h:
+        return text.rstrip() + f"{nl}{nl}{NOTES_HEADING}{nl}- {note}{nl}"
+    end, fence = len(text), None
+    for m in re.finditer(r"^(```|~~~|#{1,2} )[^\n]*$", text[h.end():], re.M):
+        tok = m.group(1)
+        if tok in ("```", "~~~"):  # a `# comment` inside a code block is not a heading
+            fence = None if fence == tok else (fence or tok)
+        elif fence is None:
+            end = h.end() + m.start()
+            break
+    body = text[:end].rstrip("\r\n")
+    gap = text[len(body):end] or nl
+    return body + f"{nl}- {note}" + gap + text[end:]
+
+
 def approve(pid: str) -> dict:
     with locked():
         props, p = _find(pid)
@@ -391,11 +466,12 @@ def approve(pid: str) -> dict:
                          "reason": p["reason"], "proposal": pid}
         elif kind == "agents_md":
             path = Path(pay["file"]).expanduser()
-            text = path.read_text() if path.exists() else ""
-            heading = "## Agent notes (learned)"
-            if heading not in text:
-                text = text.rstrip() + f"\n\n{heading}\n"
-            path.write_text(text.rstrip() + f"\n- {pay['text']}\n")
+            text = ""
+            if path.exists():
+                with open(path, newline="") as fh:  # CRLF stays CRLF
+                    text = fh.read()
+            with open(path, "w", newline="") as fh:
+                fh.write(_add_note(text, pay["text"]))
         elif kind == "needs_human":
             pass  # acknowledgement only
         _write(ROUTING, rules)
@@ -442,6 +518,13 @@ def _status() -> None:
         print("\nCost per completed orchestrate task (type, final config): n, subagent + coordination")
         for (tt, lab), (n, tc, cc) in sorted(per.items()):
             print(f"  {tt:22} {lab:14} {n}  ${tc / n:.2f} + ${cc / n:.2f} = ${(tc + cc) / n:.2f}")
+    adv = _advice()
+    if adv:
+        num = lambda e, k: e.get(k) if isinstance(e.get(k), (int, float)) else 0  # noqa: E731
+        print(f"\nAdvisor high re-check: found blocking issues in {sum(num(e, 'found') for e in adv)} of "
+              f"{sum(num(e, 'escalated') for e in adv)} re-checks over {len(adv)} job(s), "
+              f"${sum(num(e, 'escalation_cost_usd') for e in adv):.2f} total "
+              f"(information only; few jobs make it noisy)")
     print(f"\nPending proposals: {len(pending())}   (state: {DIR})")
 
 

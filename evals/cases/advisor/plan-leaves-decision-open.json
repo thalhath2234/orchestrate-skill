@@ -1,0 +1,25 @@
+{
+ "id": "plan-leaves-decision-open",
+ "core": false,
+ "pair": "plan-sound",
+ "stage": "plan",
+ "from": "advisor/plan-sound",
+ "about": "plan-sound plus one acceptance criterion that leaves a product choice open: link creation is 'rate limited', with no number, window or scope. A worker would have to invent the limit, and the reviewer couldn't check it. The advisor should ask for the choice to be settled (C5, 'Open choices').",
+ "plan_patch": {
+  "acceptance": [
+   "POST /schedules/:id/share by the owner returns 201 with a ShareLink whose token is 64 hex characters and whose url is WEB_ORIGIN/share/<token> (api test)",
+   "POST /schedules/:id/share returns 401 for an anonymous caller, 403 for a signed-in non-owner and 404 for an unknown schedule, and creates no link in each case (api tests)",
+   "GET /share/:token with no credentials returns 200 and schedules.PublicView of the schedule (no owner id); an unknown token returns 404 (api tests)",
+   "Only GET is routed for /share/:token: POST to it returns 405 (api test through the real router)",
+   "On SchedulePage the owner sees a Share button that calls POST /schedules/:id/share and copies the returned url; anyone else sees no button; an API failure shows an error message (web tests)",
+   "The web route /share/:token fetches GET /share/:token and renders the schedule read-only, and shows 'This link doesn't exist' on 404 (web tests)",
+   "Creating share links is rate limited, and a caller over the limit gets 429 (api test)"
+  ]
+ },
+ "expect": {
+  "verdict": "revise",
+  "finding_mentions": [
+   "limit"
+  ]
+ }
+}

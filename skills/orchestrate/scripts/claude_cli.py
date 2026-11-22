@@ -14,6 +14,19 @@
   its structured output is dropped even if it parses (Sonnet 5.5 prompting guide: "treat any
   response whose stop_reason is max_tokens as failed, even if its text holds valid JSON").
 
+* The advisor tool is off unless the call passes `--advisor`: a user's `advisorModel` setting would
+  otherwise give every role a second paid model. CLAUDE_CODE_DISABLE_ADVISOR_TOOL is the switch
+  (an empty `advisorModel` in --settings doesn't work), set per child because it also disables
+  `--advisor`.
+* `only` is the complete tool set of a call (`--tools`, and no MCP servers). `tools` is
+  `--allowedTools`, which only pre-approves: without `only` every other tool is still offered, and
+  the user's own allow rules apply to it.
+
+* ORCHESTRATE_HERMETIC=1 runs the call without the user's MCP servers and hooks
+  (`--strict-mcp-config` with an empty `--mcp-config`, `disableAllHooks` merged into `--settings`).
+  The evals set it so a pass rate does not depend on whose machine runs them. CLAUDE.md and other
+  setting sources still load: the user's rules can be part of their definition of done.
+
 error_kind: None | timeout | budget | max_turns | overloaded | rate_limit | api | exec | unparseable
             | refusal | cut_off
 """
@@ -28,6 +41,10 @@ from pathlib import Path
 
 OVERLOAD_RE = re.compile(r"overloaded_error|\b529\b|Overloaded", re.I)
 RATE_RE = re.compile(r"rate_limit_error|\b429\b|rate limit", re.I)
+
+
+NO_ADVISOR = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL"
+READ_ONLY = ["Read", "Grep", "Glob"]
 
 
 def claude_bin() -> str:
@@ -83,14 +100,44 @@ def _kind(data: dict) -> str | None:
     return "exec"
 
 
+def _parse(stdout: str):
+    """The CLI's JSON reply: all of stdout, else its last line. Lines split on LF only: Node writes
+    U+2028/U+2029 raw inside strings, and str.splitlines() would cut the JSON there."""
+    try:
+        d = json.loads(stdout)
+    except json.JSONDecodeError:
+        d = json.loads(stdout.strip().split("\n")[-1])
+    if not isinstance(d, dict):
+        raise ValueError(f"the reply is JSON but not an object: {type(d).__name__}")
+    return d
+
+
+def child_env(extra_args: list[str] | None = None) -> dict:
+    """The environment for one claude child: no advisor tool unless this call asked for one."""
+    env = dict(os.environ)
+    if "--advisor" in (extra_args or []):
+        env.pop(NO_ADVISOR, None)
+    else:
+        env[NO_ADVISOR] = "1"
+    return env
+
+
 def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: list[str],
          resume: str | None = None, timeout: int = 3600, settings: dict | None = None,
          schema: dict | None = None, budget_usd: float | None = None,
-         extra_args: list[str] | None = None, retries: int | None = None) -> dict:
+         extra_args: list[str] | None = None, retries: int | None = None,
+         only: list[str] | None = None) -> dict:
     cmd = [claude_bin(), "-p", prompt, "--model", model, "--effort", effort,
            "--output-format", "json", "--permission-mode", perm]
+    hermetic = os.environ.get("ORCHESTRATE_HERMETIC") == "1"
+    if hermetic:
+        settings = {**(settings or {}), "disableAllHooks": True}
     if settings:
         cmd += ["--settings", json.dumps(settings)]
+    if only is not None:
+        cmd += ["--tools", ",".join(only)]  # "" is no built-in tools; --json-schema still works
+    if hermetic or only is not None:  # --tools doesn't cover MCP tools
+        cmd += ["--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": {}})]
     if tools:
         cmd += ["--allowedTools", *tools]
     if resume:
@@ -100,6 +147,7 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
     if budget_usd is not None:
         cmd += ["--max-budget-usd", f"{max(budget_usd, 0.01):.2f}"]
     cmd += extra_args or []
+    env = child_env(extra_args)
     tries = int(os.environ.get("ORCHESTRATE_API_RETRIES", "3")) if retries is None else retries
     backoff = float(os.environ.get("ORCHESTRATE_API_BACKOFF_S", "20"))
     data: dict = {}
@@ -108,14 +156,14 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
     for attempt in range(max(tries, 0) + 1):
         t0 = time.time()
         try:
-            p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+            p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return {"is_error": True, "error_kind": "timeout", "timeout": True,
                     "result": f"claude timed out after {timeout}s", "structured": None,
                     "metrics": {"wall_s": round(time.time() - t0, 1)}}
         try:
-            data = json.loads(p.stdout.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError):
+            data = _parse(p.stdout)
+        except (ValueError, IndexError):
             data = {"is_error": True, "result": (p.stdout + p.stderr)[-2000:], "subtype": "unparseable"}
             kind = ("overloaded" if OVERLOAD_RE.search(data["result"]) else
                     "rate_limit" if RATE_RE.search(data["result"]) else "unparseable")

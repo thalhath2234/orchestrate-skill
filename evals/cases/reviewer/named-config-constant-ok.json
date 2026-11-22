@@ -1,0 +1,99 @@
+{
+ "id": "named-config-constant-ok",
+ "core": false,
+ "pair": "hardcoded-instead-of-lookup",
+ "about": "Twin of hardcoded-instead-of-lookup: the same clean diff, where the only fixed value is the documented LinkTTL constant that a decision names. A named, documented constant the plan allows is not a shortcut, so the reviewer must pass it (C9 false-positive check).",
+ "base_files": {
+  "Makefile": "lint:\n\tgolangci-lint run ./apps/api/... && pnpm --filter web lint\ntest:\n\tcd apps/api && go test ./...\n\tpnpm --filter web test\n",
+  "packages/contract/src/share.ts": "export type ShareLink = { token: string; scheduleId: string; expiresAt: string }\n",
+  "apps/api/internal/http/routes.go": "package http\n\nimport \"example.com/api/internal/schedules\"\n\nfunc Register(r Router) {\n\tschedules.Register(r)\n}\n",
+  "apps/api/internal/schedules/handler.go": "package schedules\n\nfunc Register(r Router) {\n\tr.GET(\"/schedules/:id\", Get)\n}\n",
+  "apps/web/src/share/.keep": ""
+ },
+ "head_files": {
+  "apps/api/internal/share/handler.go": "package share\n\nimport (\n\t\"crypto/rand\"\n\t\"encoding/hex\"\n\t\"net/http\"\n\t\"time\"\n)\n\n// LinkTTL is how long a share link stays valid.\nconst LinkTTL = 7 * 24 * time.Hour\n\n// Register mounts the share endpoints.\nfunc Register(r Router) {\n\tr.POST(\"/schedules/:id/share\", Create)\n\tr.GET(\"/share/:token\", Get)\n}\n\n// Link is the JSON form of contract.ShareLink (packages/contract/src/share.ts).\ntype Link struct {\n\tToken      string `json:\"token\"`\n\tScheduleID string `json:\"scheduleId\"`\n\tExpiresAt  string `json:\"expiresAt\"`\n}\n\n// Create makes an opaque token for a schedule the caller owns.\nfunc Create(c Ctx) error {\n\ts, err := c.Schedules().Get(c.Param(\"id\"))\n\tif err != nil {\n\t\treturn c.NoContent(http.StatusNotFound)\n\t}\n\tif s.OwnerID != c.UserID() {\n\t\treturn c.NoContent(http.StatusForbidden)\n\t}\n\ttok, err := newToken()\n\tif err != nil {\n\t\treturn c.NoContent(http.StatusInternalServerError)\n\t}\n\texp := c.Now().Add(LinkTTL)\n\tif err := c.Links().Save(tok, s.ID, exp); err != nil {\n\t\treturn c.NoContent(http.StatusInternalServerError)\n\t}\n\treturn c.JSON(http.StatusCreated, Link{Token: tok, ScheduleID: s.ID, ExpiresAt: exp.UTC().Format(time.RFC3339)})\n}\n\n// Get returns the schedule read-only; unknown or expired tokens are 404.\nfunc Get(c Ctx) error {\n\tl, ok := c.Links().Find(c.Param(\"token\"))\n\tif !ok || !c.Now().Before(l.ExpiresAt) {\n\t\treturn c.NoContent(http.StatusNotFound)\n\t}\n\treturn c.JSON(http.StatusOK, c.Schedules().ReadOnly(l.ScheduleID))\n}\n\n// newToken returns 16 random bytes from crypto/rand, hex-encoded: opaque, not a JWT (ADR 0007).\nfunc newToken() (string, error) {\n\tb := make([]byte, 16)\n\tif _, err := rand.Read(b); err != nil {\n\t\treturn \"\", err\n\t}\n\treturn hex.EncodeToString(b), nil\n}\n",
+  "apps/api/internal/share/handler_test.go": "package share\n\nimport (\n\t\"errors\"\n\t\"net/http\"\n\t\"testing\"\n\t\"time\"\n)\n\nvar now = time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)\n\ntype fakeSchedules map[string]Schedule\n\nfunc (f fakeSchedules) Get(id string) (Schedule, error) {\n\tif s, ok := f[id]; ok {\n\t\treturn s, nil\n\t}\n\treturn Schedule{}, errors.New(\"not found\")\n}\nfunc (f fakeSchedules) ReadOnly(id string) any { return map[string]string{\"id\": id, \"mode\": \"read-only\"} }\n\ntype fakeLinks map[string]StoredLink\n\nfunc (f fakeLinks) Save(tok, id string, exp time.Time) error { f[tok] = StoredLink{id, exp}; return nil }\nfunc (f fakeLinks) Find(tok string) (StoredLink, bool)      { l, ok := f[tok]; return l, ok }\n\ntype fakeCtx struct {\n\tparams map[string]string\n\tuser   string\n\tlinks  fakeLinks\n\tstatus int\n\tbody   any\n}\n\nfunc (c *fakeCtx) Param(n string) string        { return c.params[n] }\nfunc (c *fakeCtx) UserID() string               { return c.user }\nfunc (c *fakeCtx) Now() time.Time               { return now }\nfunc (c *fakeCtx) Schedules() Schedules         { return fakeSchedules{\"s1\": {ID: \"s1\", OwnerID: \"owner\"}} }\nfunc (c *fakeCtx) Links() Links                 { return c.links }\nfunc (c *fakeCtx) JSON(code int, v any) error   { c.status, c.body = code, v; return nil }\nfunc (c *fakeCtx) NoContent(code int) error     { c.status = code; return nil }\n\nfunc call(h func(Ctx) error, user string, params map[string]string, links fakeLinks) *fakeCtx {\n\tc := &fakeCtx{params: params, user: user, links: links}\n\tif err := h(c); err != nil {\n\t\tpanic(err)\n\t}\n\treturn c\n}\n\nfunc TestCreateReturnsLinkMatchingContract(t *testing.T) {\n\tlinks := fakeLinks{}\n\tc := call(Create, \"owner\", map[string]string{\"id\": \"s1\"}, links)\n\tl, _ := c.body.(Link)\n\tif c.status != http.StatusCreated || len(l.Token) != 32 || l.ScheduleID != \"s1\" ||\n\t\tl.ExpiresAt != now.Add(LinkTTL).Format(time.RFC3339) {\n\t\tt.Fatalf(\"got %d %+v\", c.status, c.body)\n\t}\n\tif _, ok := links[l.Token]; !ok {\n\t\tt.Fatal(\"link not saved\")\n\t}\n}\n\nfunc TestCreateRejectsNonOwner(t *testing.T) {\n\tlinks := fakeLinks{}\n\tif c := call(Create, \"stranger\", map[string]string{\"id\": \"s1\"}, links); c.status != http.StatusForbidden || len(links) != 0 {\n\t\tt.Fatalf(\"got %d, %d links\", c.status, len(links))\n\t}\n}\n\nfunc TestCreateUnknownScheduleIs404(t *testing.T) {\n\tif c := call(Create, \"owner\", map[string]string{\"id\": \"nope\"}, fakeLinks{}); c.status != http.StatusNotFound {\n\t\tt.Fatalf(\"got %d\", c.status)\n\t}\n}\n\nfunc TestGetReturnsReadOnlySchedule(t *testing.T) {\n\tlinks := fakeLinks{\"t1\": {ScheduleID: \"s1\", ExpiresAt: now.Add(time.Hour)}}\n\tc := call(Get, \"\", map[string]string{\"token\": \"t1\"}, links)\n\tif body, _ := c.body.(map[string]string); c.status != http.StatusOK || body[\"mode\"] != \"read-only\" {\n\t\tt.Fatalf(\"got %d %+v\", c.status, c.body)\n\t}\n}\n\nfunc TestGetUnknownTokenIs404(t *testing.T) {\n\tif c := call(Get, \"\", map[string]string{\"token\": \"nope\"}, fakeLinks{}); c.status != http.StatusNotFound {\n\t\tt.Fatalf(\"got %d\", c.status)\n\t}\n}\n\nfunc TestGetExpiredTokenIs404(t *testing.T) {\n\tlinks := fakeLinks{\"t1\": {ScheduleID: \"s1\", ExpiresAt: now}}\n\tif c := call(Get, \"\", map[string]string{\"token\": \"t1\"}, links); c.status != http.StatusNotFound {\n\t\tt.Fatalf(\"got %d\", c.status)\n\t}\n}\n",
+  "apps/api/internal/http/routes.go": "package http\n\nimport (\n\t\"example.com/api/internal/schedules\"\n\t\"example.com/api/internal/share\"\n)\n\nfunc Register(r Router) {\n\tschedules.Register(r)\n\tshare.Register(r)\n}\n",
+  "apps/web/src/share/Button.tsx": "import { useState } from 'react'\nimport type { ShareLink } from '@app/contract'\n\n/** Copies a schedule's public share link, and says so when the copy fails. */\nexport function ShareButton({ link }: { link: ShareLink }) {\n  const [error, setError] = useState<string | null>(null)\n  const url = `${location.origin}/share/${link.token}`\n\n  async function copy() {\n    setError(null)\n    try {\n      await navigator.clipboard.writeText(url)\n    } catch {\n      setError(`Couldn't copy the link. Copy it manually: ${url}`)\n    }\n  }\n\n  return (\n    <>\n      <button onClick={copy}>Copy link (valid until {link.expiresAt})</button>\n      {error && <p role=\"alert\">{error}</p>}\n    </>\n  )\n}\n",
+  "apps/web/src/share/Button.test.tsx": "import { render, screen } from '@testing-library/react'\nimport userEvent from '@testing-library/user-event'\nimport { expect, test, vi } from 'vitest'\nimport { ShareButton } from './Button'\n\nconst link = { token: 't1', scheduleId: 's1', expiresAt: '2026-12-01T00:00:00Z' }\n\ntest('copies the share link', async () => {\n  const writeText = vi.fn().mockResolvedValue(undefined)\n  Object.assign(navigator, { clipboard: { writeText } })\n  render(<ShareButton link={link} />)\n  await userEvent.click(screen.getByRole('button'))\n  expect(writeText).toHaveBeenCalledWith(expect.stringContaining('/share/t1'))\n  expect(screen.queryByRole('alert')).toBeNull()\n})\n\ntest('shows an error when copying fails', async () => {\n  Object.assign(navigator, { clipboard: { writeText: vi.fn().mockRejectedValue(new Error('denied')) } })\n  render(<ShareButton link={link} />)\n  await userEvent.click(screen.getByRole('button'))\n  expect(await screen.findByRole('alert')).toHaveTextContent(\"Couldn't copy the link\")\n})\n",
+  "apps/api/internal/share/types.go": "package share\n\nimport \"time\"\n\n// Router is the subset of the HTTP router this package uses.\ntype Router interface {\n\tPOST(path string, h func(Ctx) error)\n\tGET(path string, h func(Ctx) error)\n}\n\n// Ctx is what a handler receives for one request.\ntype Ctx interface {\n\tParam(name string) string\n\tUserID() string\n\tNow() time.Time\n\tSchedules() Schedules\n\tLinks() Links\n\tJSON(code int, v any) error\n\tNoContent(code int) error\n}\n\n// Schedule is the part of a schedule the share handlers need.\ntype Schedule struct{ ID, OwnerID string }\n\n// Schedules reads schedules.\ntype Schedules interface {\n\tGet(id string) (Schedule, error)\n\tReadOnly(id string) any\n}\n\n// StoredLink is a saved share link.\ntype StoredLink struct {\n\tScheduleID string\n\tExpiresAt  time.Time\n}\n\n// Links stores share links by token.\ntype Links interface {\n\tSave(token, scheduleID string, expiresAt time.Time) error\n\tFind(token string) (StoredLink, bool)\n}\n"
+ },
+ "plan": {
+  "goal": "Users can share a schedule via a public read-only link",
+  "definition_of_done": "Users can share a schedule via a public read-only link: done when every acceptance criterion holds, each shown by a test or file:line",
+  "acceptance": [
+   "POST /schedules/:id/share returns a token (test)",
+   "GET /share/:token returns the schedule read-only; unknown tokens are 404 (test)",
+   "Only the owner can create links (test)",
+   "The web share button copies the link (test)"
+  ],
+  "decisions": [
+   "Tokens are opaque random strings, not JWTs (docs/adr/0007-share-tokens.md)",
+   "Links are valid for 7 days: a documented constant, share.LinkTTL, not a setting in this job"
+  ],
+  "non_goals": [
+   "No expiry UI in this job (no picker or editing of expiry)"
+  ],
+  "verify": [
+   "make lint",
+   "make test"
+  ],
+  "tasks": [
+   {
+    "id": "api",
+    "title": "Share endpoints",
+    "goal": "create/get endpoints",
+    "type": "feature:api",
+    "tier": "T2",
+    "owns": [
+     "apps/api/internal/share/**",
+     "apps/api/internal/http/routes.go"
+    ],
+    "done": [
+     "POST /schedules/:id/share returns 201 and an opaque token (handler_test.go)",
+     "A non-owner gets 403 and an unknown schedule 404 (handler_test.go)",
+     "GET /share/:token returns the schedule read-only; unknown or expired tokens return 404 (handler_test.go)"
+    ],
+    "verify": [
+     "make test"
+    ]
+   },
+   {
+    "id": "web",
+    "title": "Share button",
+    "goal": "copy-link button",
+    "type": "feature:web",
+    "tier": "T1",
+    "owns": [
+     "apps/web/src/share/**"
+    ],
+    "done": [
+     "ShareButton copies the share link to the clipboard (test)",
+     "ShareButton shows an error message when copying fails (test)"
+    ],
+    "verify": [
+     "make test"
+    ]
+   }
+  ]
+ },
+ "reports": {
+  "api": {
+   "summary": "Added POST /schedules/:id/share (owner only, 201 with a ShareLink-shaped body) and GET /share/:token (404 for unknown/expired); six handler tests; registered routes.",
+   "interfaces": "share.Register(r)"
+  },
+  "web": {
+   "summary": "Added ShareButton that copies the link and shows an error when copying fails; two tests.",
+   "interfaces": "ShareButton({link})"
+  }
+ },
+ "expect": {
+  "verdict": "pass",
+  "no_finding_mentions": [
+   "hardcod",
+   "hard-cod",
+   "linkttl"
+  ]
+ },
+ "verify_output": "$ make lint\nok\n$ make test\ncd apps/api && go test ./...\nok  \texample.com/api/internal/share\t0.012s\npnpm --filter web test\n ✓ src/share/Button.test.tsx (2 tests)\n Test Files  1 passed (1)\n      Tests  2 passed (2)\n"
+}

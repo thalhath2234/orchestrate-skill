@@ -20,6 +20,29 @@ BAR_ITEM = {
     "properties": {"scope": {"type": "string"}, "criterion": {"type": "string"}, "why": {"type": "string"}},
 }
 
+# A page the UI review screenshots: an app path, an optional slug name and optional flow steps,
+# each one of {"click": css}, {"type": [css, text]}, {"press": key}, {"wait_for": css},
+# {"wait_ms": n}, {"screenshot": name}. ui_review.validate_ui checks the details.
+UI_PAGE = {
+    "type": "object", "required": ["path"],
+    "properties": {"path": {"type": "string"}, "name": {"type": "string"},
+                   "steps": {"type": "array", "items": {"type": "object"}}},
+}
+
+# plan.ui: how to serve the app for the UI review (see ui_review.py).
+UI = {
+    "type": "object",
+    "required": ["dev", "url"],
+    "properties": {
+        "dev": {"type": "string"},                       # command that serves the app (integration worktree)
+        "url": {"type": "string"},                       # its base URL, e.g. http://127.0.0.1:5173
+        "ready_timeout_s": {"type": "number"},
+        "paths": _STRS,                                  # repo globs: review only when the diff touches one
+        "viewports": {"type": "array", "items": {"type": "string", "enum": ["desktop", "mobile"]}},
+        "pages": {"type": "array", "items": UI_PAGE},   # pages for the whole job
+    },
+}
+
 TASK = {
     "type": "object",
     "required": ["id", "title", "goal", "type", "tier", "owns", "done", "verify"],
@@ -36,6 +59,8 @@ TASK = {
         "done": {**_STRS, "minItems": 1},
         "verify": {**_STRS, "minItems": 1},
         "gate": {"type": "string"},
+        # pages the UI review screenshots for this task (needs plan.ui); a split keeps them
+        "ui": {"type": "array", "items": UI_PAGE},
     },
 }
 
@@ -89,15 +114,17 @@ FINDING = {
 
 # One edge case the reviewer checked. Every reviewer enumerates the edge cases of what changed
 # (empty, null, boundaries, errors, concurrency, auth...) and says how each is handled; one marked
-# unhandled without a matching finding becomes a finding in code, at the severity the
-# reviewer gave it (major when it gave none).
+# unhandled without a matching finding becomes a finding in code, at the severity (major when it
+# gave none) and confidence the reviewer gave it: like any finding, only `low` doesn't block.
 EDGE_CASE = {
     "type": "object",
     "required": ["case", "evidence", "handled"],
     "properties": {"case": {"type": "string"}, "file": {"type": "string"},
                    "evidence": {"type": "string"}, "handled": {"type": "boolean"},
                    # for an unhandled case: how much it matters (default major)
-                   "severity": {"type": "string", "enum": ["blocker", "major", "minor"]}},
+                   "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+                   # for an unhandled case: how sure the reviewer is (missing blocks, like high)
+                   "confidence": {"type": "string", "enum": ["high", "medium", "low"]}},
 }
 
 REVIEW = {
@@ -111,6 +138,34 @@ REVIEW = {
         "edge_cases": {"type": "array", "items": EDGE_CASE},
         "findings": {"type": "array", "items": FINDING},
         "raise_bar": {"type": "array", "items": BAR_ITEM},
+        "summary": {"type": "string"},
+        "verdict": {"type": "string", "enum": ["pass", "changes_requested"]},
+    },
+}
+
+# The UI reviewer's judgment of the job's screenshots (plan.ui). One `pages` entry per shot id,
+# observations before ok (evidence first). Its findings join the round's review as "[UI] ...".
+UI_REVIEW = {
+    "type": "object",
+    "required": ["pages", "findings", "summary", "verdict"],
+    "properties": {
+        "pages": {"type": "array", "items": {
+            "type": "object", "required": ["shot", "observations", "ok"],
+            "properties": {"shot": {"type": "string"}, "observations": {"type": "string"},
+                           "ok": {"type": "boolean"}}}},
+        "findings": {"type": "array", "items": FINDING},
+        # browser evidence the reviewer says is expected (a 404 page on purpose, a step whose
+        # selector is stale): only an entry here waives the harness's own finding for it
+        "expected": {"type": "array", "items": {
+            "type": "object", "required": ["shot", "kind", "why"],
+            "properties": {"shot": {"type": "string"},
+                           "kind": {"type": "string", "enum": ["http_4xx", "step_error", "page_error"]},
+                           "why": {"type": "string"}}}},
+        # one answer per earlier UI finding listed in the prompt: still there or fixed
+        "earlier": {"type": "array", "items": {
+            "type": "object", "required": ["id", "fixed", "observations"],
+            "properties": {"id": {"type": "string"}, "observations": {"type": "string"},
+                           "fixed": {"type": "boolean"}}}},
         "summary": {"type": "string"},
         "verdict": {"type": "string", "enum": ["pass", "changes_requested"]},
     },
@@ -216,11 +271,16 @@ PLAN = {
         "goal": {"type": "string"},
         "definition_of_done": {"type": "string"},
         "acceptance": {**_STRS, "minItems": 1}, "non_goals": _STRS, "decisions": _STRS,
+        # choices the planner subagent made that the user hasn't confirmed (it can't ask): each
+        # names the choice and the alternative. validate warns until the user moves them into
+        # decisions; no subagent, reviewer or manager prompt ever sees them.
+        "assumptions": {**_STRS, "maxItems": 5},
         "quality_bar": _STRS,
         "setup": _STRS, "verify": {**_STRS, "minItems": 1}, "baseline": _STRS,
         "max_parallel": {"type": "integer"}, "mem_per_agent_gb": {"type": "number"},
         "budget_usd": {"type": "number"}, "review_rounds": {"type": "integer"},
         "area": {"type": "string"},
+        "ui": UI,
         "tasks": {"type": "array", "items": TASK, "minItems": 1},
     },
 }

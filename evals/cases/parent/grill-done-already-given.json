@@ -1,0 +1,41 @@
+{
+ "id": "grill-done-already-given",
+ "core": false,
+ "pair": "grill-asks-done-first",
+ "about": "The request already says what done means. The reply works with the user's own words (quoted, not rewritten) and still plans nothing.",
+ "files": {
+  "Makefile": "test:\n\tcd api && go test ./...\n\tcd web && npm test\n",
+  "AGENTS.md": "# rules\nGo API in api/, React app in web/. `make test` runs everything.\n",
+  "api/schedules/handler.go": "package schedules\n\n// Register mounts the schedule endpoints.\nfunc Register(r Router) {\n\tr.GET(\"/schedules/:id\", Get)\n}\n",
+  "api/schedules/handler_test.go": "package schedules\n\nimport \"testing\"\n\nfunc TestGetReturnsSchedule(t *testing.T) {}\n",
+  "web/src/Schedule.tsx": "export function Schedule({ items }: { items: string[] }) {\n  return <ul>{items.map(i => <li key={i}>{i}</li>)}</ul>\n}\n"
+ },
+ "stub": {
+  "scan": {
+   "exit": 0,
+   "stdout": "{\"areas\": [\"api\", \"web\"], \"verify\": [\"make test\"], \"hotspots\": [], \"setup\": [], \"ui_suggestion\": null}"
+  }
+ },
+ "turns": [
+  {
+   "user": "Add share links: a schedule owner can create a public read-only link to a schedule. Done means: I click Share on a schedule, open the copied link in a private window and see that schedule read-only.",
+   "expect": {
+    "reply_includes": [
+     "open the copied link in a private window"
+    ],
+    "calls_lack": [
+     "^orchestrate (run|plan|validate|advise|resume)\\b",
+     "^run_task\\b"
+    ],
+    "bash_lacks": [
+     "\\brun_task\\.py\\b",
+     "orchestrate\\.py[\\\"']?\\s+(run|plan|validate|advise)\\b"
+    ],
+    "writes_lack": [
+     "(^|/)plan[^/]*\\.json$",
+     "\\.(go|tsx?)$"
+    ]
+   }
+  }
+ ]
+}

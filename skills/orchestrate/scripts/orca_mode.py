@@ -217,6 +217,9 @@ def start_worker(job: O.Job, plan: dict, tid: str, rung: int, *, fresh: bool, hi
     st.update(status="running", started=st.get("started") or time.time())
     job.save()
     O.log(f"start {tid} [{task['type']} {task['tier']}] as Orca worker {did} at {model}/{effort}")
+    O.task_log(job, tid, f"started Orca worker {did} at {model}/{effort} (attempt {attempt}) in "
+                         f"{o.get('worktree')}; the worker itself runs in an Orca terminal. Brief: {spec_file}"
+               + (f"\nhint: {hint[:3000]}" if hint else ""))
     return None
 
 
@@ -342,6 +345,10 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
             "outcome": payload.get("outcome"), "probe": o.get("probe", False)}
     st.setdefault("steps", []).append(step)
     st["report"] = report
+    O.task_log(job, tid, f"worker_done from {o['dispatch']} ({payload.get('outcome') or 'no outcome'}): "
+                         f"checks {'passed' if ok else 'FAILED'} at {model}/{effort}, attempt {o['attempt']}"
+               + (f"\n{out[-6000:]}" if out else "")
+               + (f"\nreport summary: {report.get('summary')}" if report else ""))
     if not ok:
         fail_attempt(job, plan, tid, out, report=report, step=step)
         return
@@ -353,6 +360,7 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
     except Exception as e:  # noqa: BLE001
         merged, info = False, f"commit/merge error: {e}"
     st.update(ended=time.time(), result="ok" if merged else "merge_failed")
+    O.task_log(job, tid, ("merged into the integration branch" if merged else f"merge FAILED: {info}"))
     if not merged:
         st.update(status="failed", error=info)
         O.log(f"FAIL  {tid}: {info}")
@@ -398,6 +406,7 @@ def fail_attempt(job: O.Job, plan: dict, tid: str, out: str, *, report: dict | N
                             "worker_done again. Output:\n" + out[-5000:])
             if sent is not None:
                 O.log(f"retry {tid}: sent the failure back to {o['dispatch']} (attempt {o['attempt']})")
+                O.task_log(job, tid, f"sent the failure back to {o['dispatch']} (attempt {o['attempt']})")
                 job.save()
                 return
             out = f"{out}\nSending the failure back to the worker failed."
@@ -419,6 +428,7 @@ def fail_attempt(job: O.Job, plan: dict, tid: str, out: str, *, report: dict | N
         cause=c["cause"], model_id=models.MODEL_IDS[model], probe=o.get("probe", False),
         note=c.get("evidence", "")))
     O.log(f"FAIL  {tid} at {model}/{effort}: {c['cause']} - {c.get('evidence')}")
+    O.task_log(job, tid, f"FAIL at {model}/{effort}: {c['cause']} - {c.get('evidence')}")
     if c["cause"] == "environment":
         return give_up(job, plan, tid, "environment", out)
     hint = ""
@@ -450,6 +460,7 @@ def give_up(job: O.Job, plan: dict, tid: str, result: str, out: str) -> None:
     st = job.state["tasks"][tid]
     st.update(status="failed", result=result, ended=time.time(), error=out[-2000:])
     O.log(f"FAIL  {tid}: {result}")
+    O.task_log(job, tid, f"gave up ({result}); the worker stays open for you to look at\n{out[-3000:]}")
     queue_event(job, task_failed_event(job, plan, tid))
     job.save()  # the worker stays open so you can look at its worktree and chat
 

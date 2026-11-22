@@ -1,0 +1,58 @@
+{
+ "id": "link-not-found-page-is-expected",
+ "core": false,
+ "pair": "share-page-not-found",
+ "from": "ui_reviewer/clean-share-page-passes",
+ "about": "The job adds the page an unknown share link shows, and the plan says it answers HTTP 404. The harness raises a major for every 4xx page; only an `expected` entry (shot, kind http_4xx, why) turns it into a minor note. A reviewer that only mentions the 404, or says nothing, leaves the major standing.",
+ "head_files": {
+  "web/share-gone.html": "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Link not found</title><link rel=\"stylesheet\" href=\"base.css\"></head><body><header>Planner</header><main><div class=\"card\"><h1>This link no longer works</h1><p>The schedule's owner may have stopped sharing it, or the link was copied incompletely.</p><p>Ask the owner for a new link.</p></div></main></body></html>\n"
+ },
+ "plan_patch": {
+  "goal": "An unknown share link shows a friendly 'This link no longer works' page",
+  "definition_of_done": "When I open a share link that no longer exists I see a page that says the link no longer works and what to do, and the response is a 404",
+  "acceptance": [
+   "GET /share/<unknown token> answers HTTP 404 with a 'This link no longer works' page, not a server error page",
+   "The page tells the visitor to ask the owner for a new link"
+  ],
+  "tasks": {
+   "web": {
+    "title": "Link-not-found page",
+    "goal": "Show a friendly page with HTTP 404 for a share link that does not exist",
+    "done": [
+     "An unknown share token answers 404 with the 'This link no longer works' page"
+    ],
+    "ui": [
+     {
+      "name": "share-gone",
+      "path": "/share/0000-unknown"
+     }
+    ]
+   }
+  }
+ },
+ "shots": [
+  {
+   "png": "share-gone--desktop.png",
+   "name": "share-gone",
+   "path": "/share/0000-unknown",
+   "viewport": "desktop",
+   "status": 404,
+   "title": "Link not found",
+   "tasks": [
+    "web"
+   ],
+   "console": [
+    "[network error] Failed to load resource: the server responded with a status of 404 (Not Found) (http://127.0.0.1:5173/share/0000-unknown)"
+   ]
+  }
+ ],
+ "expect": {
+  "verdict": "pass",
+  "expected": [
+   [
+    "share-gone--desktop",
+    "http_4xx"
+   ]
+  ]
+ }
+}

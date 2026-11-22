@@ -29,6 +29,8 @@ FAKE_CLAUDE = textwrap.dedent('''\
                              "resume": "--resume" in a, "hint": "Note from a previous" in prompt,
                              "fallback": a[a.index("--fallback-model") + 1] if "--fallback-model" in a else None,
                              "advisor": a[a.index("--advisor") + 1] if "--advisor" in a else None,
+                             "no_advisor": os.environ.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == "1",
+                             "only": a[a.index("--tools") + 1] if "--tools" in a else None,
                              "consult": "consult the advisor" in prompt.lower()}) + "\\n")
     if "--advisor" in a and cfg.get("advisor_launch_fail"):
         sys.stderr.write("Error: Fable as the advisor needs your consent to bill usage credits. Run /model fable.\\n")
@@ -433,6 +435,149 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(r["metrics"]["cache_read"], 9)
         self.assertEqual(counter.read_text(), "3")
 
+    def _argv_fake(self, reply: dict) -> Path:
+        """A fake claude that records its argv and prints `reply` as raw UTF-8, like Node does."""
+        fake, argv = self.tmp / "argv-claude", self.tmp / "argv.json"
+        fake.write_text(textwrap.dedent(f"""\
+            #!/usr/bin/env python3
+            import json, pathlib, sys
+            pathlib.Path({str(argv)!r}).write_text(json.dumps(sys.argv[1:]))
+            import os
+            pathlib.Path({str(self.tmp / "no-advisor.json")!r}).write_text(
+                json.dumps(os.environ.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL")))
+            sys.stdout.buffer.write(json.dumps({reply!r}, ensure_ascii=False).encode() + b"\\n")
+        """))
+        fake.chmod(0o755)
+        return fake
+
+    def _cli_call(self, fake: Path, env: dict, **kw):
+        import claude_cli
+        cc = importlib.reload(claude_cli)
+        saved = {k: os.environ.get(k) for k in ("ROUTER_CLAUDE_BIN", *env)}
+        os.environ.update({"ROUTER_CLAUDE_BIN": str(fake), **env})
+        try:
+            r = cc.call("x", "sonnet", "low", self.repo, perm="dontAsk", tools=["Read"], **kw)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return r, json.loads((self.tmp / "argv.json").read_text())
+
+    def test_line_separators_in_the_reply_still_parse(self):
+        verdict = {"summary": "first\u2028second\u2029third", "ok": True}
+        fake = self._argv_fake({"is_error": False, "subtype": "success", "result": "a\u2028b\u2029c",
+                                "structured_output": verdict, "num_turns": 1})
+        r, _ = self._cli_call(fake, {}, schema={"type": "object"})
+        self.assertFalse(r["is_error"])
+        self.assertIsNone(r["error_kind"])
+        self.assertEqual(r["structured"], verdict)
+        self.assertEqual(r["result"], "a\u2028b\u2029c")
+
+    def test_reply_after_log_lines_still_parses(self):
+        fake = self._argv_fake({"is_error": False, "subtype": "success", "result": "ok"})
+        fake.write_text(fake.read_text().replace("sys.stdout.buffer.write(", "print('warming up'); sys.stdout.flush(); sys.stdout.buffer.write(", 1))
+        r, _ = self._cli_call(fake, {})
+        self.assertIsNone(r["error_kind"])
+        self.assertEqual(r["result"], "ok")
+
+    def test_hermetic_drops_mcp_servers_and_hooks_only_when_asked(self):
+        fake = self._argv_fake({"is_error": False, "subtype": "success", "result": "ok"})
+        own = {"permissions": {"deny": ["Bash"]}}
+        _, argv = self._cli_call(fake, {"ORCHESTRATE_HERMETIC": "1"}, settings=own)
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(json.loads(argv[argv.index("--mcp-config") + 1]), {"mcpServers": {}})
+        self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), {**own, "disableAllHooks": True})
+        self.assertNotIn("--setting-sources", argv, "the user's CLAUDE.md and rules still load")
+        _, argv = self._cli_call(fake, {"ORCHESTRATE_HERMETIC": "1"})
+        self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), {"disableAllHooks": True})
+        for env in ({}, {"ORCHESTRATE_HERMETIC": "0"}):
+            _, argv = self._cli_call(fake, env, settings=own)
+            self.assertNotIn("--strict-mcp-config", argv)
+            self.assertNotIn("--mcp-config", argv)
+            self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), own)
+
+    def test_only_is_the_whole_tool_set_and_drops_mcp_servers_once(self):
+        fake = self._argv_fake({"is_error": False, "subtype": "success", "result": "ok"})
+        for only, want in (([], ""), (["Read", "Grep", "Glob"], "Read,Grep,Glob")):
+            for env in ({}, {"ORCHESTRATE_HERMETIC": "1"}):
+                _, argv = self._cli_call(fake, env, only=only)
+                self.assertEqual(argv[argv.index("--tools") + 1], want)
+                self.assertEqual(argv.count("--strict-mcp-config"), 1)
+                self.assertEqual(json.loads(argv[argv.index("--mcp-config") + 1]), {"mcpServers": {}})
+        _, argv = self._cli_call(fake, {"ORCHESTRATE_HERMETIC": "0"})
+        self.assertNotIn("--tools", argv, "a worker keeps the default set")
+
+    def test_the_advisor_tool_is_off_unless_the_call_asks_for_it(self):
+        fake, var = self._argv_fake({"is_error": False, "subtype": "success", "result": "ok"}), "CLAUDE_CODE_DISABLE_ADVISOR_TOOL"
+        got = lambda: json.loads((self.tmp / "no-advisor.json").read_text())
+        before = os.environ.get(var)
+        self._cli_call(fake, {})
+        self.assertEqual(got(), "1")
+        self._cli_call(fake, {var: "1"}, extra_args=["--advisor", "opus"])
+        self.assertIsNone(got(), "the switch disables --advisor too, so a call that asks for one drops it")
+        self._cli_call(fake, {}, extra_args=["--fallback-model", "opus"])
+        self.assertEqual(got(), "1")
+        self.assertEqual(os.environ.get(var), before, "set per child, never in this process")
+
+    def test_a_task_gets_the_advisor_only_from_its_own_flag_and_the_classifier_never(self):
+        _, _, calls, _ = self.run_task("feature:web", "T1", {"pass": ["opus/high"], "cause": "capability"},
+                                       extra=("--start", "opus/medium", "--advisor", "opus"))
+        workers = [c for c in calls if not c["classifier"]]
+        judged = [c for c in calls if c["classifier"]]
+        self.assertTrue(workers and judged, calls)
+        for c in workers:
+            self.assertEqual(c["no_advisor"], c["advisor"] is None, c)
+            self.assertIsNone(c["only"])
+        for c in judged:
+            self.assertEqual((c["no_advisor"], c["only"]), (True, ""), c)
+
+    def test_a_reply_that_is_json_but_not_an_object_is_unparseable(self):
+        fake = self._argv_fake({"is_error": False, "subtype": "success", "result": "ok"})
+        fake.write_text(fake.read_text().replace("sys.stdout.buffer.write(", "print('oops'); print(42); sys.exit(0); sys.stdout.buffer.write(", 1))
+        r, _ = self._cli_call(fake, {}, retries=0)
+        self.assertEqual(r["error_kind"], "unparseable")
+        self.assertTrue(r["is_error"])
+        self.assertIsNone(r["structured"])
+
+    def test_a_learned_note_skips_headings_inside_code_fences_and_keeps_crlf(self):
+        agents = self.repo / "AGENTS.md"
+        agents.write_bytes(b"# Repo\r\n\r\n## Agent notes (learned)\r\n- old\r\n\r\n```bash\r\n"
+                           b"# regenerate the stubs\r\nmake stubs\r\n```\r\n- fenced note\r\n\r\n## Human\r\nx\r\n")
+        p = self.router.propose_context("feature:api", str(agents), "NEW NOTE", "job j1: evidence")
+        self.router.approve(p["id"])
+        self.assertEqual(agents.read_bytes(),
+                         b"# Repo\r\n\r\n## Agent notes (learned)\r\n- old\r\n\r\n```bash\r\n"
+                         b"# regenerate the stubs\r\nmake stubs\r\n```\r\n- fenced note\r\n- NEW NOTE\r\n\r\n"
+                         b"## Human\r\nx\r\n")
+
+    def _approve_note(self, agents: Path, text: str) -> str:
+        p = self.router.propose_context("feature:api", str(agents), text, "job j1: evidence")
+        self.router.approve(p["id"])
+        return agents.read_text()
+
+    def test_learned_note_goes_in_its_section_not_in_a_later_human_one(self):
+        agents = self.repo / "AGENTS.md"
+        head = "# Repo\n\nRun `make test`.\n\n## Agent notes (learned)\n- first note\n\n"
+        deploy = "## Deploy\n\nAsk Sam before deploying.\n"
+        agents.write_text(head + deploy)
+        out = self._approve_note(agents, "second note")
+        self.assertTrue(out.endswith("\n\n" + deploy), out)
+        self.assertEqual(out, "# Repo\n\nRun `make test`.\n\n## Agent notes (learned)\n"
+                              "- first note\n- second note\n\n" + deploy)
+        out = self._approve_note(agents, "third note")
+        self.assertIn("- second note\n- third note\n\n## Deploy", out)
+        self.assertTrue(out.endswith(deploy))
+
+    def test_learned_note_section_is_created_or_extended_at_eof(self):
+        agents = self.repo / "AGENTS.md"
+        agents.write_text("# Repo\n\nRun `make test`.\n")
+        out = self._approve_note(agents, "one")
+        self.assertEqual(out, "# Repo\n\nRun `make test`.\n\n## Agent notes (learned)\n- one\n")
+        out = self._approve_note(agents, "two")
+        self.assertEqual(out, "# Repo\n\nRun `make test`.\n\n## Agent notes (learned)\n- one\n- two\n")
+        agents.write_text("## Agent notes (learned)\n### Go\n- three\n")
+        self.assertEqual(self._approve_note(agents, "four"),
+                         "## Agent notes (learned)\n### Go\n- three\n- four\n", "### stays inside the section")
+
     def test_budget_stops_the_task(self):
         fake = self.tmp / "claude"
         fake.write_text(FAKE_CLAUDE.replace('print(json.dumps({"result": res,',
@@ -442,6 +587,16 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(code, 7, err)
         self.assertEqual(s["result"], "budget")
         self.assertFalse(any(c["classifier"] for c in calls), "budget is not a failure to classify")
+
+    def test_status_sums_the_advisor_re_check_yield(self):
+        status = lambda: subprocess.run([sys.executable, str(SCRIPTS / "router.py"), "status"],  # noqa: E731
+                                        env=self.env, capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("Advisor high re-check", status(), "no advice.jsonl: no line")
+        rows = [{"job": "a", "calls": 2, "escalated": 1, "found": 1, "escalation_cost_usd": 0.5},
+                {"job": "b", "calls": 3, "escalated": 2, "found": 0, "escalation_cost_usd": 1.25}]
+        (self.state / "advice.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows) + "not json\n")
+        self.assertIn("Advisor high re-check: found blocking issues in 1 of 3 re-checks over 2 job(s), "
+                      "$1.75 total", status())
 
 if __name__ == "__main__":
     unittest.main()

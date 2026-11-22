@@ -113,10 +113,10 @@ def env_signature(vout: str, verify_cmds: list[str]) -> str | None:
 def claude(prompt: str, model: str, effort: str, cwd: Path, *, perm: str,
            tools: list[str], resume: str | None, timeout: int, settings: dict | None = None,
            schema: dict | None = None, budget_usd: float | None = None,
-           extra_args: list[str] | None = None) -> dict:
+           extra_args: list[str] | None = None, only: list[str] | None = None) -> dict:
     return claude_cli.call(prompt, model, effort, cwd, perm=perm, tools=tools, resume=resume,
                            timeout=timeout, settings=settings, schema=schema,
-                           budget_usd=budget_usd, extra_args=extra_args)
+                           budget_usd=budget_usd, extra_args=extra_args, only=only)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -181,7 +181,7 @@ def classify(task: str, rung: int, worker: dict, vout: str, repo: Path, timeout:
     prompt = CLASSIFIER_PROMPT.format(
         config="/".join(router.cfg(rung)), task=task, final=str(worker.get("result", ""))[-3000:],
         stat=git(repo, "diff", "--stat")[-1500:] or "(none)", tail=vout[-4000:])
-    res = claude(prompt, *classifier_cfg(), repo, perm="plan", tools=[], resume=None,
+    res = claude(prompt, *classifier_cfg(), repo, perm="plan", tools=[], only=[], resume=None,
                  timeout=timeout, schema=schemas.CLASSIFIER,
                  extra_args=["--exclude-dynamic-system-prompt-sections"])
     out = res.get("structured") or {}

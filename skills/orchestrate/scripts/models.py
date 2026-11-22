@@ -59,13 +59,17 @@ ROLES: dict[str, tuple[str, str]] = {
     "area_reviewer": ("opus", "medium"),
     # Tidies the merged diff before the final check: dead code, debug output, stray TODOs.
     "cleanup": ("opus", "medium"),
-    # Merge-conflict resolution: everyday coding [CHOOSE] at Sonnet's default effort.
-    "integrator": ("sonnet", "high"),
+    # Merge-conflict resolution. Opus 5.5 at its default effort (the user's choice, 2026-11-18:
+    # no Sonnet in the defaults).
+    "integrator": ("opus", "medium"),
     # Failure-cause classification. [ROUTE] "Claude Haiku 5.5 ... at low effort handles
     # simple, high-volume requests such as classification". Our sweep: haiku/low = sonnet/low.
     "classifier": ("haiku", "low"),
     # Extract AGENTS.md notes from reports: extraction is Haiku's job [CHOOSE], default effort.
     "lessons": ("haiku", "medium"),
+    # Looks at the job's screenshots (desktop and mobile) when plan.ui is set: vision plus judgment
+    # against the definition of done. Opus 5.5 at its default effort, like the code reviewer.
+    "ui_reviewer": ("opus", "medium"),
 }
 # When the advisor at its role effort finds nothing, ask again at this effort before believing it.
 ADVISOR_ESCALATE = "high"
@@ -109,7 +113,8 @@ def fallback_args(model: str) -> list[str]:
 def advisor_args(model: str, advisor: str | None, max_model: str | None = None) -> list[str]:
     """`--advisor X` for a worker running `model`, or [] when the pairing can't work.
 
-    The advisor tool (claude --advisor) is off by default: [COST] measured it buying about what
+    The advisor tool (claude --advisor) is off by default, whatever the user's `advisorModel`
+    setting says (claude_cli.child_env). [COST] measured it buying about what
     more effort buys (+1.7 points for 2.1x), and on another benchmark Opus rarely consulted it
     and scored 7 points lower. It is opt-in per plan, for long tasks that are hard in spots.
     `max_model` caps the advisor like any role (Fable capped at Opus -> an Opus advisor).

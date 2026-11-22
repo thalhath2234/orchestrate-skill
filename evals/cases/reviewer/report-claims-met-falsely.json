@@ -1,0 +1,40 @@
+{
+ "id": "report-claims-met-falsely",
+ "core": false,
+ "pair": "decision-respected-passes",
+ "about": "The api report's done_check marks D2 (a non-owner gets 403) as met, with evidence that does not exist: handler.go has no owner check and handler_test.go has no TestCreateNonOwnerIs403. The reviewer must check each claim against the code, not believe it. Same fixture as missing-owner-check.",
+ "from": "reviewer/missing-owner-check",
+ "reports": {
+  "api": {
+   "summary": "Added POST /schedules/:id/share and GET /share/:token with tests; owner-only creation enforced; registered routes.",
+   "interfaces": "share.Register(r)",
+   "done_check": [
+    {
+     "id": "D1",
+     "met": true,
+     "evidence": "apps/api/internal/share/handler.go:15-24 Create returns 201 with a hex token; handler_test.go:5 TestCreateReturnsToken"
+    },
+    {
+     "id": "D2",
+     "met": true,
+     "evidence": "handler.go:16 owner check; handler_test.go TestCreateNonOwnerIs403"
+    },
+    {
+     "id": "D3",
+     "met": true,
+     "evidence": "handler.go:28-31 Get returns 404 for unknown or expired tokens; handler_test.go:7 TestGetUnknownTokenIs404"
+    }
+   ]
+  },
+  "web": {
+   "summary": "Added ShareButton that copies the link.",
+   "interfaces": "ShareButton({link})"
+  }
+ },
+ "expect": {
+  "verdict": "changes_requested",
+  "finding_mentions": [
+   "owner"
+  ]
+ }
+}

@@ -1,0 +1,36 @@
+{
+ "id": "mobile-text-cut-off",
+ "core": true,
+ "pair": "clean-share-page-passes",
+ "about": "Desktop is fine, but on mobile the page is laid out 620px wide inside a 390px viewport with overflow hidden: the times, the description and the share link are cut off at the right edge. The browser evidence is clean (HTTP 200, no console errors), so only looking at the screenshot catches it.",
+ "from": "ui_reviewer/clean-share-page-passes",
+ "head_files": {
+  "web/share.html": "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Team schedule</title><link rel=\"stylesheet\" href=\"base.css\"></head><body><style>html,body{overflow-x:hidden}main{width:620px;max-width:none}</style><header>Planner</header><main><div class=\"card\"><h1>Team schedule</h1><p>Week of 16 November</p><ul><li><span>Standup</span><span class=\"time\">Mon 09:00</span></li><li><span>Design review</span><span class=\"time\">Tue 14:00</span></li><li><span>Release</span><span class=\"time\">Thu 16:00</span></li></ul></div><div class=\"card\"><h1>Share</h1><p>Anyone with the link can view this schedule. They cannot edit it.</p><div class=\"link\" style=\"white-space:nowrap;overflow-wrap:normal\">https://planner.example.com/share/3f9c2a7e1b6d4c08a5e2f71d9b30c6aa?from=schedule</div><button>Copy link</button></div></main></body></html>"
+ },
+ "shots": [
+  {
+   "png": "share--desktop.png",
+   "name": "share",
+   "path": "/share.html",
+   "viewport": "desktop",
+   "title": "Team schedule",
+   "tasks": [
+    "web"
+   ]
+  },
+  {
+   "png": "share-cut-off--mobile.png",
+   "name": "share",
+   "path": "/share.html",
+   "viewport": "mobile",
+   "title": "Team schedule",
+   "tasks": [
+    "web"
+   ]
+  }
+ ],
+ "expect": {
+  "verdict": "changes_requested",
+  "finding_shot": "share--mobile"
+ }
+}
