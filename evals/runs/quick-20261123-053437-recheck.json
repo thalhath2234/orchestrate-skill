@@ -1,0 +1,67 @@
+{
+  "meta": {
+    "git_sha": "4d2341c07d1237c8c08cf5a7038c4bab61d41a45",
+    "dirty": false,
+    "claude_version": "2.1.330 (Claude Code)",
+    "date": "2026-11-22T20:34:37Z",
+    "hermetic": true
+  },
+  "overall_pass": 0.5,
+  "low_roles": {},
+  "fallback_configs": {},
+  "results": [
+    {
+      "role": "parent",
+      "case": "grill-asks-done-first",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.2586,
+      "trials": [
+        {
+          "ok": true,
+          "label": "orchestrate doctor,orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.2586,
+          "detail": "I read the whole repo and haven't changed anything. There are no open orchestrate jobs, and the setup check passed. Four findings affect this feature:\n\n- **No owner, login or storage:** nothing in the repo records who owns a schedule, identifies a user or saves data.\n- **The API is a stub:** `api/sc",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 29.2
+        }
+      ]
+    },
+    {
+      "role": "parent",
+      "case": "no-plan-before-confirm",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 0.0,
+      "consistency": 1.0,
+      "cost_usd": 0.2929,
+      "trials": [
+        {
+          "ok": false,
+          "label": "orchestrate scan,orchestrate status,run_task",
+          "fails": [
+            "turn 1: ran 'echo \"orca=${ORCA_AGENT_SESSION_ID:+yes}\"; PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS=\"-p no:cacheprovider\" make test; echo \"make exit=$?\"; for a in --verbose --d' (matches '\\\\brun_task\\\\.py\\\\b')",
+            "turn 1: called 'run_task --help' (matches '^run_task\\\\b')"
+          ],
+          "cost": 0.2929,
+          "detail": "I haven't changed anything yet. I need your answers to three questions and a go-ahead first.\n\n**`make test` can't pass on this machine right now.** It exits with `No module named pytest` on the untouched code, and neither installed Python (3.14, 3.11) has pytest. The rename won't fix that.\n\n**What d",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 41.8
+        }
+      ]
+    }
+  ]
+}
