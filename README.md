@@ -59,7 +59,7 @@ This installs five skills:
 | `orchestrate-manage` | The manager agent's playbook: events, diagnosis, actions, and when to ask you |
 | `orchestrate-review` | What the integrator, reviewer and UI reviewer subagents check, severities, and output format |
 
-Requirements: Python 3.9+ (stdlib only), Linux (CI runs `make test` there with Python 3.9 and 3.13; macOS is not supported), and `git` and `claude` on PATH. UI review also needs Google Chrome or Chromium (only for plans with a `ui` block).
+Requirements: Python 3.9+ (stdlib only), Linux (CI runs `make test` there with Python 3.9 and 3.13; macOS is not supported), and `git` and `claude` on PATH, and `bubblewrap` (`bwrap`) to confine workers. UI review also needs Google Chrome or Chromium (only for plans with a `ui` block).
 
 ## Update
 
@@ -208,8 +208,10 @@ Validation rejects plans where tasks that can run at the same time own overlappi
 ## Safety
 
 - **Judgment roles are read-only.** The reviewers, the advisor, the manager and the planner are offered only Read, Grep and Glob, and the failure classifier and lessons extractor no tools at all. The integrator, which has to edit the conflict, also gets Edit and Write, but no shell or git. None of them gets your MCP servers, and your own allow rules can't add a tool back. Workers and the cleanup pass aren't restricted this way.
-- **Approvals go through you.** The plugin installs a `PreToolUse` hook: any `--approve`, `--answer` or `router.py approve` command the agent runs shows up in Claude Code's own permission prompt for you to allow. An approval typed in chat approves nothing. (`npx skills` installs: add the hook printed by `orchestrate.py guard-hook`.)
-- **Edits stay in the worktree.** Subagents' file edits are confined to their worktree (`blockWritesOutsideWorkingDirectories`). A scope check rejects changes to paths another task owns, hotspots and migrations, and feeds the error back to the subagent. `"sandbox": true` in the plan adds an OS sandbox around their shell commands.
+- **Approvals go through you.** The plugin installs a `PreToolUse` hook: any `--approve`, `--answer` or `router.py approve` command the agent runs shows up in Claude Code's own permission prompt for you to allow. An approval typed in chat approves nothing. (`npx skills` installs: add the hook printed by `orchestrate.py guard-hook`.) The hook reads the command text, so it catches the plain forms, not a command hidden in a script: confinement is what stops a worker editing job state.
+- **Workers are confined (Linux, bubblewrap).** A worker, its verify commands, setup on merged work, the dev server and cleanup run where job state, other checkouts, git refs, hooks and config, and Claude Code's settings, hooks and skills are read-only. Caches, the network and localhost services work as usual. Without a working `bwrap` the job still runs and says so in the log, `report.md` and `doctor`; `"sandbox": true` refuses to run instead, `false` turns it off. It stops accidents and injected instructions, not a determined attacker: the Docker socket, systemd, `~/.claude.json` and other PATH directories are still reachable. Orca workers are not confined, so their gates are only as strong as your own permission settings.
+- **Edits stay in the task.** The scope check sees committed and uncommitted changes, and the merge checks again on exactly the commit it merges: a file another task owns, a hotspot or a migration is never merged.
+- **A branch can't configure the harness.** The harness's own git never runs the repo's hooks (put lint in `verify`), and judgment calls don't load project `.claude` settings: they get your committed `CLAUDE.md` from the main checkout's HEAD.
 - **Subagent text is evidence, not instructions.** Reports, open issues and logs reach the manager, reviewer and integrator inside fences, sanitized and size-capped.
 - **The orchestrator watches its own files.** If a subagent modifies the orchestrate skill files, the job stops.
 - **The manager is bounded.** Its actions are validated as one all-or-nothing batch, against the resulting plan. It can't approve gates, change your decisions, drop or trivialise a task's verify commands, or add an ungated migration. It gets at most 12 interventions per job and 2 retries per task, then it asks you.

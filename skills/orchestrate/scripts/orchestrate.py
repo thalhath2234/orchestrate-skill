@@ -77,6 +77,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import claude_cli  # noqa: E402
+import jail  # noqa: E402
 import models  # noqa: E402
 import router  # noqa: E402
 import schemas  # noqa: E402
@@ -145,17 +146,18 @@ def task_log(job, tid: str, text: str) -> None:
         pass
 
 
-def sh(cmd: str, cwd: Path, timeout: int = 1800, env: dict | None = None) -> tuple[int, str]:
+def sh(cmd: str, cwd: Path, timeout: int = 1800, env: dict | None = None,
+       confine: Path | None = None) -> tuple[int, str]:
     try:
-        p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True,
+        p = subprocess.run(jail.shell(cmd, cwd, confine), cwd=cwd, capture_output=True, encoding="utf-8", errors="replace",
                            timeout=timeout, env=env)
         return p.returncode, p.stdout + p.stderr
     except subprocess.TimeoutExpired as e:
-        return 124, f"TIMEOUT after {timeout}s: {cmd}\n{e.stdout or ''}{e.stderr or ''}"
+        return 124, f"TIMEOUT after {timeout}s: {cmd}\n{decoded(e.stdout)}{decoded(e.stderr)}"
 
 
 def git(cwd: Path, *args: str, check: bool = True) -> str:
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    p = subprocess.run([*jail.GIT, *args], cwd=cwd, capture_output=True, encoding="utf-8", errors="replace")
     if check and p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed in {cwd}:\n{p.stdout}{p.stderr}")
     return p.stdout.strip()
@@ -165,7 +167,7 @@ def git_paths(cwd: Path, *args: str) -> list[str]:
     """Paths a git listing command prints (diff --name-only, ls-files), read NUL-separated with
     core.quotePath off: a non-ASCII name comes back as itself, never quoted and octal-escaped.
     For diff, pass --no-renames so a file moved away lists its old path too."""
-    p = subprocess.run(["git", "-c", "core.quotePath=off", *args, "-z"], cwd=cwd, capture_output=True)
+    p = subprocess.run([*jail.GIT, "-c", "core.quotePath=off", *args, "-z"], cwd=cwd, capture_output=True)
     if p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed in {cwd}:\n{p.stderr.decode(errors='replace')}")
     return [x for x in p.stdout.decode("utf-8", errors="surrogateescape").split("\0") if x]
@@ -177,9 +179,28 @@ def git_ident(repo: Path) -> list[str]:
     return ["-c", "user.name=orchestrate", "-c", "user.email=orchestrate@localhost"]
 
 
+def confinement(plan: dict) -> Path | None:
+    """For a command that runs code workers wrote: the state dir to jail it against, or None."""
+    return jail.confinement(jail.mode_of(plan), router.DIR)
+
+
+def has_worker_code(job, cwd: Path) -> bool:
+    return git(cwd, "rev-parse", "HEAD") != job.state.get("base_sha")
+
+
+def decoded(x) -> str:
+    """Output of a timed-out command: bytes even in text mode, or None."""
+    return x.decode("utf-8", "replace") if isinstance(x, bytes) else (x or "")
+
+
+def printable(path: str) -> str:
+    """A path from git_paths for state, reports and stdout: bytes that aren't UTF-8 show as `?`."""
+    return path.encode("utf-8", "replace").decode("utf-8")
+
+
 def read_text(p) -> str | None:
     try:
-        return Path(p).read_text()
+        return Path(p).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
 
@@ -272,11 +293,12 @@ def skill_text(name: str) -> str:
 def claude(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: list[str],
            resume: str | None = None, timeout: int = 3600, settings: dict | None = None,
            schema: dict | None = None, budget_usd: float | None = None,
-           extra_args: list[str] | None = None, only: list[str] | None = None) -> dict:
+           extra_args: list[str] | None = None, only: list[str] | None = None,
+           confine: Path | None = None) -> dict:
     extra = list(extra_args or []) + models.fallback_args(model)  # no Fable access -> Opus
     return claude_cli.call(prompt, model, effort, cwd, perm=perm, tools=tools, resume=resume,
                            timeout=timeout, settings=settings, schema=schema,
-                           budget_usd=budget_usd, extra_args=extra, only=only)
+                           budget_usd=budget_usd, extra_args=extra, only=only, confine=confine)
 
 
 def record_call(job, role: str, res: dict, task: str | None = None, cfg: str = "") -> None:
@@ -519,7 +541,7 @@ def _verify_suggestions(p: dict, targets: dict, pm: str) -> list[str]:
 
 # ============================================================== ownership ===
 def _has_glob(p: str) -> bool:
-    return any(c in p for c in "*?[")
+    return any(c in p for c in "*?")  # `[` is literal (_pat_regex): app/[id] is a directory
 
 
 @functools.lru_cache(maxsize=4096)
@@ -583,22 +605,24 @@ def patterns_overlap(a: str, b: str, files: list[str]) -> bool:
                for pref in {pa, pb} for pat in (a, b) for pr in _probes(pref, pat))
 
 
+def status_entries(cwd: Path, *args: str) -> list[tuple[str, str]]:
+    """`git status` as (XY, path), NUL-separated, so no name is quoted, trimmed or split on " -> ".
+    A rename gives both of its paths."""
+    items, out = iter(git_paths(cwd, "status", "--porcelain", *args)), []
+    for item in items:
+        out.append((item[:2], item[3:]))
+        if "R" in item[:2] or "C" in item[:2]:
+            out.append((item[:2], next(items, "")))
+    return out
+
+
 def scope_violations(cwd: Path, owns: list[str], base: str | None = None) -> list[str]:
     """Changed paths outside `owns`: uncommitted ones, plus everything committed since `base`
     (a worker that can commit must not get committed edits past the check)."""
-    # Don't use git() here: its .strip() eats the leading space of the first
-    # " M path" line, shifting every path by one character.
-    out = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
-                         cwd=cwd, capture_output=True, text=True).stdout
-    changed = []
-    for line in out.splitlines():
-        path = line[3:]
-        changed += [p.strip('"') for p in (path.split(" -> ") if " -> " in path else [path])]
+    changed = [path for xy, path in status_entries(cwd, "--untracked-files=all")]
     if base:
         # --no-renames: a committed `git mv` lists both paths, so moving another task's file away is caught
-        committed = subprocess.run(["git", "diff", "--name-only", "--no-renames", f"{base}..HEAD"], cwd=cwd,
-                                   capture_output=True, text=True).stdout
-        changed += [p.strip('"') for p in committed.splitlines() if p.strip()]
+        changed += git_paths(cwd, "diff", "--name-only", "--no-renames", f"{base}..HEAD")
     return [p for p in dict.fromkeys(changed) if not any(owned(p, pat) for pat in owns)]
 
 
@@ -617,8 +641,13 @@ def claim_unowned(job_id: str, task_id: str, bad: list[str]) -> tuple[list[str],
         return bad, []
     others = [p for t in plan["tasks"] if t["id"] != task_id for p in t.get("owns", [])]
     still, granted = [], []
-    with open(jd / ".claims.lock", "a") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
+    try:
+        lock = open(jd / ".claims.lock", "a")
+    except OSError:  # a worker running the check itself, in its jail: it can judge, not record
+        lock = None
+    with lock or contextlib.nullcontext():
+        if lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
         claims = json.loads(read_text(jd / "claims.json") or "{}")
         for f in bad:
             name = Path(f).name
@@ -629,7 +658,7 @@ def claim_unowned(job_id: str, task_id: str, bad: list[str]) -> tuple[list[str],
             else:
                 claims[f] = task_id
                 granted.append(f)
-        if granted:
+        if granted and lock:
             write_json(jd / "claims.json", claims)
     return still, granted
 
@@ -1109,7 +1138,7 @@ def _repo_key(path) -> str:
     worktree of a repo (Orca workspaces) gives the same key; the path itself outside a repo."""
     p = Path(path).expanduser()
     with contextlib.suppress(Exception):
-        common = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=p,
+        common = subprocess.run([*jail.GIT, "rev-parse", "--git-common-dir"], cwd=p,
                                 capture_output=True, text=True, timeout=10).stdout.strip()
         if common:
             return str((p / common).resolve())
@@ -1198,10 +1227,42 @@ def pid_alive(pid) -> bool:
         return False
 
 
+def other_repo_refusal(job: Job, plan: dict) -> str | None:
+    """Job ids are global to the state dir: a slug another repo holds must never take this plan."""
+    held = (job.state or {}).get("repo")
+    if held and Path(held).expanduser().resolve() != Path(plan["repo"]).expanduser().resolve():
+        return (f"job {job.id} belongs to {held}, not {plan['repo']}: job ids are shared by every repo. "
+                "Pick another plan.job.")
+    return None
+
+
+def hold_job(job_id: str) -> bool:
+    """Take the job for this process's lifetime. False when another process has it: two orchestrators
+    would start each other's tasks on the same worktrees. The kernel drops it when the process dies."""
+    import fcntl
+    if job_id in _held:
+        return True
+    JOBS.mkdir(parents=True, exist_ok=True)
+    fh = open(JOBS / f".{job_id}.lock", "a")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return False
+    _held[job_id] = fh
+    return True
+
+
+_held: dict = {}
+
+
 def fresh_run_refusal(plan: dict) -> str | None:
     """Why `run` can't start plan.job now, or None. Checked before anything else (dashboard, the
     detached child), so a taken slug fails loudly instead of `wait` reporting an earlier run."""
     job = Job(plan["job"])
+    other = other_repo_refusal(job, plan)
+    if other:
+        return other
     if job.state and job.state.get("status") == "done":
         return f"job {job.id} already finished; pick a new plan.job or `clean {job.id}`"
     if not job.state:
@@ -1214,6 +1275,9 @@ def fresh_run_refusal(plan: dict) -> str | None:
 
 def start_job(plan: dict, plan_path: Path) -> Job:
     job = Job(plan["job"])
+    other = other_repo_refusal(job, plan)
+    if other:
+        raise SystemExit(other)  # before anything of the other repo's job is written
     job.dir.mkdir(parents=True, exist_ok=True)
     (job.dir / "briefs").mkdir(exist_ok=True)
     (job.dir / "logs").mkdir(exist_ok=True)
@@ -1265,13 +1329,17 @@ def ensure_integration(job: Job) -> Path:
     return wt
 
 
-def run_setup(cmds: list[str], cwd: Path, logf: Path) -> tuple[bool, str]:
+def run_setup(cmds: list[str], cwd: Path, logf: Path, confine: Path | None = None) -> tuple[bool, str]:
+    # git hooks and config are read-only in the jail, so hook installers are told to stand down
+    env = {**os.environ, "HUSKY": "0", "LEFTHOOK": "0"} if confine else None
     for c in cmds:
-        code, out = sh(c, cwd, 1800)
+        code, out = sh(c, cwd, 1800, env=env, confine=confine)
         with open(logf, "a") as fh:
             fh.write(f"$ {c}\n{out}\n")
         if code != 0:
-            return False, f"setup failed: {c}\n{out[-3000:]}"
+            return False, (f"setup failed: {c}\n{out[-3000:]}"
+                           + ("\n(it ran in the worker sandbox: the repo's git config, hooks and refs are "
+                              "read-only there; see plan.sandbox)" if confine else ""))
     return True, ""
 
 
@@ -1294,14 +1362,18 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
 
     Reads job state but never writes it; the scheduler records the result."""
     logf = job.dir / "logs" / f"{task['id']}.log"
-    ok, err = run_setup(plan.get("setup", []), wt, logf)
+    # on the user's own base commit setup is their code; with merged work in it, it is workers' code
+    ok, err = run_setup(plan.get("setup", []), wt, logf,
+                        confinement(plan) if has_worker_code(job, wt) else None)
     if not ok:
         return {"ok": False, "result": "environment", "error": err, "wt": str(wt), "branch": br}
     upstream = {d: job.state["tasks"].get(d, {}) for d in task.get("depends_on", [])}
     brief = build_brief(plan, task, wt, upstream)
-    (job.dir / "briefs" / f"{task['id']}.md").write_text(brief)
+    (job.dir / "briefs" / f"{task['id']}.md").write_text(brief, encoding="utf-8", errors="replace")
+    start = (job.state["tasks"].get(task["id"]) or {}).get("start_sha")
     scope = (f"{shlex.quote(sys.executable)} {shlex.quote(str(HERE / 'orchestrate.py'))} scope-check "
              f"--job {shlex.quote(job.id)} --task {shlex.quote(task['id'])} "
+             + (f"--base {shlex.quote(start)} " if start else "")
              + " ".join(f"--owns {shlex.quote(p)}" for p in task["owns"]))
     cmd = [sys.executable, str(HERE / "run_task.py"), "--repo", str(wt), "--type", task["type"],
            "--tier", task["tier"], "--verify", scope, "--report-schema", json.dumps(schemas.REPORT)]
@@ -1320,6 +1392,7 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
         cmd += ["--no-baseline"]  # the job-level baseline already ran
     if plan.get("extra_tools"):
         cmd += ["--extra-tools", *plan["extra_tools"]]
+    cmd += ["--jail", jail.mode_of(plan), "--trusted-verify", scope]
     if plan.get("sandbox"):
         cmd.append("--sandbox")
     if plan.get("exclude_dynamic_prompt", True):  # measured: ~4.8k fewer cache-write tokens per session
@@ -1328,11 +1401,12 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
         cmd += ["--max-escalations", str(int(plan["max_escalations"]))]
     if budget is not None:
         cmd += ["--budget-usd", f"{max(budget, 0.01):.2f}"]
-    cmd.append(brief)
+    cmd.append("-")  # the brief goes on stdin: it can be bigger than one argument may be
     env = {**os.environ, "ORCHESTRATE_SLOT": str(slot), "ORCHESTRATE_JOB": job.id,
            "ORCHESTRATE_TASK": task["id"]}
     with open(logf, "a") as fh:
-        p = subprocess.run(cmd, cwd=wt, stdout=subprocess.PIPE, stderr=fh, text=True, env=env)
+        p = subprocess.run(cmd, cwd=wt, input=brief, stdout=subprocess.PIPE, stderr=fh, encoding="utf-8",
+                           errors="replace", env=env)
     summary = extract_json(p.stdout) or {}
     report = summary.get("report")
     if not (isinstance(report, dict) and "summary" in report):
@@ -1364,13 +1438,26 @@ def commit_and_merge(job: Job, plan: dict, task: dict, res: dict,
     git(wt, "add", "-A")
     if git(wt, "diff", "--cached", "--name-only"):
         git(wt, *ident, "commit", "-q", "-m", f"orchestrate({job.id}): {task['id']}: {task['title']}")
-    files = git(wt, "diff", "--name-only", f"{job.state['tasks'][task['id']]['start_sha']}..HEAD").splitlines()
+    start, tip = job.state["tasks"][task["id"]]["start_sha"], git(wt, "rev-parse", "HEAD")
+    if git(wt, "merge-base", start, tip, check=False) != start:
+        return False, (f"not merged: the worktree's history was rewritten (HEAD no longer descends from "
+                       f"{start[:10]}, where the task started)")
+    changed = git_paths(wt, "diff", "--name-only", "--no-renames", f"{start}..{tip}")
+    # The worker's own scope check runs where the worker can commit, switch branches or edit what it
+    # reads: this one judges exactly the commit that gets merged.
+    stray = [f for f in changed if not any(owned(f, pat) for pat in task["owns"])]
+    if stray:
+        stray, _ = claim_unowned(job.id, task["id"], stray)
+    if stray:
+        return False, ("not merged, OUT OF SCOPE (files another task owns, shared hotspots or migrations): "
+                       + ", ".join(printable(f) for f in stray[:20]))
+    files = [printable(f) for f in git_paths(wt, "diff", "--name-only", f"{start}..{tip}")]
     if files:
         clear_unfinished_merge(integ)  # an earlier merge cut off mid-verify must not be concluded by this one
         clean_before = tracked_clean(integ)
-        p = subprocess.run(["git", *ident, "merge", "--no-ff", "--no-edit", "-m",
-                            f"orchestrate({job.id}): merge {task['id']}", res["branch"]],
-                           cwd=integ, capture_output=True, text=True)
+        p = subprocess.run([*jail.GIT, *ident, "merge", "--no-ff", "--no-edit", "-m",
+                            f"orchestrate({job.id}): merge {task['id']}", tip],
+                           cwd=integ, capture_output=True, encoding="utf-8", errors="replace")
         if p.returncode != 0:
             try:
                 ok, why = resolve_conflicts(job, plan, task, ident, merge_err=(p.stdout + p.stderr)[-1500:])
@@ -1383,7 +1470,7 @@ def commit_and_merge(job: Job, plan: dict, task: dict, res: dict,
     if remove_worktree:  # Orca-managed worktrees are removed through Orca instead
         git(repo, "worktree", "remove", "--force", str(wt), check=False)
     # files this task claimed because no task owned them now belong to it in the plan (P2.3)
-    mine = sorted(f for f, t in read_claims(job).items() if t == task["id"] and f in files)
+    mine = sorted(f for f, t in read_claims(job).items() if t == task["id"] and f in changed)
     if mine:
         task["owns"] = list(dict.fromkeys(task["owns"] + mine))
         job.state["tasks"][task["id"]]["claimed"] = mine
@@ -1413,14 +1500,13 @@ def clear_unfinished_merge(integ: Path, clean_before: bool = False) -> None:
 def resolve_conflicts(job: Job, plan: dict, task: dict, ident: list[str],
                       merge_err: str = "") -> tuple[bool, str]:
     integ = Path(job.state["integration_wt"])
-    conflicted = git(integ, "diff", "--name-only", "--diff-filter=U").splitlines()
+    conflicted = list(dict.fromkeys(git_paths(integ, "diff", "--name-only", "--diff-filter=U")))
     if not conflicted:  # git refused the merge for another reason: nothing for an integrator to do
         return False, f"git merge failed without a conflict: {merge_err.strip()[-800:]}"
     # Only content conflicts (both sides changed the file: UU, AA) can be judged by their markers.
     # Delete/modify, rename and the like leave no markers, so staging would "resolve" them by
     # whatever happens to be on disk: those go back to the manager instead.
-    kinds = {line[3:]: line[:2] for line in git(integ, "status", "--porcelain", "--untracked-files=no",
-                                                  "--", *conflicted, check=False).splitlines() if len(line) > 3}
+    kinds = {path: xy for xy, path in status_entries(integ, "--untracked-files=no")}
     structural = sorted(f for f in conflicted if kinds.get(f) not in ("UU", "AA"))
     if structural:
         return False, ("conflict git can't show with markers (" + ", ".join(f"{f}: {kinds.get(f, '?')}"
@@ -1471,7 +1557,7 @@ Reply with the JSON object: resolved (true|false), notes."""
     slot = next(i for i in range(len(busy) + 1) if i not in busy)
     env = {**os.environ, "ORCHESTRATE_SLOT": str(slot), "ORCHESTRATE_JOB": job.id, "ORCHESTRATE_TASK": task["id"]}
     for c in cmds:  # commit_and_merge aborts the merge if this is interrupted
-        code, out = sh(c, integ, 1800, env=env)
+        code, out = sh(c, integ, 1800, env=env, confine=confinement(plan))
         if code:
             job.state["tasks"][task["id"]]["merge_verify"] = {"cmd": c, "ok": False, "tail": out[-3000:],
                                                               "files": conflicted}
@@ -1501,7 +1587,7 @@ def verify_and_review(job: Job, plan: dict, rnd_no: int) -> tuple[dict, list[dic
     clear_unfinished_merge(integ)  # never verify or review a half-merged tree
     code, vout = 0, ""
     for c in plan["verify"]:
-        code, out = sh(c, integ, 1800)
+        code, out = sh(c, integ, 1800, confine=confinement(plan))
         vout += f"$ {c}\n{out[-4000:]}\n"
         if code:
             break
@@ -1564,8 +1650,9 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
     area = plan.get("area", "cross")
     union = sorted({p for t in plan["tasks"] for p in t["owns"]} | set(plan.get("review_may_edit", [])))
     log(f"review round {rnd_no}: {len(blocking)} blocking finding(s); running a fix subagent")
+    before = git(integ, "rev-parse", "HEAD")
     scope = (f"{shlex.quote(sys.executable)} {shlex.quote(str(HERE / 'orchestrate.py'))} scope-check "
-             + " ".join(f"--owns {shlex.quote(p)}" for p in union))
+             f"--base {shlex.quote(before)} " + " ".join(f"--owns {shlex.quote(p)}" for p in union))
     task = ("Fix these review findings on the integration branch of job "
             f"\"{job.id}\" ({plan['goal']}). Do not commit.\n\n"
             + fix_round_context(plan) + "\n## Findings to fix\n"
@@ -1575,14 +1662,18 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
     cmd = [sys.executable, str(HERE / "run_task.py"), "--repo", str(integ), "--type",
            f"bugfix:{area}", "--tier", "T2", "--no-baseline", "--max-escalations", "1",
            "--verify", scope, *sum((["--verify", v] for v in plan["verify"]), []),
-           "--start", "/".join(models.role("worker", plan)), task]
+           "--jail", jail.mode_of(plan), "--trusted-verify", scope,
+           "--start", "/".join(models.role("worker", plan)), "-"]
     if plan.get("max_model"):
         cmd[-1:-1] = ["--max-model", plan["max_model"]]
     left = budget_left(job, plan)
     if left is not None:
         cmd[-1:-1] = ["--budget-usd", f"{max(left, 0.01):.2f}"]
     with open(job.dir / "logs" / f"_fix-round-{rnd_no}.log", "a") as fh:
-        p = subprocess.run(cmd, cwd=integ, stdout=subprocess.PIPE, stderr=fh, text=True)
+        p = subprocess.run(cmd, cwd=integ, input=task, stdout=subprocess.PIPE, stderr=fh, encoding="utf-8",
+                           errors="replace")
+    if git(integ, "rev-parse", "HEAD") != before:
+        git(integ, "reset", "-q", "--soft", before)  # what it committed is judged like what it only edited
     s = extract_json(p.stdout) or {}
     for x in s.get("steps", []):
         record_call(job, "fix_round", {"total_cost_usd": (x.get("cost_usd") or 0) + (x.get("classifier_cost_usd") or 0),
@@ -1594,7 +1685,7 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
             + ", ".join(stray[:10]))
         job.state["review"]["rounds"][-1]["fix"]["not_committed"] = stray
         for f in stray:
-            if subprocess.run(["git", "cat-file", "-e", f"HEAD:{f}"], cwd=integ, capture_output=True).returncode == 0:
+            if subprocess.run([*jail.GIT, "cat-file", "-e", f"HEAD:{f}"], cwd=integ, capture_output=True).returncode == 0:
                 git(integ, "checkout", "HEAD", "--", f, check=False)
             else:
                 with contextlib.suppress(OSError):
@@ -1635,10 +1726,15 @@ def ui_capture_step(job: Job, plan: dict, rnd_no: int, rnd: dict, verify_ok: boo
             return ui
     root = integ / ".orchestrate" / "screenshots"
     kept = job.state.get("screenshots_root")
-    if kept and Path(kept) != root and Path(kept).is_dir():
-        # a resumed job after `clean`: bring the earlier rounds back next to the new one
-        ui_review.ensure_gitignore(integ)
-        move_screenshots(job, Path(kept), root)
+    try:
+        ui_review.ensure_gitignore(integ)  # refuses links: nothing below writes or deletes through one
+        if kept and Path(kept) != root and Path(kept).is_dir():
+            # a resumed job after `clean`: bring the earlier rounds back next to the new one
+            move_screenshots(job, Path(kept), root)
+    except (OSError, ui_review.UIUnavailable) as e:
+        ui["error"] = str(e)
+        job.save()
+        return ui
     job.state["screenshots_root"] = str(root)
     log(f"UI review (round {rnd_no}): dev server + screenshots")
     try:
@@ -2294,7 +2390,7 @@ def stale_doc_refs(integ: Path, base: str) -> list[str]:
     symbols depend on the language and match too much. A path counts only as a whole token
     (`api.py` is not named by `legacy_api.py`). Cleanup can't edit an untouched doc, so the
     reviewer gets these and a stale one becomes a small fix task."""
-    p = subprocess.run(["git", "-c", "core.quotePath=off", "diff", "-M", "--name-status", "-z", f"{base}..HEAD"],
+    p = subprocess.run([*jail.GIT, "-c", "core.quotePath=off", "diff", "-M", "--name-status", "-z", f"{base}..HEAD"],
                        cwd=integ, capture_output=True)
     fields = [x for x in p.stdout.decode("utf-8", errors="surrogateescape").split("\0")]
     gone, touched, i = [], set(), 0
@@ -2313,7 +2409,7 @@ def stale_doc_refs(integ: Path, base: str) -> list[str]:
                                      errors="surrogateescape") as fh:
         fh.write("\n".join(gone) + "\n")
     try:
-        out = subprocess.run(["git", "-c", "core.quotePath=off", "grep", "-n", "-F", "-f", fh.name, "--", "*.md"],
+        out = subprocess.run([*jail.GIT, "-c", "core.quotePath=off", "grep", "-n", "-F", "-f", fh.name, "--", "*.md"],
                              cwd=integ, capture_output=True).stdout.decode("utf-8", errors="replace")
     finally:
         os.unlink(fh.name)
@@ -2870,7 +2966,8 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
               + f"\n\nSee the job's changes with: git diff {base[:12]}..HEAD (read-only; ask nothing).")
     res = claude(prompt, m, e, integ, perm="acceptEdits", tools=["Read", "Edit", "Write", "Grep", "Glob"],
                  settings={"permissions": {"blockWritesOutsideWorkingDirectories": True}},
-                 schema=schemas.CLEANUP, budget_usd=budget_left(job, plan), timeout=1800)
+                 schema=schemas.CLEANUP, budget_usd=budget_left(job, plan), timeout=1800,
+                 confine=confinement(plan))
     record_call(job, "cleanup", res, None, f"{m}/{e}")
     out = {"config": f"{m}/{e}", "report": res.get("structured") or {}}
     new_files = untracked() - before
@@ -2893,7 +2990,7 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
                f"judged on): {outside[:10]}")
     else:
         for c in plan["verify"]:
-            code, vout = sh(c, integ, 1800)
+            code, vout = sh(c, integ, 1800, confine=confinement(plan))
             if code:
                 revert(f"verify failed after cleanup: `{c}`: {vout[-500:]}")
                 break
@@ -3741,12 +3838,21 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
             f"({job.state['base_sha'][:10]}) and won't include them")
     integ = ensure_integration(job)
     logf = job.dir / "logs" / "_integration.log"
-    ok, err = run_setup(plan.get("setup", []), integ, logf)
+    mode, why = jail.mode_of(plan), jail.available()
+    if mode == "required" and why:
+        return finish(job, plan, "environment",
+                      f'plan.sandbox is true, but {why}. Install bubblewrap (or drop "sandbox"), then '
+                      f"`orchestrate.py resume {job.id}`.")
+    job.state["unconfined"] = "plan.sandbox is false" if mode == "off" else why
+    if job.state["unconfined"]:
+        log(f"warning: workers are NOT confined ({job.state['unconfined']}): they can write anywhere you can")
+    confine = confinement(plan) if has_worker_code(job, integ) else None  # a resume; first time it's the user's code
+    ok, err = run_setup(plan.get("setup", []), integ, logf, confine)
     if not ok:
         return finish(job, plan, "environment", err)
     if not skip_baseline and not job.state.get("baseline_ok"):
         for c in plan.get("baseline", plan["verify"]):
-            code, out = sh(c, integ, 1800)
+            code, out = sh(c, integ, 1800, confine=confine)
             if code:
                 return finish(job, plan, "environment",
                               f"job baseline fails BEFORE any change: `{c}`\n{out[-3000:]}\n"
@@ -4081,6 +4187,8 @@ def skipped_checks(s: dict, plan: dict) -> list[str]:
             out.append(f"advisor final check: overridden by the user (--approve advisor:final), round {r.get('round')}")
     if s.get("baseline_skipped") and not s.get("baseline_ok"):
         out.append("job baseline: not run (--skip-baseline)")
+    if s.get("unconfined"):
+        out.append(f"worker confinement: none ({s['unconfined']}); workers could write outside their worktrees")
     gates = {t["id"] for t in plan.get("tasks", []) if t.get("gate")}
     out += [f"gate {g}: approved by the user" for g in s.get("approved") or []
             if g in gates and not g.startswith("advisor:")]
@@ -4707,6 +4815,10 @@ def cmd_run(a, resume: bool = False) -> int:
     if dash:
         log(f"dashboard: {dash}")
     mode = workers_mode(a, Job(plan["job"]))  # an existing job keeps the mode it started in
+    if (mode == "orca" or not a.detach) and not hold_job(plan["job"]):  # a detached child takes it itself
+        print(f"another orchestrate process is working on job {plan['job']}: `orchestrate.py status "
+              f"{plan['job']}`", file=sys.stderr)
+        return 2
     if mode == "orca":
         import orca_mode
         if a.detach:
@@ -4875,8 +4987,11 @@ def cmd_clean(a) -> int:
 
 
 def guard_hook_config() -> dict:
+    gate = shlex.quote(str(HERE / "approval_gate.py"))
+    # python3 exits 2 for a missing file, and exit 2 from a PreToolUse hook blocks the call: without
+    # the guard a removed or mid-update skill blocks every Bash command in every session.
     return {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
-        {"type": "command", "command": f"python3 {shlex.quote(str(HERE / 'approval_gate.py'))}"}]}]}}
+        {"type": "command", "command": f"[ ! -r {gate} ] || python3 {gate}"}]}]}}
 
 
 def claude_config_dir() -> Path:
@@ -4993,6 +5108,7 @@ def cmd_doctor(a) -> int:
     d = doctor(Path(a.repo).expanduser().resolve())
     print(f"scripts: {d['scripts']}")
     print(f"approval hook: {d['approval_hook'] or 'MISSING'}")
+    print(f"worker confinement: {'NONE: ' + jail.available() if jail.available() else 'bubblewrap'}")
     for e in d["errors"]:
         print(f"ERROR: {e}")
     for w in d["warnings"]:
@@ -5006,6 +5122,9 @@ def keep_screenshots(job: Job) -> Path | None:
     jobs/<job>/screenshots first and point the job state (report, dashboard) there."""
     old = job.state.get("screenshots_root")
     if not old or not Path(old).is_dir():
+        return None
+    if Path(old).is_symlink() or Path(old).parent.is_symlink():
+        log(f"not keeping screenshots: {old} goes through a link")  # its target isn't ours to move
         return None
     new = job.dir / "screenshots"
     if Path(old).resolve() == new.resolve():
@@ -5075,6 +5194,7 @@ def main(argv=None) -> int:
     cl = sub.add_parser("clean"); cl.add_argument("job"); cl.add_argument("--branches", action="store_true")
     sc = sub.add_parser("scope-check"); sc.add_argument("--owns", action="append", required=True)
     sc.add_argument("--job"); sc.add_argument("--task")
+    sc.add_argument("--base", help="also check what was committed since this commit")
     sub.add_parser("guard-hook", help="print the settings.json hook that routes approvals to the user")
     dr = sub.add_parser("doctor", help="check the install: claude on PATH (error), the approval hook (warning)")
     dr.add_argument("--repo", default=".")
@@ -5157,7 +5277,7 @@ def main(argv=None) -> int:
             for k, v in mt.items():
                 print(f"{k:30} {json.dumps(v) if isinstance(v, dict) else v}")
     elif a.cmd == "scope-check":
-        bad = scope_violations(Path.cwd(), a.owns)
+        bad = scope_violations(Path.cwd(), a.owns, base=a.base)
         granted: list[str] = []
         if bad and a.job and a.task:
             bad, granted = claim_unowned(a.job, a.task, bad)
@@ -5165,10 +5285,10 @@ def main(argv=None) -> int:
             print("OUT OF SCOPE: you changed files that another task owns, or that are shared "
                   "hotspots or migrations. Revert these (git checkout -- <f> or delete new files) "
                   "and report the need under open_issues instead:")
-            print("\n".join(f"  {b}" for b in bad))
-            print("You own: " + ", ".join(a.owns + granted))
+            print("\n".join(f"  {printable(b)}" for b in bad))
+            print("You own: " + ", ".join(printable(x) for x in a.owns + granted))
             return 1
-        print("scope ok" + (f" (claimed files no task owned: {', '.join(granted)})" if granted else ""))
+        print("scope ok" + (f" (claimed files no task owned: {', '.join(map(printable, granted))})" if granted else ""))
     return 0
 
 

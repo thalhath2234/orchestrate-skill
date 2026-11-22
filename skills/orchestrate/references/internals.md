@@ -161,6 +161,14 @@ Every child gets `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` unless the call passes `--
 
 A manager session started without these flags (an older job resumed) still lists the old tools, from its saved prompt, but the CLI refuses to run them.
 
+## Confinement
+
+`jail.py` wraps a command in `bwrap` with the host as it is, then read-only mounts (state dir, other checkouts, the common git dir, Claude Code's settings, hooks and skills, shell start-up files) and writable ones (the worktree, its git dir, objects). Ancestors the user owns become mount points, so none can be renamed away. `plan.sandbox`: absent = wherever bwrap works, `true` = required, `false` = off. What runs inside: worker attempts, their verify (not the harness's `--trusted-verify` scope check), setup and baseline once the tree holds worker code, resolution and final verify, the fix round, cleanup and the dev server. Orca starts its own workers, so only their verify is confined.
+
+The harness's git runs with `core.hooksPath=/dev/null` and `core.fsmonitor=false` (`jail.GIT`). Judgment calls pass `--setting-sources user` and get the committed CLAUDE.md through `project_rules`. A prompt over 100,000 bytes goes to `claude` on stdin, a brief always does.
+
+A job id belongs to one repo, and one process holds it (`jobs/.<id>.lock`).
+
 ## Hermetic calls
 
 `ORCHESTRATE_HERMETIC=1` makes every `claude_cli.call` add `--strict-mcp-config`, `--mcp-config '{"mcpServers":{}}'` and `disableAllHooks` merged into its `--settings` (so `blockWritesOutsideWorkingDirectories` stays), and the user's MCP servers and hooks don't load. CLAUDE.md, rules and other setting sources still load. It is off by default in jobs, though restricted calls never load MCP servers (above); `evals/run.py` sets it unless given `--no-hermetic`.

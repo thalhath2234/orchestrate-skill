@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/orchestrate/scripts/approval_gate.py\""
+            "command": "[ ! -r \"${CLAUDE_PLUGIN_ROOT}/skills/orchestrate/scripts/approval_gate.py\" ] || python3 \"${CLAUDE_PLUGIN_ROOT}/skills/orchestrate/scripts/approval_gate.py\""
           }
         ]
       }
