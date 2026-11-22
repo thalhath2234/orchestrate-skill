@@ -1342,6 +1342,78 @@ class OrchestrateTest(unittest.TestCase):
                 self.assertEqual(v["verdict"], "changes_requested")
                 self.assertTrue([f for f in v["findings"] if f["issue"] == f"edge case not handled: {case}"])
 
+    def test_a_word_match_never_lends_a_doubt_to_a_blocking_case(self):
+        case, other = "the update endpoint skips the owner check", "the delete endpoint skips the owner check"
+        for given, finding in (({"severity": "blocker"}, {"severity": "blocker", "confidence": "low"}),
+                               ({}, {"severity": "minor", "confidence": "high"}),
+                               ({}, {"severity": "major", "confidence": "low"}),
+                               ({"severity": "major"}, {"severity": "major", "confidence": "low"}),
+                               ({"severity": "blocker", "confidence": "high"}, {"severity": "blocker", "confidence": "high"})):
+            with self.subTest(given=given, finding=finding):
+                v = self.o.settle_verdict(self.o.enforce_edge_cases({"verdict": "pass",
+                    "findings": [{"file": "api.go", "issue": other, **finding}],
+                    "edge_cases": [{"case": case, "handled": False, "evidence": "api.go:40", **given}]}))
+                self.assertEqual(v["verdict"], "changes_requested")
+                added = [f for f in v["findings"] if f["issue"] == f"edge case not handled: {case}"]
+                self.assertEqual(len(added), 1, "a different bug that shares most words is still reported")
+                self.assertEqual(added[0].get("possible_duplicate_of"), other)
+        for given in ({"severity": "major", "confidence": "low"}, {"severity": "minor"}):
+            v = self.o.settle_verdict(self.o.enforce_edge_cases({"verdict": "pass",
+                "findings": [{"file": "api.go", "issue": other, "severity": "major", "confidence": "low"}],
+                "edge_cases": [{"case": case, "handled": False, "evidence": "api.go:40", **given}]}))
+            self.assertEqual(v["verdict"], "pass", "the case's own doubt doesn't block")
+
+    def test_binary_data_under_a_code_name_blocks_whatever_git_calls_it(self):
+        import gzip
+        import io
+        import zipfile
+        z = io.BytesIO()
+        with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as f:
+            f.writestr("__main__.py", "print('x')\n")
+        late = b"# padding line\n" * 600 + z.getvalue()
+        blob = bytes(range(256)) * 8
+        for files, bad in (({"auth.go": blob, ".gitattributes": "*.go diff\n"}, "auth.go"),
+                           ({"auth.go": blob, ".gitattributes": "* text diff\n"}, "auth.go"),
+                           ({"run.sh": gzip.compress(b"echo hi\n" * 50), ".gitattributes": "*.sh diff\n"}, "run.sh"),
+                           ({"tool.py": late}, "tool.py"),
+                           ({"tool.py": late + b"# trailer\n" * 900}, "tool.py"),
+                           ({"big.py": b"# padding line\n" * 80000 + blob}, "big.py"),
+                           ({"tiny.sh": b"# padding\n" * 900 + gzip.compress(b"echo x\n", mtime=0)}, "tiny.sh"),
+                           ({"bin/tool": b"#!/usr/bin/env python3\n" + late}, "bin/tool")):
+            with self.subTest(sorted(files)):
+                job, wt, base = self._changed(files)
+                self.assertEqual([f["file"] for f in self.o.unreadable_code(wt, base)], [bad])
+
+    def test_readable_code_of_any_encoding_does_not_block(self):
+        sql = "SELECT name FROM users;\n" * 40
+        for name, body in (("u16.sql", sql.encode("utf-16")), ("latin.py", ("# Gr\u00fc\u00dfe\n" * 90).encode("latin-1")),
+                           ("sjis.py", ("# \u65e5\u672c\u8a9e\u306e\u8aac\u660e\n" * 90).encode("shift_jis")),
+                           ("ansi.sh", b"printf '\x1b[31mred\x1b[0m'\n" * 90), ("two.go", b"// a\x00b\x00\n"),
+                           ("min.js", b"var a=1;" * 9000), ("logo.png", b"\x89PNG\r\n" + bytes(range(256)) * 8),
+                           ("crlf.bat", b"echo hi\r\n\x0c" * 90)):
+            with self.subTest(name):
+                job, wt, base = self._changed({name: body})
+                self.assertEqual(self.o.unreadable_code(wt, base), [])
+
+    def test_an_areas_second_turn_never_drops_what_its_first_found(self):
+        job, wt, base = self._changed({"auth.go": "package auth\n" + "// line\n" * 40})
+        bug = {"severity": "major", "confidence": "high", "file": "auth.go", "issue": "owner never checked"}
+        self._replies(self._good_review(edge_cases=[], findings=[bug]), self._good_review())
+        v = self.o.review(job, {**self._review_plan(), "review_diff_chars": 80}, "ok")
+        self.assertEqual(v["verdict"], "changes_requested")
+
+    def test_files_with_no_behaviour_need_no_edge_cases(self):
+        job, wt, base = self._changed({".gitignore": "dist/\n", "web/pnpm-lock.yaml": "lockfileVersion: 9\n",
+                                       "go.sum": "x v1 h1:a=\n"})
+        seen = self._replies(self._good_review(edge_cases=[]))
+        self.assertEqual(self.o.review(job, self._review_plan(), "ok")["verdict"], "pass")
+        self.assertEqual(len(seen), 1)
+
+    def test_common_filler_is_no_evidence(self):
+        import schemas
+        for word in ("LGTM", "ok ok", "trust me", "none found", "see the diff", "by inspection"):
+            self.assertFalse(schemas.has_evidence(word), word)
+
     def test_placeholder_evidence_is_no_evidence(self):
         import run_task
         for word in ("none", "N/A", "done", "Yes.", "works", "verified", "looks good", "TODO", "----"):

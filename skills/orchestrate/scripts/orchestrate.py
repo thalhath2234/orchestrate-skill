@@ -2332,10 +2332,10 @@ def enforce_edge_cases(v: dict) -> dict:
     """An edge case the reviewer marked unhandled must surface as a finding: if no finding names
     it, add one at the severity (major when it gave none) and confidence the reviewer gave the
     case, so `pass` can't coexist with a known hole, while a minor gap or a doubt the reviewer
-    marked `low` doesn't block. An added case with no confidence blocks. A case that one finding
-    names by itself (60% of its words, whole) is not added, and lends it what the case left out.
-    Except: a case that blocks is only covered by a finding that blocks, so a word match can
-    repeat a blocker but never lose one."""
+    marked `low` doesn't block. A case is judged by its own fields alone: no confidence blocks.
+    One that doesn't block isn't added when one finding names it (60% of its words, whole). One
+    that blocks needs a finding that blocks and has every one of its words; a looser match is
+    only a tag (possible_duplicate_of), because two bugs can share most of their words."""
     added = []
     findings = [f for f in v.get("findings") or [] if isinstance(f, dict)]
     for ec in v.get("edge_cases") or []:
@@ -2343,15 +2343,15 @@ def enforce_edge_cases(v: dict) -> dict:
             continue
         case = str(ec.get("case", "")).strip()
         named = [f for f in findings if _names_case(f, case)]
-        if named:
-            f = next(iter(blocking_findings(named)), named[0])
-            as_judged = {"severity": ec.get("severity") or f.get("severity") or "major",
-                         "confidence": ec.get("confidence") or f.get("confidence")}
-            if blocking_findings([f]) or not blocking_findings([as_judged]):
-                continue  # a finding already covers it
+        blocks = blocking_findings([{"severity": ec.get("severity") or "major", "confidence": ec.get("confidence")}])
+        if named and not blocks:
+            continue  # a finding already covers it
+        if any(_names_case(f, case, share=1.0) for f in blocking_findings(named)):
+            continue
         added.append({"severity": ec.get("severity") or "major", "file": ec.get("file", ""),
                       **({"confidence": ec["confidence"]} if ec.get("confidence") else {}),
                       "issue": f"edge case not handled: {case}",
+                      **({"possible_duplicate_of": str(named[0].get("issue") or "")[:200]} if named else {}),
                       "suggestion": str(ec.get("evidence", ""))[:500]})
     if added:
         v = {**v, "findings": list(v.get("findings") or []) + added}
@@ -2360,12 +2360,12 @@ def enforce_edge_cases(v: dict) -> dict:
     return v
 
 
-def _names_case(f: dict, case: str) -> bool:
+def _names_case(f: dict, case: str, share: float = 0.6) -> bool:
     words = _issue_words(case)
     said = set(_issue_words(f"{f.get('file', '')} {f.get('issue', '')}"))
     if len(words) < 2:  # one word names nothing by itself
         return bool(case) and case.lower() == str(f.get("issue", "")).strip().lower()
-    return sum(w in said for w in words) / len(words) >= 0.6
+    return sum(w in said for w in words) / len(words) >= share
 
 
 def _issue_words(text) -> list[str]:
@@ -2507,15 +2507,43 @@ CODE_FILE = re.compile(
     r"\.(?:[cm]?[jt]sx?|py|pyw|go|rs|rb|php|java|kts?|scala|swift|dart|c|h|cc|cpp|cxx|hpp|cs|fs|vb|mm?|lua|pl|pm"
     r"|r|jl|exs?|erl|hs|clj|sh|bash|zsh|fish|ps1|bat|cmd|sql|vue|svelte|astro|html?|css|scss|json|ya?ml|toml"
     r"|xml|gradle|tf|proto|graphql)$|(?:^|/)(?:Makefile|Dockerfile|Jenkinsfile)$", re.I)
-NOT_BEHAVIOUR = re.compile(r"\.(?:md|mdx|rst|adoc|txt|png|jpe?g|gif|webp|ico|pdf)$|(?:^|/)(?:LICENSE|NOTICE)$", re.I)
+NOT_BEHAVIOUR = re.compile(
+    r"\.(?:md|mdx|rst|adoc|txt|png|jpe?g|gif|webp|ico|pdf)$|(?:^|/)(?:LICENSE|NOTICE|\.gitignore|\.gitkeep"
+    r"|\.editorconfig|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|go\.sum|Cargo\.lock|poetry\.lock|uv\.lock)$", re.I)
 CLEANUP_DIFF_MAX = 60000
 _NOT_TEXT = bytes(b for b in range(32) if b not in b"\t\n\r\f\v\b\x1b")
 
 
 def looks_text(data: bytes) -> bool:
     """Text even with a few NULs planted in it, which is all it takes for git to call it binary."""
-    data = data[:1_000_000]
-    return len(data) - len(data.translate(None, _NOT_TEXT)) <= max(4, len(data) // 50)
+    data = _utf8(data[:1_000_000])
+    return _controls(data) <= max(4, len(data) // 50)
+
+
+def readable(data: bytes) -> bool:
+    """looks_text all the way through: no stretch of data (a zip after 8 KB of comments, which
+    Python runs and git calls text). High bytes don't count: Latin-1 and Shift-JIS are text."""
+    if _controls(data) <= 4:
+        return True
+    data = _utf8(data)
+    if _controls(data) <= 4:
+        return True
+    return (_controls(data) <= len(data) // 50
+            and all(_controls(data[i:i + 512]) <= 8 for i in range(0, len(data), 256)))
+
+
+def _controls(data: bytes) -> int:
+    return len(data) - len(data.translate(None, _NOT_TEXT))
+
+
+def _utf8(data: bytes) -> bytes:
+    """UTF-16 with a BOM that holds mostly ASCII, as UTF-8: the diff shows that readably."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        with contextlib.suppress(UnicodeDecodeError):
+            s = data[:len(data) // 2 * 2].decode("utf-16")
+            if sum(c < "\x80" for c in s) >= 0.8 * len(s):
+                return s.encode("utf-8")
+    return data
 
 
 def binary_changes(cwd: Path, base: str, paths=()) -> tuple[list[str], list[str]]:
@@ -2547,12 +2575,27 @@ def review_diff(cwd: Path, base: str, paths=()) -> str:
 
 
 def unreadable_code(cwd: Path, base: str) -> list[dict]:
-    """A blocker per changed code file that no diff can show."""
-    return [{"severity": "blocker", "confidence": "high", "file": printable(f),
-             "issue": f"{printable(f)} is binary data under a code file's name, so no reviewer saw the change",
-             "suggestion": "Commit it as plain UTF-8 text, or under an extension that says it is binary."}
-            for f in binary_changes(cwd, base)[1] if CODE_FILE.search(f)
-            and git(cwd, "--literal-pathspecs", "ls-tree", "--name-only", "HEAD", "--", f)]
+    """A blocker per changed code file holding data no reviewer can read: code by its name, its
+    exec bit or a #! line. Judged on the committed bytes: what git calls binary is the branch's
+    choice (`*.go diff`), and git itself only looks at the first 8000 bytes."""
+    bad = []
+    for f in git_paths(cwd, "diff", "--name-only", "--no-renames", "--diff-filter=AMT", f"{base}..HEAD"):
+        named = bool(CODE_FILE.search(f))
+        if not named and NOT_BEHAVIOUR.search(f):
+            continue
+        mode = (git(cwd, "--literal-pathspecs", "ls-tree", "HEAD", "--", f).split() or [""])[0]
+        if mode not in ("100644", "100755"):
+            continue  # a link or a submodule: the diff shows all there is
+        if not named and mode != "100755" and "." in f.rsplit("/", 1)[-1]:
+            continue
+        data = subprocess.run([*jail.GIT, "cat-file", "blob", b"HEAD:" + os.fsencode(f)], cwd=cwd,
+                              capture_output=True).stdout
+        if (named or mode == "100755" or data.startswith(b"#!")) and not readable(data):
+            bad.append({"severity": "blocker", "confidence": "high", "file": printable(f),
+                        "issue": f"{printable(f)} holds binary data under a code file's name, so no reviewer "
+                                 "could read the change",
+                        "suggestion": "Commit it as plain UTF-8 text, or under an extension that says it is binary."})
+    return bad
 
 
 def clipped(text: str, limit: int) -> str:
@@ -2739,7 +2782,7 @@ every finding in `findings`."""
 def review_by_area(job: Job, plan: dict, verify_out: str, limit: int, stale: list[str] | None = None,
                    keep: dict | None = None) -> dict:
     """Big diffs: one reviewer per area in parallel, then an integration reviewer over their
-    verdicts and the cross-area interface surface (meta-review, P3.3). Nothing is truncated away."""
+    verdicts and the cross-area interface surface (meta-review, P3.3). An area diff over the limit is cut, naming the files to Read."""
     integ = Path(job.state["integration_wt"])
     base = job.state["base_sha"]
     changed = git_paths(integ, "diff", "--name-only", "--no-renames", f"{base}..HEAD")

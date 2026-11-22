@@ -293,7 +293,8 @@ NO_EVIDENCE = frozenset((
     "yes", "true", "okay", "pass", "passed", "passes", "done", "works", "working", "verified", "checked",
     "tested", "confirmed", "complete", "completed", "implemented", "handled", "fixed", "fine", "good",
     "correct", "looks good", "looks fine", "all good", "it works", "see above", "as above", "same as above",
-    "see diff", "see code", "evidence"))
+    "see diff", "see code", "evidence", "lgtm", "ok ok", "trust me", "none found", "nothing found", "see the diff",
+    "see the code", "by inspection", "code inspection"))
 
 
 def has_evidence(value) -> bool:
