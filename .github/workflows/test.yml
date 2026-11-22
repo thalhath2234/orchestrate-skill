@@ -37,4 +37,11 @@ jobs:
       # runner images ship Chrome; fail here if that ever stops being true.
       - name: Chrome is installed
         run: python3 skills/orchestrate/scripts/ui_review.py chrome
+      # Without a working bwrap the jail tests skip and workers would run unconfined: make it work,
+      # then fail here if it doesn't.
+      - name: Bubblewrap works
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 || true
+          python3 -c "import sys; sys.path.insert(0, 'skills/orchestrate/scripts'); import jail; sys.exit(jail.available())"
       - run: make test

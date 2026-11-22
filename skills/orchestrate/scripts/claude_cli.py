@@ -32,17 +32,23 @@ error_kind: None | timeout | budget | max_turns | overloaded | rate_limit | api 
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
+
+import jail
 
 OVERLOAD_RE = re.compile(r"overloaded_error|\b529\b|Overloaded", re.I)
 RATE_RE = re.compile(r"rate_limit_error|\b429\b|rate limit", re.I)
 
 
+# Linux refuses a single argument of 128 KiB or more (MAX_ARG_STRLEN, in bytes): longer prompts go on stdin.
+ARG_PROMPT_MAX = 100_000
 NO_ADVISOR = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL"
 READ_ONLY = ["Read", "Grep", "Glob"]
 
@@ -112,6 +118,70 @@ def _parse(stdout: str):
     return d
 
 
+RULES_MAX_BYTES = 60_000  # one argument, so well under ARG_PROMPT_MAX
+
+
+def project_rules(cwd: Path) -> str:
+    """The repo's committed CLAUDE.md (or .claude/CLAUDE.md) and the files it imports with an
+    `@path` line, from the main checkout's HEAD: the user's own rules, never the copy on a branch
+    workers wrote. "" when there is none."""
+    def git(at, *args):
+        try:
+            p = subprocess.run([*jail.GIT, *args], cwd=at, capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return p.stdout.decode("utf-8", "replace") if p.returncode == 0 else ""
+
+    main = git(cwd, "worktree", "list", "--porcelain").split("\n", 1)[0]
+    if not main.startswith("worktree ") or not Path(main[9:]).is_dir():
+        return ""
+    root = Path(main[9:])
+    for name in ("CLAUDE.md", ".claude/CLAUDE.md"):
+        text = git(root, "show", f"HEAD:{name}")
+        if text:
+            parts = [text]
+            for line in text.splitlines():
+                ref = line.strip()
+                if re.fullmatch(r"@[\w./-]+", ref) and ".." not in ref and not ref.startswith("@/"):
+                    body = git(root, "show", f"HEAD:{ref[1:].lstrip('./') if ref.startswith('@./') else ref[1:]}")
+                    if body:
+                        parts.append(f"## {ref[1:]}\n{body}")
+            body = "\n\n".join(parts).replace("\x00", "").encode("utf-8")[:RULES_MAX_BYTES].decode("utf-8", "ignore")
+            return "The repository's project instructions (the user's committed CLAUDE.md):\n\n" + body
+    return ""
+
+
+REFRESH_S = 240  # the CLI refreshes a login in its last 5 minutes
+
+
+def refresh_login() -> None:
+    """The jail can't save a refreshed login, so a free command refreshes it out here; the jailed
+    CLI reads the replaced file before its next request. Output (the account's email) is discarded,
+    and the cwd is the home: a worktree's settings could run hooks."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run([claude_bin(), "auth", "status"], cwd=Path.home(), env=child_env(),
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+
+
+@contextlib.contextmanager
+def login_kept_fresh(on: bool):
+    if not on:
+        yield
+        return
+    done = threading.Event()
+
+    def keep() -> None:
+        while not done.wait(REFRESH_S):
+            refresh_login()
+
+    refresh_login()
+    threading.Thread(target=keep, daemon=True).start()
+    try:
+        yield
+    finally:
+        done.set()
+
+
 def child_env(extra_args: list[str] | None = None) -> dict:
     """The environment for one claude child: no advisor tool unless this call asked for one."""
     env = dict(os.environ)
@@ -126,8 +196,10 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
          resume: str | None = None, timeout: int = 3600, settings: dict | None = None,
          schema: dict | None = None, budget_usd: float | None = None,
          extra_args: list[str] | None = None, retries: int | None = None,
-         only: list[str] | None = None) -> dict:
-    cmd = [claude_bin(), "-p", prompt, "--model", model, "--effort", effort,
+         only: list[str] | None = None, confine: Path | None = None) -> dict:
+    prompt = prompt.replace("\x00", "\ufffd")  # no argument can hold a NUL
+    piped = prompt if len(prompt.encode("utf-8", "replace")) > ARG_PROMPT_MAX else None
+    cmd = [claude_bin(), "-p", *([prompt] if piped is None else []), "--model", model, "--effort", effort,
            "--output-format", "json", "--permission-mode", perm]
     hermetic = os.environ.get("ORCHESTRATE_HERMETIC") == "1"
     if hermetic:
@@ -136,6 +208,11 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
         cmd += ["--settings", json.dumps(settings)]
     if only is not None:
         cmd += ["--tools", ",".join(only)]  # "" is no built-in tools; --json-schema still works
+        # the cwd is a tree workers wrote: its .claude/settings.json could run hooks in this call
+        cmd += ["--setting-sources", "user"]
+        rules = project_rules(cwd) if only else ""  # that flag also drops the project's CLAUDE.md
+        if rules:
+            cmd += ["--append-system-prompt", rules]
     if hermetic or only is not None:  # --tools doesn't cover MCP tools
         cmd += ["--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": {}})]
     if tools:
@@ -148,6 +225,8 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
         cmd += ["--max-budget-usd", f"{max(budget_usd, 0.01):.2f}"]
     cmd += extra_args or []
     env = child_env(extra_args)
+    if confine:
+        cmd = jail.wrap(cmd, cwd, confine)
     tries = int(os.environ.get("ORCHESTRATE_API_RETRIES", "3")) if retries is None else retries
     backoff = float(os.environ.get("ORCHESTRATE_API_BACKOFF_S", "20"))
     data: dict = {}
@@ -156,7 +235,9 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
     for attempt in range(max(tries, 0) + 1):
         t0 = time.time()
         try:
-            p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+            with login_kept_fresh(bool(confine)):
+                p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, input=piped, encoding="utf-8",
+                                   errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
             return {"is_error": True, "error_kind": "timeout", "timeout": True,
                     "result": f"claude timed out after {timeout}s", "structured": None,

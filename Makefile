@@ -7,6 +7,7 @@ test:
 	python3 tests/test_routing.py
 	python3 tests/test_orchestrate.py
 	python3 tests/test_evals.py
+	python3 tests/test_jail.py
 	python3 tests/test_ui_review.py
 	python3 tests/test_dashboard.py
 	python3 tests/test_packaging.py

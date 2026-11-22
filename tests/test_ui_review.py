@@ -561,6 +561,8 @@ def real_chrome():
 class RealChromeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="ui-real-"))
+        os.environ["ORCHESTRATE_SANDBOX_WRITE"] = str(self.tmp)  # the fake servers' scripts live here
+        self.addCleanup(os.environ.pop, "ORCHESTRATE_SANDBOX_WRITE", None)
         self.wt = self.tmp / "wt"
         self.wt.mkdir()
         (self.wt / "index.html").write_text(SITE)
@@ -914,6 +916,8 @@ class RealChromeEvidenceTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="ui-evid-"))
+        os.environ["ORCHESTRATE_SANDBOX_WRITE"] = str(self.tmp)  # the fake servers' scripts live here
+        self.addCleanup(os.environ.pop, "ORCHESTRATE_SANDBOX_WRITE", None)
         self.wt = self.tmp / "wt"
         self.wt.mkdir()
         self.job = SimpleNamespace(dir=self.tmp / "job", state={"integration_wt": str(self.wt)})

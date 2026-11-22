@@ -37,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_cli  # noqa: E402
+import jail  # noqa: E402
 import models  # noqa: E402
 import router  # noqa: E402
 import schemas  # noqa: E402
@@ -59,19 +60,23 @@ def log(msg: str) -> None:
     print(f"[run_task] {msg}", file=sys.stderr, flush=True)
 
 
-def sh(cmd: str, cwd: Path, timeout: int) -> tuple[bool, str]:
+def sh(cmd: str, cwd: Path, timeout: int, confine: Path | None = None) -> tuple[bool, str]:
     try:
-        p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True,
+        p = subprocess.run(jail.shell(cmd, cwd, confine), cwd=cwd, capture_output=True, encoding="utf-8", errors="replace",
                            timeout=timeout)
         return p.returncode == 0, (p.stdout + p.stderr)
     except subprocess.TimeoutExpired as e:
-        return False, f"TIMEOUT after {timeout}s: {cmd}\n{e.stdout or ''}{e.stderr or ''}"
+        out, err = ((x.decode("utf-8", "replace") if isinstance(x, bytes) else (x or "")) for x in (e.stdout, e.stderr))
+        return False, f"TIMEOUT after {timeout}s: {cmd}\n{out}{err}"
 
 
-def verify(cmds: list[str], cwd: Path, timeout: int) -> tuple[bool, str]:
+def verify(cmds: list[str], cwd: Path, timeout: int, confine: Path | None = None,
+           trusted: list[str] | tuple = ()) -> tuple[bool, str]:
+    """`confine`: run in the jail (they run code a worker wrote). `trusted`: the harness's own
+    commands (the scope check), which write the state the jail protects."""
     out = []
     for c in cmds:
-        ok, text = sh(c, cwd, timeout)
+        ok, text = sh(c, cwd, timeout, None if c in trusted else confine)
         out.append(f"$ {c}\n{text[-6000:]}")
         if not ok:
             return False, "\n".join(out)
@@ -113,14 +118,15 @@ def env_signature(vout: str, verify_cmds: list[str]) -> str | None:
 def claude(prompt: str, model: str, effort: str, cwd: Path, *, perm: str,
            tools: list[str], resume: str | None, timeout: int, settings: dict | None = None,
            schema: dict | None = None, budget_usd: float | None = None,
-           extra_args: list[str] | None = None, only: list[str] | None = None) -> dict:
+           extra_args: list[str] | None = None, only: list[str] | None = None,
+           confine: Path | None = None) -> dict:
     return claude_cli.call(prompt, model, effort, cwd, perm=perm, tools=tools, resume=resume,
                            timeout=timeout, settings=settings, schema=schema,
-                           budget_usd=budget_usd, extra_args=extra_args, only=only)
+                           budget_usd=budget_usd, extra_args=extra_args, only=only, confine=confine)
 
 
 def git(repo: Path, *args: str) -> str:
-    ok, out = sh("git " + " ".join(shlex.quote(a) for a in args), repo, 60)
+    ok, out = sh(" ".join(shlex.quote(a) for a in [*jail.GIT, *args]), repo, 60)
     return out if ok else ""
 
 
@@ -264,7 +270,7 @@ Do not commit.
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("task", help="the task prompt")
+    ap.add_argument("task", help="the task prompt, or - to read it from stdin (it has no size limit there)")
     ap.add_argument("--type", required=True, help="<category>:<area>, e.g. bugfix:api")
     ap.add_argument("--tier", required=True, choices=router.TIER_DEFAULT)
     ap.add_argument("--repo", type=Path, default=Path.cwd())
@@ -306,10 +312,16 @@ def main(argv=None) -> int:
                     help="never route or escalate above this model (e.g. opus: no Fable)")
     ap.add_argument("--advisor", choices=["sonnet", "opus", "fable"],
                     help="let the worker consult this model at decision points (claude --advisor)")
+    ap.add_argument("--jail", choices=jail.MODES, default="auto",
+                    help="confine the worker and verify commands with bubblewrap (default: where it works)")
+    ap.add_argument("--trusted-verify", action="append", default=[], metavar="CMD",
+                    help="a verify command of the harness's own, run outside the jail")
     ap.add_argument("--start", metavar="MODEL/EFFORT",
                     help="start config before learned floors (default: the worker role, opus/medium)")
     ap.add_argument("--dry-run", action="store_true", help="only print the routing decision")
     a = ap.parse_args(argv)
+    if a.task == "-":
+        a.task = sys.stdin.buffer.read().decode("utf-8", "replace")
     repo = a.repo.expanduser().resolve()
     router.validate_type(a.type)
     # the worker is told to run the verify commands itself, so it must be allowed to
@@ -324,8 +336,15 @@ def main(argv=None) -> int:
         print(json.dumps(decision))
         return 0
 
+    try:
+        confine = jail.confinement("required" if a.sandbox else a.jail, router.DIR)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 3
+    if a.jail != "off" and not confine:
+        log(f"warning: the worker is NOT confined: {jail.available()}")
     if not a.no_baseline:
-        ok, out = verify(a.baseline or a.verify, repo, a.verify_timeout)
+        ok, out = verify(a.baseline or a.verify, repo, a.verify_timeout, confine, a.trusted_verify)
         if not ok:
             log("baseline check FAILS before any change -> environment problem; not starting.")
             print(out[-3000:], file=sys.stderr)
@@ -335,7 +354,9 @@ def main(argv=None) -> int:
 
     settings = {"permissions": {"blockWritesOutsideWorkingDirectories": True}}
     if a.sandbox:
-        settings["sandbox"] = {"enabled": True, "autoAllowBashIfSandboxed": True}
+        # strict: otherwise a command leaves the sandbox with dangerouslyDisableSandbox
+        settings["sandbox"] = {"enabled": True, "autoAllowBashIfSandboxed": True,
+                               "allowUnsandboxedCommands": False, "failIfUnavailable": True}
     rung, probe, hint = decision["rung"], decision["probe"], ""
     summary = {"task_id": task_id, "type": a.type, "tier": a.tier, "steps": [], "proposals": []}
     advisor_off = None  # set when a launch failed because of the advisor: run on without it
@@ -357,7 +378,7 @@ def main(argv=None) -> int:
             log(f"attempt {attempt}/{a.attempts} at {model}/{effort}"
                 + (f" (advisor {adv[1]})" if adv else ""))
             kw = dict(perm=a.permission_mode, tools=a.allowed_tools, resume=session,
-                      timeout=a.claude_timeout, settings=settings, schema=report_schema)
+                      timeout=a.claude_timeout, settings=settings, schema=report_schema, confine=confine)
             worker = claude(prompt, model, effort, repo, budget_usd=remaining(),
                             extra_args=extra + models.fallback_args(model) + adv, **kw)
             if adv and worker.get("error_kind") in ("exec", "unparseable") \
@@ -383,7 +404,7 @@ def main(argv=None) -> int:
             if worker.get("is_error"):
                 vout = str(worker.get("result"))
                 break
-            ok, vout = verify(a.verify, repo, a.verify_timeout)
+            ok, vout = verify(a.verify, repo, a.verify_timeout, confine, a.trusted_verify)
             if ok and a.done_ids:
                 gaps = done_gaps(worker.get("structured"), a.done_ids)
                 if gaps:

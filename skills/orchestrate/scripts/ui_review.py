@@ -52,6 +52,9 @@ import urllib.request
 from collections import deque
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import jail  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
@@ -479,7 +482,7 @@ class Chrome:
             launcher = ("import os,sys\nr,w=int(sys.argv[1]),int(sys.argv[2])\nos.dup2(r,3)\nos.dup2(w,4)\n"
                         "os.close(r)\nos.close(w)\nos.execv(sys.argv[3],sys.argv[3:])")
             try:
-                self.proc = subprocess.Popen([sys.executable, "-c", launcher, str(child[0]), str(child[1]),
+                self.proc = subprocess.Popen([sys.executable, "-I", "-c", launcher, str(child[0]), str(child[1]),
                                               self.binary, *args], stdout=self._log, stderr=subprocess.STDOUT,
                                              stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=child)
             except OSError as e:
@@ -1053,6 +1056,12 @@ def port_taken(url: str, timeout: float = 1.0) -> str | None:
     return None
 
 
+def _confine(plan: dict) -> Path | None:
+    """The dev command runs code workers wrote: jailed like their verify commands."""
+    import router
+    return jail.confinement(jail.mode_of(plan), router.DIR)
+
+
 def _lock_path() -> Path:
     import router
     return router.DIR / "devserver.lock"
@@ -1157,7 +1166,7 @@ def group_alive(p: subprocess.Popen) -> bool:
 
 @contextlib.contextmanager
 def dev_server(cmd: str, url: str, cwd: Path, log_path: Path, ready_timeout: float = DEFAULT_READY_TIMEOUT_S,
-               lock_path: Path | None = None, lock_wait: float = LOCK_WAIT_S):
+               lock_path: Path | None = None, lock_wait: float = LOCK_WAIT_S, confine: Path | None = None):
     """Run the dev command until the block ends. One dev server per state dir at a time (a flock);
     refuses to start when anything accepts connections on url's port (it would screenshot other
     code); the command runs in its own process group, which is killed afterwards, also on
@@ -1190,7 +1199,7 @@ def dev_server(cmd: str, url: str, cwd: Path, log_path: Path, ready_timeout: flo
                 logf.write(f"\n$ {cmd}   (cwd {cwd}, {time.strftime('%Y-%m-%d %H:%M:%S')})\n".encode())
                 logf.flush()
                 log_from = logf.tell()
-                p = subprocess.Popen(cmd, shell=True, cwd=str(cwd), stdout=logf, stderr=subprocess.STDOUT,
+                p = subprocess.Popen(jail.shell(cmd, cwd, confine), cwd=str(cwd), stdout=logf, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL, start_new_session=True,
                                      env={**os.environ, "BROWSER": "none"})
                 _register(p, "dev server")
@@ -1349,7 +1358,7 @@ def check_alive(p: subprocess.Popen, url: str, log_path: Path) -> None:
 # --- the worktree the dev server runs in: whatever it writes there is put back afterwards ---
 def _status(wt: Path) -> dict[str, str] | None:
     """{path: XY} of every changed or untracked (not ignored) path, or None outside a git work tree."""
-    r = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=wt,
+    r = subprocess.run([*jail.GIT, "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=wt,
                        capture_output=True)
     if r.returncode != 0:
         return None
@@ -1398,12 +1407,16 @@ def restore_worktree(wt: Path, snap: dict | None) -> list[str]:
     fixed = []
     for path in sorted(set(now) | set(snap)):
         f = wt / path
+        if not f.parent.resolve().is_relative_to(wt.resolve()):
+            continue  # the dev command swapped a directory for a link: never write or delete through it
         before = snap.get(path)
         if before is not None:
             if _digest(f) == before["hash"] and f.exists() == before["exists"]:
                 continue
             if before["data"] is not None:
                 f.parent.mkdir(parents=True, exist_ok=True)
+                if f.is_symlink():
+                    f.unlink()  # its target isn't ours to overwrite
                 f.write_bytes(before["data"])
                 fixed.append(path)
             elif not before["exists"]:
@@ -1411,9 +1424,9 @@ def restore_worktree(wt: Path, snap: dict | None) -> list[str]:
                     f.unlink()
                 fixed.append(path)
             continue
-        tracked = subprocess.run(["git", "cat-file", "-e", f"HEAD:{path}"], cwd=wt, capture_output=True).returncode == 0
+        tracked = subprocess.run([*jail.GIT, "cat-file", "-e", f"HEAD:{path}"], cwd=wt, capture_output=True).returncode == 0
         if tracked:
-            subprocess.run(["git", "checkout", "HEAD", "--", path], cwd=wt, capture_output=True)
+            subprocess.run([*jail.GIT, "checkout", "HEAD", "--", path], cwd=wt, capture_output=True)
         else:
             with contextlib.suppress(OSError):
                 if f.is_dir() and not f.is_symlink():
@@ -1436,8 +1449,12 @@ def ensure_gitignore(integ: Path) -> Path:
     """<wt>/.orchestrate/ with a .gitignore of "*": nothing under it ever shows in git status,
     scope checks or commits, without touching the repo's own .gitignore."""
     d = Path(integ) / ".orchestrate"
-    d.mkdir(parents=True, exist_ok=True)
     gi = d / ".gitignore"
+    for p in (d, gi, d / "screenshots"):
+        if p.is_symlink() or (p.exists() and p.is_dir() == (p == gi)):
+            raise UIUnavailable(f"{p.relative_to(integ)} in the branch is a link or not what the harness keeps "
+                                "there: refusing to write or delete through it")
+    d.mkdir(parents=True, exist_ok=True)
     if not gi.exists() or gi.read_text().strip() != "*":
         gi.write_text("*\n")
     return d
@@ -1546,6 +1563,8 @@ def capture(plan: dict, job_like, round_no: int, chrome: str | None = None) -> d
     integ = Path(job_like.state["integration_wt"])
     root = ensure_gitignore(integ) / "screenshots"
     rdir = root / f"round-{round_no}"
+    if rdir.is_symlink():
+        rdir.unlink()  # never through it
     shutil.rmtree(rdir, ignore_errors=True)
     rdir.mkdir(parents=True, exist_ok=True)
     res = {"ran": False, "skipped": None, "error": None, "app_failed": False, "url": ui["url"], "dir": str(rdir),
@@ -1563,7 +1582,8 @@ def capture(plan: dict, job_like, round_no: int, chrome: str | None = None) -> d
                 snap = snapshot_worktree(integ)
                 log(f"starting the dev server: {ui['dev']}  (waiting for {ui['url']})")
                 with dev_server(ui["dev"], ui["url"], integ, devlog,
-                                float(ui.get("ready_timeout_s") or DEFAULT_READY_TIMEOUT_S)) as p:
+                                float(ui.get("ready_timeout_s") or DEFAULT_READY_TIMEOUT_S),
+                                confine=_confine(plan)) as p:
                     res["shots"] = shoot(ui["url"], pages, viewports, rdir, f"round-{round_no}", binary,
                                          failures=res["page_failures"],
                                          alive=lambda: check_alive(p, ui["url"], devlog))
@@ -1612,7 +1632,8 @@ def preflight(plan: dict, job_like) -> str | None:
         with signals_raise():
             try:
                 with dev_server(ui["dev"], ui["url"], integ, Path(job_like.dir) / "logs" / "_devserver.log",
-                                float(ui.get("ready_timeout_s") or DEFAULT_READY_TIMEOUT_S)):
+                                float(ui.get("ready_timeout_s") or DEFAULT_READY_TIMEOUT_S),
+                                confine=_confine(plan)):
                     pass
             finally:
                 restore_worktree(integ, snap)

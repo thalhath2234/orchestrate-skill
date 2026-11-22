@@ -35,6 +35,7 @@ import sys
 import time
 from pathlib import Path
 
+import jail
 import models
 import orchestrate as O
 import router
@@ -126,7 +127,7 @@ def exclude_reports(repo: Path) -> None:
 
 
 def _common_dir(path: Path) -> Path | None:
-    p = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=path, capture_output=True, text=True)
+    p = subprocess.run([*jail.GIT, "rev-parse", "--git-common-dir"], cwd=path, capture_output=True, text=True)
     if p.returncode:
         return None
     d = Path(p.stdout.strip())
@@ -330,7 +331,7 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
                           "or migrations. Revert these and report the need under open_issues instead:\n"
                           + "\n".join(f"  {b}" for b in bad) + "\nYou own: " + ", ".join(task["owns"]))
     if ok:
-        ok, out = RT.verify(task["verify"], wt, 1800)
+        ok, out = RT.verify(task["verify"], wt, 1800, O.confinement(plan))
     if ok and report is None:
         ok, out = False, (f"The verify commands pass, but there is no readable report at {wt / REPORT_REL}. "
                           "Write the JSON report there, then send worker_done again.")
