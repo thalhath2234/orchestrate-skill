@@ -738,6 +738,8 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
     for k in ("verify", "setup", "acceptance", "non_goals", "decisions", "quality_bar", "assumptions"):
         if k in plan and not (isinstance(plan[k], list) and all(isinstance(x, str) for x in plan[k])):
             errs.append(f"plan.{k} must be a list of strings")
+    if plan.get("sandbox") is not None and not isinstance(plan["sandbox"], bool):
+        errs.append(f"plan.sandbox must be true or false (or left out), not {plan['sandbox']!r}")
     if not plan.get("acceptance"):
         errs.append("plan.acceptance is required: the job's definition of done, as checkable criteria")
     if not (isinstance(plan.get("definition_of_done"), str) and plan["definition_of_done"].strip()):
@@ -1501,7 +1503,7 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
     if plan.get("extra_tools"):
         cmd += ["--extra-tools", *plan["extra_tools"]]
     cmd += ["--jail", jail.mode_of(plan), "--trusted-verify", scope]
-    if plan.get("sandbox"):
+    if jail.mode_of(plan) == "required":
         cmd.append("--sandbox")
     if plan.get("exclude_dynamic_prompt", True):  # measured: ~4.8k fewer cache-write tokens per session
         cmd.append("--exclude-dynamic-prompt")
@@ -1797,9 +1799,9 @@ def verify_and_review(job: Job, plan: dict, rnd_no: int) -> tuple[dict, list[dic
 def reviewed_rounds(job: Job) -> int:
     """Review rounds that produced a verdict. A round that failed closed (no reviewer verdict, a UI
     review that could not run) doesn't use up plan.review_rounds: after the fix and a resume,
-    the job still gets its fix rounds."""
+    the job still gets its fix rounds. Nor does one an edit superseded before anything acted on it."""
     return sum(1 for r in job.state["review"]["rounds"]
-               if r.get("verdict") and not r["verdict"].get("reviewer_error"))
+               if r.get("verdict") and not r["verdict"].get("reviewer_error") and not r.get("superseded"))
 
 
 def fix_round_context(plan: dict) -> str:
@@ -4326,7 +4328,10 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
     job.state["commit_hook_skipped"] = not plan.get("commit_hook") and has_commit_hook(repo)
     if job.state["commit_hook_skipped"]:
         log('note: the repo\'s pre-commit hook will not run (set "commit_hook": true to run it as a check on each task)')
-    job.state["unconfined"] = "plan.sandbox is false" if mode == "off" else why
+    loose = "plan.sandbox is false" if mode == "off" else why
+    if job.state.get("mode") == "orca":
+        loose = ORCA_UNCONFINED + (f"; verify, setup and the dev server aren't confined either: {loose}" if loose else "")
+    job.state["unconfined"] = loose
     if job.state["unconfined"]:
         log(f"warning: workers are NOT confined ({job.state['unconfined']}): they can write anywhere you can")
     confine = confinement(plan) if has_worker_code(job, integ) else None  # a resume; first time it's the user's code
@@ -4409,6 +4414,10 @@ def _review_round(job: Job, plan: dict) -> int | str:
         rnd_no, verdict, blocking = kept["round"], kept["verdict"], kept["blocking"]
         log(f"round {rnd_no} was reviewed but not decided on; going on from its verdict")
     else:
+        if kept:  # the plan or the code was edited since, so nothing will act on that verdict
+            for r in job.state["review"]["rounds"]:
+                if r.get("round") == kept["round"]:
+                    r["superseded"] = True
         rnd_no = len(job.state["review"]["rounds"]) + 1
         log(f"all tasks merged; final verify + review (round {rnd_no})")
         verdict, blocking = verify_and_review(job, plan, rnd_no)
@@ -4818,7 +4827,8 @@ def render_report(job: Job, plan: dict) -> str:
               *[f"- **{t}**: {', '.join(f)}" for t, f in claimed.items()]]
     for r in s.get("review", {}).get("rounds", []):
         v = r.get("verdict") or {}
-        L += ["", f"Review round {r['round']}: final verify {'ok' if r.get('final_verify_ok') else 'FAILED'}, "
+        L += ["", f"Review round {r['round']}{' (superseded by an edit, not counted)' if r.get('superseded') else ''}: "
+                  f"final verify {'ok' if r.get('final_verify_ok') else 'FAILED'}, "
                   + (f"verdict **{v.get('verdict', '-')}**: {v.get('summary', '')}" if v
                      else "interrupted before a verdict (the job stopped during this round)")]
         for a in v.get("acceptance", []) or []:
@@ -5295,14 +5305,26 @@ def cmd_validate(a) -> int:
     return 0 if not errs else 2
 
 
-def workers_mode(a, job: Job | None = None) -> str:
+ORCA_UNCONFINED = "Orca starts its own workers; --workers headless confines them"
+
+
+def workers_mode(a, job: Job | None = None, plan: dict | None = None) -> str:
     """orca: the parent agent coordinates Orca workers (inside Orca); headless: a detached process
-    runs `claude -p` workers itself. A resumed job keeps the mode it started in."""
+    runs `claude -p` workers itself. A resumed job keeps the mode it started in. Orca can't confine
+    a worker (it reports through Orca's socket, which can open any terminal), so `auto` picks
+    headless for a plan whose sandbox is required."""
     import orca_mode
     if job is not None and job.state and (job.state.get("mode") or job.state.get("tasks")):
         return job.state.get("mode") or "headless"  # jobs from before Orca mode ran headless
     w = getattr(a, "workers", None) or "auto"
-    return ("orca" if orca_mode.in_orca() else "headless") if w == "auto" else w
+    if w != "auto":
+        return w
+    if not orca_mode.in_orca():
+        return "headless"
+    if jail.mode_of(plan or {}) == "required":
+        log("plan.sandbox is true, so workers run headless: Orca's can't be confined")
+        return "headless"
+    return "orca"
 
 
 def cmd_run(a, resume: bool = False) -> int:
@@ -5349,7 +5371,12 @@ def cmd_run(a, resume: bool = False) -> int:
     dash = ensure_dashboard(plan["job"])  # before any work, so the user can watch from the start
     if dash:
         log(f"dashboard: {dash}")
-    mode = workers_mode(a, Job(plan["job"]))  # an existing job keeps the mode it started in
+    mode = workers_mode(a, Job(plan["job"]), plan)  # an existing job keeps the mode it started in
+    if mode == "orca" and jail.mode_of(plan) == "required":
+        print(f'plan.sandbox is true, and Orca workers can\'t be confined ({ORCA_UNCONFINED}). Start it with '
+              '--workers headless (a job that already started in Orca keeps that mode: use a new plan.job), or '
+              'have the user drop "sandbox".', file=sys.stderr)
+        return 2
     if (mode == "orca" or not a.detach) and not hold_job(plan["job"]):  # a detached child takes it itself
         print(f"another orchestrate process is working on job {plan['job']}: `orchestrate.py status "
               f"{plan['job']}`", file=sys.stderr)
@@ -5435,6 +5462,11 @@ def cmd_worker_event(a) -> int:
         raise SystemExit(f"no job {a.job}")
     if job.state.get("mode") != "orca":
         raise SystemExit(f"job {a.job} doesn't run Orca workers")
+    if jail.mode_of(job.plan) == "required":
+        print(f"plan.sandbox is now true, and this job's Orca workers aren't confined ({ORCA_UNCONFINED}): their "
+              "work isn't checked or merged. Have the user either drop \"sandbox\" from the job's plan.json and "
+              "run this same command again, or start a new job with --workers headless.", file=sys.stderr)
+        return 2
     log_to_job(job.dir)
     if a.cmd == "worker-lost":
         return orca_mode.worker_lost(job, job.plan, a.dispatch, a.reason)

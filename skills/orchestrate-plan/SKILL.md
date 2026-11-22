@@ -134,7 +134,8 @@ When `scan` returns a `ui_suggestion` and the job changes the UI, add a `ui` blo
                                               //   the system prompt so subagents share its cache
   // "sandbox": true,                        // optional; leave it out. Workers are confined with
                                               //   bubblewrap wherever it works. true: refuse to run without it,
-                                              //   and add Claude Code's sandbox (no localhost services). false
+                                              //   and add Claude Code's sandbox (no localhost services); Orca
+                                              //   can't confine workers, so inside Orca they run headless. false
                                               //   turns confinement off: the user's call, never set it yourself
   "ui": {                                     // optional: screenshot the running app (before the code
                                               //   review) and have the UI reviewer check the shots after it

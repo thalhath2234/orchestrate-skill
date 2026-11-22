@@ -179,6 +179,8 @@ def start_worker(job: O.Job, plan: dict, tid: str, rung: int, *, fresh: bool, hi
     integration head; otherwise the task's existing worktree (an escalation keeps the work).
     Returns an error message, or None."""
     task = next(t for t in plan["tasks"] if t["id"] == tid)
+    if O.jail.mode_of(plan) == "required":  # the plan can be edited while the job runs
+        return f"plan.sandbox is true and Orca workers can't be confined ({O.ORCA_UNCONFINED})"
     st = job.state["tasks"][tid]
     o = st.setdefault("orca", {"starts": 0, "escalations": 0})
     model, effort = router.cfg(rung)
@@ -253,13 +255,31 @@ def start(job: O.Job, plan: dict, approve: list[str], max_parallel: int | None,
             code = O.prepare_job(job, plan, approve, max_parallel, skip_baseline, answer)
             if code is not None:
                 return code
-            while orca_state(job).get("undelivered"):  # reports a usage limit cut short
-                deliver(job, job.plan, orca_state(job)["undelivered"][0])
-                orca_state(job)["undelivered"].pop(0)
-                job.save()
+            deliver_kept(job)
             return pump(job, plan)
         except O.UsageLimit as e:
             return O.usage_limit_stop(job, plan, e)
+
+
+def deliver_kept(job: O.Job) -> None:
+    """Reports a usage limit cut short. Every step that takes a report delivers them: Orca won't
+    send them again, and `waiting on workers` would wait for them forever."""
+    while orca_state(job).get("undelivered"):
+        event = orca_state(job)["undelivered"][0]
+        try:
+            deliver(job, job.plan, event)
+        except O.UsageLimit:
+            raise
+        except Exception as e:  # noqa: BLE001  (its worktree is gone: every resume would raise again)
+            tid = orca_state(job)["dispatches"].get(event["dispatch"])
+            st = job.state["tasks"].get(tid or "", {})
+            if st.get("status") == "running":  # not one that merged before it raised
+                st.update(status="failed", result="error", error=f"its report could not be checked: {e}")
+                if any(t["id"] == tid for t in job.plan["tasks"]):
+                    queue_event(job, task_failed_event(job, job.plan, tid))
+            O.log(f"kept report of {tid} could not be handled (task now {st.get('status')}): {e}")
+        orca_state(job)["undelivered"].pop(0)
+        job.save()
 
 
 def deliver(job: O.Job, plan: dict, event: dict) -> None:
@@ -280,8 +300,7 @@ def limit_stop(job: O.Job, plan: dict, event: dict, e: Exception) -> int:
     st = job.state["tasks"].get(tid or "", {})
     if st.get("status") == "running" and st.get("orca", {}).get("dispatch") == event["dispatch"]:
         kept = orca_state(job).setdefault("undelivered", [])
-        if event not in kept:
-            kept.append(event)
+        kept[:] = [x for x in kept if x["dispatch"] != event["dispatch"]] + [event]  # the newest one
     return O.usage_limit_stop(job, plan, e)
 
 
@@ -312,9 +331,9 @@ def worker_done(job: O.Job, plan: dict, payload: dict) -> int:
                             f"{tid} ran. Job stopped. Inspect them before resuming.")
         try:
             check(job, plan, tid, payload)
-            return pump(job, plan)
-        except O.UsageLimit as e:
+        except O.UsageLimit as e:  # only this keeps the report: past here it is handled
             return limit_stop(job, plan, {"dispatch": did, "payload": payload}, e)
+        return go_on(job, plan, did)
 
 
 def worker_lost(job: O.Job, plan: dict, did: str, reason: str) -> int:
@@ -328,9 +347,22 @@ def worker_lost(job: O.Job, plan: dict, did: str, reason: str) -> int:
             return pump(job, plan)
         try:
             lost(job, plan, tid, reason)
-            return pump(job, plan)
         except O.UsageLimit as e:
             return limit_stop(job, plan, {"dispatch": did, "lost": reason}, e)
+        return go_on(job, plan, did)
+
+
+def go_on(job: O.Job, plan: dict, handled: str) -> int:
+    """After `handled`'s newest report was dealt with: an older one kept from that worker is stale
+    (it may be fixing what that one showed). A limit from here on stops the job and keeps nothing new."""
+    kept = orca_state(job).get("undelivered")
+    if kept:
+        kept[:] = [e for e in kept if e["dispatch"] != handled]
+    try:
+        deliver_kept(job)
+        return pump(job, plan)
+    except O.UsageLimit as e:
+        return O.usage_limit_stop(job, plan, e)
 
 
 def lost(job: O.Job, plan: dict, tid: str, reason: str) -> None:
@@ -391,12 +423,17 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
                + (f"\n{out[-6000:]}" if out else "")
                + (f"\nreport summary: {report.get('summary')}" if report else ""))
     if not ok:
-        fail_attempt(job, plan, tid, out, report=report, step=step)
+        try:
+            fail_attempt(job, plan, tid, out, report=report, step=step)
+        except O.UsageLimit:  # nothing was judged: the replay records the attempt
+            st["steps"].remove(step)
+            raise
         return
     res = {"wt": str(wt), "branch": o["branch"], "report": report}
     try:
         merged, info = O.commit_and_merge(job, plan, task, res, remove_worktree=False)
     except O.UsageLimit:  # the integrator's: the merge was undone and the task still waits for this step
+        st["steps"].remove(step)
         raise
     except Exception as e:  # noqa: BLE001
         merged, info = False, f"commit/merge error: {e}"

@@ -2084,6 +2084,264 @@ class OrchestrateTest(unittest.TestCase):
         job.state, job.held = {"cost_usd": 0.0}, {"web": 0.8}
         self.assertLessEqual(self.o.budget_left(job, {"budget_usd": 0.8}), 0.21)
 
+    # ------------------------------------------------- v0.9.1
+    def test_a_retried_attempt_is_still_paid_for(self):
+        fake, mark = self.tmp / "retry-claude", self.tmp / "retry-mark"
+        fake.write_text("#!/usr/bin/env python3\nimport json, pathlib\n"
+                        f"m = pathlib.Path({str(mark)!r})\n"
+                        "r = ({'is_error': False, 'session_id': 'b', 'total_cost_usd': 0.25, 'result': 'ok'} if m.exists() else\n"
+                        "     {'is_error': True, 'session_id': 'a', 'total_cost_usd': 0.5, 'api_error_status': 529, 'result': 'Overloaded'})\n"
+                        "m.touch()\n"
+                        "print(json.dumps(r))\n")
+        fake.chmod(0o755)
+        old = os.environ["ROUTER_CLAUDE_BIN"]
+        os.environ["ROUTER_CLAUDE_BIN"] = str(fake)
+        self.addCleanup(os.environ.__setitem__, "ROUTER_CLAUDE_BIN", old)
+        r = self.o.claude_cli.call("x", "opus", "medium", self.repo, perm="dontAsk", tools=[], retries=1)
+        self.assertEqual((r.get("error_kind"), r["total_cost_usd"]), (None, 0.75))
+
+    def test_a_timed_out_call_reports_what_it_spent(self):
+        import jail
+        fake = self.tmp / "slow-claude"
+        fake.write_text("#!/usr/bin/env python3\nimport json, signal, sys, time\n"
+                        "if 'auth' in sys.argv:\n    sys.exit()\n"
+                        "def stop(*_):\n"
+                        "    print(json.dumps({'is_error': True, 'subtype': 'error_during_execution', 'session_id': 's-slow',\n"
+                        "                      'total_cost_usd': 0.4}), flush=True)\n"
+                        "    sys.exit(0)\n"
+                        "signal.signal(signal.SIGINT, stop)\n"
+                        "time.sleep(30)\n")
+        deaf = self.tmp / "deaf-claude"
+        deaf.write_text("#!/usr/bin/env python3\nimport signal, sys, time\n"
+                        "if 'auth' in sys.argv:\n    sys.exit()\n"
+                        "signal.signal(signal.SIGINT, signal.SIG_IGN)\ntime.sleep(30)\n")
+        old = os.environ["ROUTER_CLAUDE_BIN"]
+        self.addCleanup(os.environ.__setitem__, "ROUTER_CLAUDE_BIN", old)
+        C = self.o.claude_cli
+        for confine in [None] + ([] if jail.available() else [self.state]):
+            for exe, cost in ((fake, 0.4), (deaf, None)):
+                with self.subTest(exe.name, confined=bool(confine)):
+                    exe.chmod(0o755)
+                    os.environ["ROUTER_CLAUDE_BIN"] = str(exe)
+                    t0 = time.time()
+                    r = C.call("x", "opus", "medium", self.repo, perm="dontAsk", tools=[], timeout=5, confine=confine)
+                    self.assertEqual((r.get("error_kind"), r.get("timeout"), r.get("total_cost_usd")), ("timeout", True, cost))
+                    self.assertLess(time.time() - t0, 25, "one that ignores the interrupt is still killed")
+
+    def _orca_job(self):
+        import orca_mode
+        O = importlib.reload(orca_mode)
+        plan = base_plan(self.repo)
+        self.cfg.write_text("{}")
+        job = self.o.start_job(plan, self.write_plan(plan))
+        tasks = job.state["tasks"]
+        for tid, did in (("api", "d-api"), ("web", "d-web")):
+            tasks.setdefault(tid, {}).update(status="running", orca={"dispatch": did, "worktree": str(self.tmp / tid)})
+        job.state["orca"] = {"run": None, "dispatches": {"d-api": "api", "d-web": "web"},
+                             "undelivered": [{"dispatch": "d-api", "payload": {"dispatchId": "d-api"}}]}
+        job.state.update(mode="orca", guard=self.o.guard_snapshot(), status="environment")
+        job.save()
+        for name in ("pump", "check", "fail_attempt", "queue_event", "task_failed_event"):
+            self.addCleanup(setattr, O, name, getattr(O, name))
+        O.pump = lambda j, p: 10
+        return O, job, plan
+
+    def test_another_workers_report_delivers_the_one_a_limit_cut_short(self):
+        for step in ("done", "lost"):
+            with self.subTest(step):
+                self.tearDown()
+                self.setUp()
+                O, job, plan = self._orca_job()
+                seen = []
+
+                def handled(j, p, tid, *a, **kw):
+                    seen.append(tid)
+                    j.state["tasks"][tid]["status"] = "done"
+                O.check = O.fail_attempt = handled
+                code = (O.worker_done(job, plan, {"dispatchId": "d-web"}) if step == "done"
+                        else O.worker_lost(job, plan, "d-web", "exited"))
+                self.assertEqual((code, sorted(seen)), (10, ["api", "web"]))
+                self.assertEqual(job.state["orca"]["undelivered"], [])
+
+    def test_a_kept_report_that_cannot_be_checked_fails_its_task_not_every_resume(self):
+        O, job, plan = self._orca_job()
+        events = []
+
+        def check(j, p, tid, payload):
+            if tid == "api":
+                raise FileNotFoundError("the worktree is gone")
+            j.state["tasks"][tid]["status"] = "done"
+        O.check = check
+        O.task_failed_event = lambda j, p, tid: {"kind": "task_failed", "task": tid}
+        O.queue_event = lambda j, ev: events.append(ev)
+        self.assertEqual(O.worker_done(job, plan, {"dispatchId": "d-web"}), 10)
+        self.assertEqual(job.state["tasks"]["api"]["status"], "failed")
+        self.assertIn("worktree is gone", job.state["tasks"]["api"]["error"])
+        self.assertEqual((events, job.state["orca"]["undelivered"]), ([{"kind": "task_failed", "task": "api"}], []))
+
+    def test_a_replayed_report_adds_one_step(self):
+        self.orca_env()
+        cfg = {"cause": "effort", "tasks": {**WRITES, "api": {**WRITES["api"], "fail_until_effort": "high"}}}
+        code, out = self.drive_orca(("run", str(self.write_plan(base_plan(self.repo)))),
+                                    {**cfg, "limited": ["FAILURE_CLASSIFIER"]})
+        self.assertEqual(code, 3, out[-1500:])
+        before = len(self.job_state()["tasks"]["api"].get("steps", []))
+        for _ in range(2):
+            code, out, err = self.cli("resume", "share")  # still limited
+            self.assertEqual(code, 3, err[-1500:])
+        self.assertEqual(len(self.job_state()["tasks"]["api"].get("steps", [])), before)
+
+    def test_a_verdict_an_edit_made_stale_costs_no_round(self):
+        bad = {"verdict": "changes_requested", "summary": "bug",
+               "findings": [{"severity": "blocker", "confidence": "high", "issue": "owner never checked"}]}
+        good = {"verdict": "pass", "summary": "ok", "findings": []}
+        plan = self.write_plan(base_plan(self.repo))
+        code, out, err = self.cli("run", str(plan), "--workers", "headless",
+                                  cfg={"tasks": WRITES, "limited": ["ORCHESTRATE_ADVISE_FINAL"], "reviews": [good]})
+        self.assertEqual(code, 3, err[-1500:])
+        f = self.state / "jobs/share/plan.json"
+        edited = json.loads(f.read_text())
+        edited["acceptance"].append("Only the owner can revoke a link")
+        f.write_text(json.dumps(edited))
+        fix = {"packages/contract/src/share/types.ts": "export type S = { owner: string }\n"}
+        code, out, err = self.cli("resume", "share", cfg={"tasks": WRITES, "reviews": [good, bad, good], "fix": fix})
+        self.assertEqual(code, 0, err[-1500:])
+        self.assertTrue(list(self.tmp.glob("calls.jsonl.fix_prompt*")))
+
+    def test_the_script_is_the_module_orca_mode_imports(self):
+        code = ("import sys, runpy\n"
+                f"sys.argv = [{str(ORCH)!r}, '--help']\n"
+                "try:\n"
+                f"    runpy.run_path({str(ORCH)!r}, run_name='__main__')\n"
+                "except SystemExit:\n    pass\n"
+                "print('one module', 'orchestrate' in sys.modules)\n")
+        p = subprocess.run([sys.executable, "-c", code], env=self.env, capture_output=True, text=True)
+        self.assertIn("one module True", p.stdout, p.stderr)
+
+    def test_orca_never_passes_for_confined(self):
+        import jail
+        self.orca_env()
+        code, out = self.drive_orca(("run", str(self.write_plan(base_plan(self.repo)))), {"tasks": WRITES})
+        self.assertEqual(code, 0, out[-1500:])
+        self.assertIn("worker confinement: none", (self.state / "jobs/share/report.md").read_text(),
+                      "Orca's workers run unjailed, and the report must say so")
+        self.tearDown()
+        self.setUp()
+        self.orca_env()
+        strict = str(self.write_plan(base_plan(self.repo, sandbox=True)))
+        code, out, err = self.cli("run", strict, "--workers", "orca", cfg={"tasks": WRITES})
+        self.assertEqual(code, 2, err[-1500:])
+        self.assertIn("--workers headless", err)
+        self.assertFalse(self.orca_of("worker-start"), "a required sandbox never starts an unjailed worker")
+        if not jail.available():
+            code, out, err = self.cli("run", strict, cfg={"tasks": WRITES})  # auto, inside Orca
+            self.assertFalse(self.orca_of("worker-start"))
+            self.assertEqual(self.job_state()["mode"], "headless", err[-1500:])
+
+    def test_a_report_already_handled_is_never_kept_again(self):
+        self.orca_env()
+        tasks = {**WRITES, "api": {**WRITES["api"], "fail_until_effort": "high"},
+                 "web": {**WRITES["web"], "fail_first": True}}
+        cfg = {"cause": "effort", "tasks": tasks}
+
+        def done(tid):
+            c = [c for c in self.orca_of("worker-start") if c["tid"] == tid][-1]
+            payload = {"dispatchId": c["dispatch"], "outcome": "succeeded",
+                       "reportPath": str(Path(c["wt"]) / ".orchestrate" / "report.json")}
+            self.cli("worker-done", "share", "--payload", json.dumps(payload))
+            return c["dispatch"]
+
+        self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg={**cfg, "limited": ["FAILURE_CLASSIFIER"]})
+        done("contract")
+        done("api")
+        api = done("api")  # judged by the classifier, which is limited: kept
+        web = done("web")  # fails its checks and is sent back: handled
+        self.assertEqual([e["dispatch"] for e in self.job_state()["orca"]["undelivered"]], [api])
+        (Path([c for c in self.orca_of("worker-start") if c["dispatch"] == web][0]["wt"])
+         / "apps/web/src/share/Button.tsx").unlink(missing_ok=True)  # its worker is mid-fix
+        code, out, err = self.cli("resume", "share", cfg=cfg)
+        st = self.job_state()["tasks"]["web"]
+        self.assertEqual((len(st["steps"]), st["orca"]["dispatch"]), (1, web), err[-1500:])
+
+    def test_a_newer_report_replaces_the_one_kept_from_the_same_worker(self):
+        O, job, plan = self._orca_job()
+        seen = []
+        O.check = lambda j, p, tid, payload: seen.append(payload)  # sent back: still running
+        newer = {"dispatchId": "d-api", "reportPath": "second"}
+        self.assertEqual(O.worker_done(job, plan, newer), 10)
+        self.assertEqual((seen, job.state["orca"]["undelivered"]), ([newer], []))
+
+        O, job, plan = self._orca_job()
+
+        def limited(*a):
+            raise self.o.UsageLimit("You've hit your weekly limit")
+        O.check = limited
+        with contextlib.redirect_stdout(open(os.devnull, "w")):
+            self.assertEqual(O.worker_done(job, plan, newer), 3)
+        self.assertEqual(job.state["orca"]["undelivered"], [{"dispatch": "d-api", "payload": newer}])
+
+    def test_a_merged_task_stays_merged_when_replaying_its_report_fails(self):
+        O, job, plan = self._orca_job()
+
+        def check(j, p, tid, payload):
+            j.state["tasks"][tid]["status"] = "done"
+            if tid == "api":
+                raise ValueError("raising the bar failed after the merge")
+        O.check = check
+        self.assertEqual(O.worker_done(job, plan, {"dispatchId": "d-web"}), 10)
+        self.assertEqual((job.state["tasks"]["api"]["status"], job.state["orca"]["undelivered"]), ("done", []))
+
+    def test_a_sandbox_that_is_not_a_boolean_never_fails_open(self):
+        import jail
+        for v in (1, "true", "yes", 0, "false", [], {}):
+            with self.subTest(v=v):
+                self.assertEqual(jail.mode_of({"sandbox": v}), "required")
+                errs, _, _ = self.o.validate(base_plan(self.repo, sandbox=v))
+                self.assertTrue([e for e in errs if "sandbox" in e], errs)
+        self.assertEqual([jail.mode_of(p) for p in ({}, {"sandbox": None}, {"sandbox": False}, {"sandbox": True})],
+                         ["auto", "auto", "off", "required"])
+
+    def test_every_orca_step_holds_to_a_sandbox_required_mid_job(self):
+        self.orca_env()
+        code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), cfg={"tasks": WRITES})
+        self.assertEqual(code, 10, err[-1500:])
+        f = self.state / "jobs/share/plan.json"
+        plan = json.loads(f.read_text())
+        plan["sandbox"] = True
+        f.write_text(json.dumps(plan))
+        did = self.orca_of("worker-start")[0]["dispatch"]
+        for step in (("worker-done", "share", "--dispatch", did), ("worker-lost", "share", "--dispatch", did),
+                     ("resume", "share")):
+            code, out, err = self.cli(*step)
+            self.assertEqual(code, 2, (step, err[-800:]))
+            self.assertIn("confined", err)
+        self.assertEqual(self.job_state()["tasks"]["contract"]["status"], "running", "nothing was merged")
+        import orca_mode
+        O = importlib.reload(orca_mode)
+        job = type("J", (), {})()
+        self.assertIn("confined", O.start_worker(job, plan, "contract", 0, fresh=True))
+
+    def test_orcas_report_names_every_reason_nothing_is_confined(self):
+        self.orca_env()
+        code, out = self.drive_orca(("run", str(self.write_plan(base_plan(self.repo, sandbox=False)))), {"tasks": WRITES})
+        self.assertEqual(code, 0, out[-1500:])
+        line = [l for l in (self.state / "jobs/share/report.md").read_text().splitlines() if "worker confinement" in l][0]
+        self.assertIn("Orca", line)
+        self.assertIn("plan.sandbox is false", line)
+
+    def test_a_superseded_round_reads_as_one(self):
+        import dashboard
+        dash = importlib.reload(dashboard)
+        plan = base_plan(self.repo)
+        self.cfg.write_text("{}")
+        job = self.o.start_job(plan, self.write_plan(plan))
+        verdict = {"verdict": "pass", "summary": "ok"}
+        job.state["review"] = {"rounds": [{"round": 1, "final_verify_ok": True, "superseded": True, "verdict": verdict},
+                                          {"round": 2, "final_verify_ok": True, "verdict": verdict}]}
+        job.save()
+        self.assertEqual(dash.job_payload(job.id)["review_rounds_used"], 1, "never 3 / 2")
+        self.assertIn("superseded", self.o.render_report(job, plan))
+
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate
         v = orchestrate.settle_verdict({"verdict": "pass", "findings": [

@@ -242,9 +242,10 @@ def mounts(wt: Path, state: Path, box: Path, scratch: Path, program: str = "") -
 
 
 def mode_of(plan: dict) -> str:
-    """plan.sandbox: true = required, false = off, absent = confined wherever bwrap works."""
+    """plan.sandbox: true = required, false = off, absent = confined wherever bwrap works. Anything
+    else is required: validate refuses it, and a typo must not be what turns confinement off."""
     v = (plan or {}).get("sandbox")
-    return "required" if v is True else "off" if v is False else "auto"
+    return "auto" if v is None else "off" if v is False else "required"
 
 
 def confinement(mode: str, state: Path) -> Path | None:

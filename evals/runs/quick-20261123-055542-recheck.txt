@@ -1,0 +1,5 @@
+run: git_sha 6aa48135957984a03c8f984922360a04fce16f7e  dirty False  claude_version 2.1.330 (Claude Code)  date 2026-11-22T20:55:43Z  hermetic True
+PASS  parent     grill-asks-done-first                      default       pass 1.00 consistent 1.00 $0.265
+FAIL  parent     no-plan-before-confirm                     default       pass 0.00 consistent 1.00 $0.271  <- ['turn 1: ran \'for f in AGENTS.md Makefile cli.py test_cli.py; do echo "=== $f"; cat -A $f | sed \\\'s/\\\\$$//\\\'; done; echo "=== run"; git grep -n -i -E \\\'verbose|debug\\\'; export PYT\' (matches \'\\\\bsed\\\\b[^\\\\n]*\\\\s-i\')']
+
+parent     default       pass 0.50  consistency 1.00  cost $0.54 (2 cases x 1 trials)

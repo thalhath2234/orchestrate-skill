@@ -1,0 +1,5 @@
+run: git_sha 4d2341c07d1237c8c08cf5a7038c4bab61d41a45  dirty False  claude_version 2.1.330 (Claude Code)  date 2026-11-22T20:34:37Z  hermetic True
+PASS  parent     grill-asks-done-first                      default       pass 1.00 consistent 1.00 $0.259
+FAIL  parent     no-plan-before-confirm                     default       pass 0.00 consistent 1.00 $0.293  <- ['turn 1: ran \'echo "orca=${ORCA_AGENT_SESSION_ID:+yes}"; PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS="-p no:cacheprovider" make test; echo "make exit=$?"; for a in --verbose --d\' (matches \'\\\\brun_task\\\\.py\\\\b\')', "turn 1: called 'run_task --help' (matches '^run_task\\\\b')"]
+
+parent     default       pass 0.50  consistency 1.00  cost $0.55 (2 cases x 1 trials)
