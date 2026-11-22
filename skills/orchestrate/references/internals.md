@@ -128,7 +128,7 @@ Whether the second, high-effort advisor call pays is measured, not assumed. `job
 
 Separately, `plan.advisor` turns on Claude Code's advisor tool inside each worker (`run_task.py --advisor`). The worker decides when to call it, so the prompt tells it when: before committing to an approach, when an error repeats, and before the final report (on an Anthropic benchmark Opus rarely consulted unprompted and scored 7 points below Opus alone). `max_model` caps the advisor, and an advisor ranked below the worker isn't passed. A launch refused because of the advisor (for example Fable's usage-credits consent) is re-run without it and recorded as `advisor_off`, not as a model failure. Each advisor call re-reads the whole worker session uncached, which is why it stays opt-in.
 
-Each config gets 2 attempts. API overloads and rate limits are retried with backoff first and never count against a model. Then the failure is classified:
+Each config gets 2 attempts. API overloads and rate limits are retried with backoff first and never count against a model. A plan usage limit (`usage_limit`: the CLI's "You've hit your ..." text) isn't retried: `claude_cli.call` waits for the reset it names when that is within `ORCHESTRATE_LIMIT_WAIT_H` (6) hours, for every role, then resumes the session. Otherwise it's no model's fault: `claude()` raises `UsageLimit`, run_task reports `usage_limit`, and the job finishes `environment`, resumable, with the interrupted tasks pending and the manager's event queued. Any other failure is classified:
 
 | Cause | This task | Future tasks |
 |---|---|---|
@@ -144,7 +144,7 @@ Learning, all as proposals the user approves:
 
 ## Budget
 
-`budget_usd` is passed to every model call as `--max-budget-usd` (the remaining amount), and the scheduler stops launching tasks once it is spent.
+`budget_usd` reaches every model call as `--max-budget-usd`, which counts that process alone. Sequential calls get what is left. Parallel ones split it: tasks launched together share what no running call holds (`budget_free`), a manager call beside running tasks holds up to $1 or a quarter, and area reviewers divide evenly. On `--resume` the CLI's `total_cost_usd` is the session's running total, so `_cost_of_this_call` takes off the total last reported (kept in `<state>/sessions/`). A killed orchestrator takes its workers along: each run_task leads a process group and gets `--parent` (PR_SET_PDEATHSIG).
 
 ## Tools and the advisor tool in each call
 
@@ -168,7 +168,7 @@ A manager session started without these flags (an older job resumed) still lists
 
 `jail.py` wraps a command in `bwrap` on an allow-list: the root is read-only. Writable: the worktree, a copy of its git dir (the harness's git never reads the copy), per-invocation `/tmp` and `/var/tmp`, and per-worktree caches and Claude session dirs under `<state>/jail/<hash>` (dropped on merge and `clean`). The home is a tmpfs with its existing children mounted read-only, and so is each home dir where `/proc/net/unix` shows a bound socket, minus the sockets. The common git dir, objects included, is read-only; `/run/user` is empty; the pid namespace is new. Claude Code's config dir stays one read-only directory mount, so a jailed CLI never spends the refresh token it couldn't save: `claude_cli.login_kept_fresh` runs `claude auth status` outside every 4 minutes and the worker reads the replaced file. Don't mount the credentials file alone or put a tmpfs on that dir: either breaks this. `plan.sandbox`: absent = wherever bwrap works, `true` = required, `false` = off. What runs inside: worker attempts, their verify (not the harness's `--trusted-verify` scope check), setup and baseline once the tree holds worker code, resolution and final verify, the fix round, cleanup and the dev server. Orca starts its own workers, so only their verify is confined. For unconfined workers the harness also checks that HEAD is on the expected branch before it commits, merges a task only when the task's start is the merge's one base, starts its own Pythons without the user site, and drops relative PATH entries.
 
-The harness's git runs with `core.hooksPath=/dev/null` and `core.fsmonitor=false` (`jail.GIT`). Judgment calls pass `--setting-sources user` and get the committed CLAUDE.md through `project_rules`. A prompt over 100,000 bytes goes to `claude` on stdin, a brief always does.
+`plan.commit_hook` adds `HOOK_CHECK` to each task's checks: the repo's hook, run like any verify command, on a scratch index and object dir. `setup_integration` repeats `plan.setup` before final and resolution verify and puts back what it rewrote in tracked files. The harness's git runs with `core.hooksPath=/dev/null` and `core.fsmonitor=false` (`jail.GIT`). Judgment calls pass `--setting-sources user` and get the committed CLAUDE.md through `project_rules`. A prompt over 100,000 bytes goes to `claude` on stdin, a brief always does.
 
 A job id belongs to one repo, and one process holds it (`jobs/.<id>.lock`).
 
