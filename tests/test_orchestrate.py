@@ -1419,7 +1419,9 @@ class OrchestrateTest(unittest.TestCase):
         self._as_worker(wt, "checkout", "-q", job.state["branch"])
         (wt / "a.txt").write_text("ours\n")
         self._as_worker(wt, "commit", "-qam", "ours")
-        subprocess.run(["git", "merge", "side"], cwd=wt, capture_output=True)
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "merge", "side"], cwd=wt,
+                       capture_output=True)  # conflicts; a CI runner has no identity to merge with
+        self.assertTrue(self.o.git(wt, "diff", "--name-only", "--diff-filter=U"), "the setup left a conflict")
 
         def integrator(*a, **kw):
             (wt / "a.txt").write_text("ours\nside\n")
