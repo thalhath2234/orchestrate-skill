@@ -30,8 +30,10 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -190,6 +192,8 @@ def classify(task: str, rung: int, worker: dict, vout: str, repo: Path, timeout:
     res = claude(prompt, *classifier_cfg(), repo, perm="plan", tools=[], only=[], resume=None,
                  timeout=timeout, schema=schemas.CLASSIFIER,
                  extra_args=["--exclude-dynamic-system-prompt-sections"])
+    if res.get("error_kind") == "usage_limit":
+        return {"cause": "usage_limit", "evidence": str(res.get("result"))[:300]}
     out = res.get("structured") or {}
     if out.get("cause") not in router.CAUSES:
         out = {"cause": "unknown", "evidence": f"classifier unparseable: {str(res.get('result'))[:200]}"}
@@ -268,6 +272,32 @@ Do not commit.
 {SCOPE}{hint}{CONSULT if advisor else ""}"""
 
 
+PR_SET_PDEATHSIG = 1
+
+
+def die_with(parent: int) -> None:
+    """Stop when the orchestrator that started this task stops, SIGKILL included, and take what this
+    task started along: a resume would start a second worker on the same task. The orchestrator
+    starts this process as the leader of its own group, so the group holds only this task (a jailed
+    command dies with bwrap). Only a leader signals its group: never someone else's."""
+    def stop(*_) -> None:
+        if os.getpgrp() == os.getpid():
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            os.killpg(0, signal.SIGTERM)
+            time.sleep(1)
+            os.killpg(0, signal.SIGKILL)
+        os._exit(143)
+
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
+    except (ImportError, OSError, AttributeError) as e:
+        log(f"warning: this task can't follow its orchestrator's death: {e}")
+    if os.getppid() != parent:  # it was gone before prctl
+        stop()
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("task", help="the task prompt, or - to read it from stdin (it has no size limit there)")
@@ -312,6 +342,7 @@ def main(argv=None) -> int:
                     help="never route or escalate above this model (e.g. opus: no Fable)")
     ap.add_argument("--advisor", choices=["sonnet", "opus", "fable"],
                     help="let the worker consult this model at decision points (claude --advisor)")
+    ap.add_argument("--parent", type=int, help=argparse.SUPPRESS)  # set by the orchestrator: die with it
     ap.add_argument("--jail", choices=jail.MODES, default="auto",
                     help="confine the worker and verify commands with bubblewrap (default: where it works)")
     ap.add_argument("--trusted-verify", action="append", default=[], metavar="CMD",
@@ -320,6 +351,8 @@ def main(argv=None) -> int:
                     help="start config before learned floors (default: the worker role, opus/medium)")
     ap.add_argument("--dry-run", action="store_true", help="only print the routing decision")
     a = ap.parse_args(argv)
+    if a.parent:
+        die_with(a.parent)
     if a.task == "-":
         a.task = sys.stdin.buffer.read().decode("utf-8", "replace")
     repo = a.repo.expanduser().resolve()
@@ -449,7 +482,15 @@ def main(argv=None) -> int:
             log(f"refused at {model}/{effort} ({cat}); not routing evidence")
             break
 
-        c = classify(a.task, rung, worker, vout, repo, a.claude_timeout, a.verify)
+        if worker.get("error_kind") == "usage_limit":
+            c = {"cause": "usage_limit", "evidence": str(worker.get("result"))[:300]}
+        else:
+            c = classify(a.task, rung, worker, vout, repo, a.claude_timeout, a.verify)
+        if c["cause"] == "usage_limit":  # the plan's, not the model's: no evidence, no escalation
+            step.update(cause="usage_limit", evidence=c.get("evidence"))
+            summary["result"], summary["usage_limit"] = "usage_limit", c.get("evidence")
+            log(f"usage limit -> stopping: {c.get('evidence')}")
+            break
         spent += c.get("classifier_cost") or 0
         step.update(cause=c["cause"], evidence=c.get("evidence"),
                     classifier_cost_usd=c.get("classifier_cost"))
@@ -499,7 +540,7 @@ def main(argv=None) -> int:
     print(json.dumps(summary, indent=2))
     if summary["proposals"]:
         log(f"{len(summary['proposals'])} proposal(s) pending: router.py proposals")
-    return {"ok": 0, "environment": 3, "budget": 7, "refused": 9}.get(summary["result"], 4)
+    return {"ok": 0, "environment": 3, "usage_limit": 3, "budget": 7, "refused": 9}.get(summary["result"], 4)
 
 
 if __name__ == "__main__":

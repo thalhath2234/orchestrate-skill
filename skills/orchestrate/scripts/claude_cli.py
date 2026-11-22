@@ -27,24 +27,35 @@
   The evals set it so a pass rate does not depend on whose machine runs them. CLAUDE.md and other
   setting sources still load: the user's rules can be part of their definition of done.
 
-error_kind: None | timeout | budget | max_turns | overloaded | rate_limit | api | exec | unparseable
+error_kind: None | timeout | budget | max_turns | overloaded | rate_limit | usage_limit | api | exec | unparseable
             | refusal | cut_off
 """
 from __future__ import annotations
 
 import contextlib
+import datetime
 import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
 import jail
+import router
 
 OVERLOAD_RE = re.compile(r"overloaded_error|\b529\b|Overloaded", re.I)
 RATE_RE = re.compile(r"rate_limit_error|\b429\b|rate limit", re.I)
+# The plan's own limit, in the CLI's words: retrying in seconds can't help, waiting for the reset can.
+# Not "requires usage credits": that is one model's, and --fallback-model handles it.
+USAGE_RE = re.compile(r"^\W*(?:You've hit your|You've reached your|You're out of (?:extra usage|usage credits)"
+                      r"|Your org is out of usage)")
+RESET_RE = re.compile(r"resets (?:([A-Z][a-z]{2}) (\d{1,2}), )?(\d{1,2})(?::(\d\d))?([ap]m) \(([\w/+-]+)\)")
+MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+LIMIT_WAIT_H = 6.0  # a 5-hour window is waited out; a weekly one stops the job, resumable
+stopping = threading.Event()  # set on an interrupt: nothing keeps waiting for a reset
 
 
 # Linux refuses a single argument of 128 KiB or more (MAX_ARG_STRLEN, in bytes): longer prompts go on stdin.
@@ -83,6 +94,59 @@ def _metrics(data: dict, wall: float) -> dict:
             "duration_ms": data.get("duration_ms"), "wall_s": round(wall, 1)}
 
 
+def _cost_of_this_call(data: dict, resume: str | None) -> None:
+    """On --resume the CLI reports the session's running total (its usage, and --max-budget-usd,
+    count this process alone), so the total last reported is taken off. It's kept on disk: a resumed
+    job's manager continues a session another process started. A total never seen counts in full."""
+    sid, total = data.get("session_id"), data.get("total_cost_usd")
+    if not isinstance(sid, str) or not re.fullmatch(r"[\w-]{1,100}", sid) or not isinstance(total, (int, float)):
+        return
+    seen = router.DIR / "sessions" / sid
+    used = data.get("modelUsage") or {}
+    out = (data.get("usage") or {}).get("output_tokens")
+    # a CLI that reports per call: its per-model totals are this call's usage, not the session's
+    per_call = bool(out) and bool(used) and sum(u.get("outputTokens") or 0 for u in used.values()) <= out
+    if resume == sid and not per_call:
+        with contextlib.suppress(OSError, ValueError):
+            before = float(seen.read_text())
+            if total >= before:  # less would be a CLI that reports per call
+                data["total_cost_usd"] = total - before
+    with contextlib.suppress(OSError):
+        seen.parent.mkdir(parents=True, exist_ok=True)
+        tmp = seen.with_name(f"{sid}.{os.getpid()}.{threading.get_ident()}")
+        tmp.write_text(repr(float(total)))
+        os.replace(tmp, seen)
+
+
+def reset_wait(text: str, now: float | None = None) -> float | None:
+    """Seconds until the reset a limit message names ("resets 7am (Asia/Tokyo)", "resets Nov 21,
+    2am (...)"); 0 when it just passed, None when it names none we can read."""
+    m = RESET_RE.search(text or "")
+    if not m:
+        return None
+    mon, day, hour, minute, half, zone = m.groups()
+    try:
+        import zoneinfo
+        here = datetime.datetime.fromtimestamp(time.time() if now is None else now, zoneinfo.ZoneInfo(zone))
+        at = here.replace(hour=int(hour) % 12 + (12 if half == "pm" else 0), minute=int(minute or 0),
+                          second=0, microsecond=0)
+        if mon:
+            at = at.replace(month=MONTHS.index(mon) + 1, day=int(day))
+            if (here - at).days > 180:
+                at = at.replace(year=at.year + 1)
+        late = here.timestamp() - at.timestamp()
+        if late > 600 and not mon:
+            at += datetime.timedelta(days=1)
+        return max(at.timestamp() - here.timestamp(), 0.0)
+    except (ImportError, KeyError, ValueError, OSError):
+        return None
+
+
+def pause(seconds: float) -> bool:
+    """Sleep; False when an interrupt cut it short."""
+    return not stopping.wait(seconds)
+
+
 def _kind(data: dict) -> str | None:
     if data.get("stop_reason") == "refusal":
         return "refusal"
@@ -97,6 +161,8 @@ def _kind(data: dict) -> str | None:
         return "max_turns"
     status = data.get("api_error_status")
     text = str(data.get("result") or "") + " " + " ".join(map(str, data.get("errors") or []))
+    if USAGE_RE.match(str(data.get("result") or "")):
+        return "usage_limit"
     if status == 529 or OVERLOAD_RE.search(text):
         return "overloaded"
     if status == 429 or RATE_RE.search(text):
@@ -196,7 +262,46 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
          resume: str | None = None, timeout: int = 3600, settings: dict | None = None,
          schema: dict | None = None, budget_usd: float | None = None,
          extra_args: list[str] | None = None, retries: int | None = None,
-         only: list[str] | None = None, confine: Path | None = None) -> dict:
+         only: list[str] | None = None, confine: Path | None = None, wait: bool = True) -> dict:
+    """One model call. A plan usage limit that resets within ORCHESTRATE_LIMIT_WAIT_H hours is
+    waited out here, for every role, and the session continued; a longer one is `usage_limit`."""
+    try:
+        left = float(os.environ.get("ORCHESTRATE_LIMIT_WAIT_H", LIMIT_WAIT_H)) * 3600
+    except ValueError:
+        left = LIMIT_WAIT_H * 3600
+    kw = dict(perm=perm, tools=tools, timeout=timeout, settings=settings, schema=schema, budget_usd=budget_usd,
+              extra_args=extra_args, retries=retries, only=only, confine=confine)
+    if not wait:
+        left = 0.0
+    paid = 0.0
+    while True:
+        data = _call(prompt, model, effort, cwd, resume=resume, **kw)
+        if data.get("error_kind") == "usage_limit":
+            secs = reset_wait(str(data.get("result")))
+            if secs is not None and secs + 60 <= left:
+                secs += 60  # past the minute it names
+                print(f"[claude] usage limit: {str(data.get('result'))[:160]}; waiting {secs / 60:.0f} min "
+                      "for the reset", file=sys.stderr, flush=True)
+                left -= secs
+                if pause(secs):
+                    spent = data.get("total_cost_usd") or 0.0
+                    paid += spent
+                    if kw["budget_usd"] is not None:
+                        kw["budget_usd"] -= spent
+                    if data.get("session_id") and (data.get("num_turns") or 0) > 1:
+                        resume = data["session_id"]
+                        prompt = ("A usage limit interrupted you; it has reset. Continue where you stopped and "
+                                  "finish the task, replying as first asked.")
+                    continue
+        if paid:
+            data["total_cost_usd"] = paid + (data.get("total_cost_usd") or 0.0)
+        return data
+
+
+def _call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: list[str],
+          resume: str | None, timeout: int, settings: dict | None, schema: dict | None,
+          budget_usd: float | None, extra_args: list[str] | None, retries: int | None,
+          only: list[str] | None, confine: Path | None) -> dict:
     prompt = prompt.replace("\x00", "\ufffd")  # no argument can hold a NUL
     piped = prompt if len(prompt.encode("utf-8", "replace")) > ARG_PROMPT_MAX else None
     cmd = [claude_bin(), "-p", *([prompt] if piped is None else []), "--model", model, "--effort", effort,
@@ -252,7 +357,8 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
             data = _parse(p.stdout)
         except (ValueError, IndexError):
             data = {"is_error": True, "result": (p.stdout + p.stderr)[-2000:], "subtype": "unparseable"}
-            kind = ("overloaded" if OVERLOAD_RE.search(data["result"]) else
+            kind = ("usage_limit" if USAGE_RE.match(data["result"]) else
+                    "overloaded" if OVERLOAD_RE.search(data["result"]) else
                     "rate_limit" if RATE_RE.search(data["result"]) else "unparseable")
         else:
             kind = _kind(data)
@@ -266,6 +372,7 @@ def call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: l
     usage = data.get("modelUsage") or {}
     data["model_id"] = next((k for k in usage if model in k), next(iter(usage), None))
     data["metrics"] = _metrics(data, time.time() - t0)
+    _cost_of_this_call(data, resume)
     so = data.get("structured_output")
     data["structured"] = so if isinstance(so, dict) else extract_json(str(data.get("result", "")))
     if kind == "cut_off":

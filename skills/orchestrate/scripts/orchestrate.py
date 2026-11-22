@@ -58,6 +58,7 @@ import argparse
 import concurrent.futures as cf
 import contextlib
 import functools
+import hashlib
 import json
 import math
 import os
@@ -78,6 +79,10 @@ HERE = Path(__file__).resolve().parent
 # harness Pythons: no PYTHON* variables and no user site, both places a worker can plant code
 PY = [sys.executable, "-E", "-s"]
 sys.path.insert(0, str(HERE))
+if __name__ == "__main__":
+    # `import orchestrate` (orca_mode, dashboard) gets this module: a second copy has its own state
+    # and exception classes, so this one's handlers would never catch what that one raises
+    sys.modules["orchestrate"] = sys.modules[__name__]
 import claude_cli  # noqa: E402
 import jail  # noqa: E402
 import models  # noqa: E402
@@ -296,11 +301,26 @@ def claude(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools:
            resume: str | None = None, timeout: int = 3600, settings: dict | None = None,
            schema: dict | None = None, budget_usd: float | None = None,
            extra_args: list[str] | None = None, only: list[str] | None = None,
-           confine: Path | None = None) -> dict:
+           confine: Path | None = None, wait: bool = True) -> dict:
     extra = list(extra_args or []) + models.fallback_args(model)  # no Fable access -> Opus
-    return claude_cli.call(prompt, model, effort, cwd, perm=perm, tools=tools, resume=resume,
-                           timeout=timeout, settings=settings, schema=schema,
-                           budget_usd=budget_usd, extra_args=extra, only=only, confine=confine)
+    res = claude_cli.call(prompt, model, effort, cwd, perm=perm, tools=tools, resume=resume,
+                          timeout=timeout, settings=settings, schema=schema,
+                          budget_usd=budget_usd, extra_args=extra, only=only, confine=confine, wait=wait)
+    if res.get("error_kind") == "usage_limit":  # no role can answer, so none is judged by it
+        raise UsageLimit(str(res.get("result"))[:300])
+    return res
+
+
+class UsageLimit(Exception):
+    """The user's plan limit, with a reset too far off to wait for: the job stops, resumable."""
+
+
+def usage_limit_stop(job, plan: dict, what) -> int:
+    return finish(job, plan, "environment",
+                  f"your Claude usage limit stopped the job: {what}\nNothing was judged failed, and finished work is kept. After "
+                  f"the reset: `orchestrate.py resume {job.id}`. (A reset within "
+                  f"{claude_cli.LIMIT_WAIT_H:g} hours is waited out; ORCHESTRATE_LIMIT_WAIT_H changes that.)",
+                  resumable=True)
 
 
 def record_call(job, role: str, res: dict, task: str | None = None, cfg: str = "") -> None:
@@ -316,7 +336,23 @@ def record_call(job, role: str, res: dict, task: str | None = None, cfg: str = "
 
 def budget_left(job, plan: dict) -> float | None:
     b = plan.get("budget_usd")
-    return None if b is None else max(float(b) - job.state.get("cost_usd", 0), 0.0)
+    if b is None:
+        return None
+    left = max(float(b) - job.state.get("cost_usd", 0), 0.0)
+    held = sum((getattr(job, "held", None) or {}).values())
+    # beside running tasks (the integrator, say): what they don't hold, but always enough for one call
+    return max(left - held, min(left, MANAGER_BUDGET, float(b) / 4)) if held else left
+
+
+BUDGET_MIN = 0.05  # less free than this: wait for a running call to give back what it didn't spend
+MANAGER_BUDGET = 1.0  # what one call beside running tasks may take (one costs $0.10-0.40)
+
+
+def budget_free(job, plan: dict, held: dict) -> float | None:
+    """What no running call holds. Calls that run side by side split this: each one's
+    --max-budget-usd counts its own process alone, so whole remainders would add up past the cap."""
+    b = plan.get("budget_usd")
+    return None if b is None else max(float(b) - job.state.get("cost_usd", 0) - sum(held.values()), 0.0)
 
 
 # ================================================================ capacity ===
@@ -1350,6 +1386,29 @@ def run_setup(cmds: list[str], cwd: Path, logf: Path, confine: Path | None = Non
     return True, ""
 
 
+def setup_integration(job: Job, plan: dict, integ: Path, confine: Path | None) -> tuple[bool, str]:
+    """plan.setup on the integration tree: at the start, and again wherever a merge may have changed
+    what it installs. What it rewrites in tracked files (a lockfile) is put back: verify and review
+    judge the commit, and a later `git add -A` must not pick it up."""
+    if not plan.get("setup"):
+        return True, ""
+
+    def unstaged() -> set[str]:
+        return set(git_paths(integ, "diff", "--name-only", "--no-renames"))
+
+    before = unstaged()
+    logf = job.dir / "logs" / "_integration.log"
+    ok, err = run_setup(plan["setup"], integ, logf, confine)
+    if not ok and has_worker_code(job, integ):  # on merged code a failure is judged as the code's: rule out a flaky install
+        log("setup failed on the merged tree; trying once more")
+        ok, err = run_setup(plan["setup"], integ, logf, confine)
+    edited = sorted(unstaged() - before)
+    if edited:
+        git(integ, "--literal-pathspecs", "checkout", "--", *edited)
+        log(f"setup rewrote tracked file(s), put back: {', '.join(printable(f) for f in edited[:8])}")
+    return ok, err
+
+
 def prepare_worktree(job: Job, tid: str, start_sha: str) -> tuple[Path, str]:
     """Main thread only: git worktree/branch operations are not safe to run concurrently."""
     repo = Path(job.state["repo"])
@@ -1364,6 +1423,46 @@ def prepare_worktree(job: Job, tid: str, start_sha: str) -> tuple[Path, str]:
     return wt, br
 
 
+# The repo's pre-commit hook as a check, where the worker's other checks run (the harness's own git
+# never runs hooks: a branch can write them). It is the main checkout's hook: a worktree may have none
+# (husky's dir is ignored) and a worker could delete its copy. It runs in a scratch git dir that holds
+# copies of refs and config and reads the repo's objects, with the task's changes staged there, so a
+# hook that stashes or moves refs works where the repo is read-only, and reaches none of the repo's.
+HOOK_CHECK = (
+    '(h=%s; [ -x "$h" ] || { echo "commit_hook: no executable pre-commit hook at $h"; exit 1; }; '
+    'c=$(git rev-parse --path-format=absolute --git-common-dir) && sha=$(git rev-parse HEAD) && '
+    'br=$(git symbolic-ref -q HEAD || true) && '
+    't=$(mktemp -d) && trap \'rm -rf "$t"\' EXIT && mkdir -p "$t/g/objects/info" && '
+    'git for-each-ref --format="create %%(refname) %%(objectname)" > "$t/refs" && '
+    'mkdir -p "$t/g/refs/heads" "$t/g/info" && cp "$c/config" "$t/g/config" && '
+    '{ git config --file "$t/g/config" --unset extensions.refstorage || true; } && '
+    '{ [ ! -f "$c/info/exclude" ] || cp "$c/info/exclude" "$t/g/info/"; } && '
+    '{ [ ! -f "$c/info/attributes" ] || cp "$c/info/attributes" "$t/g/info/"; } && '
+    '{ [ ! -f "$c/shallow" ] || cp "$c/shallow" "$t/g/"; } && '
+    'echo "$c/objects" > "$t/g/objects/info/alternates" && '
+    'if [ -n "$br" ]; then echo "ref: $br"; else echo "$sha"; fi > "$t/g/HEAD" && export GIT_DIR="$t/g" GIT_WORK_TREE="$PWD" && '
+    'git config core.bare false && git update-ref --stdin < "$t/refs" && '
+    'git read-tree HEAD && git add -A && "$h")')
+
+
+def commit_hook_path(repo: Path) -> Path | None:
+    # plain git, reading config only: jail.GIT would answer /dev/null
+    p = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=repo, capture_output=True, text=True)
+    return (repo / p.stdout.strip() / "pre-commit").absolute() if p.returncode == 0 and p.stdout.strip() else None
+
+
+def task_checks(plan: dict, task: dict) -> list[str]:
+    if not plan.get("commit_hook"):
+        return list(task["verify"])
+    hook = commit_hook_path(Path(plan["repo"]))
+    return [*task["verify"], HOOK_CHECK % shlex.quote(str(hook or "pre-commit"))]
+
+
+def has_commit_hook(repo: Path) -> bool:
+    hook = commit_hook_path(repo)
+    return bool(hook) and hook.is_file() and os.access(hook, os.X_OK)
+
+
 def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, budget: float | None) -> dict:
     """Runs in a worker thread: setup, handoff brief, run_task.py (routing/retries/escalation).
 
@@ -1372,6 +1471,8 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
     # on the user's own base commit setup is their code; with merged work in it, it is workers' code
     ok, err = run_setup(plan.get("setup", []), wt, logf,
                         confinement(plan) if has_worker_code(job, wt) else None)
+    if claude_cli.stopping.is_set():
+        return {"ok": False, "result": "interrupted", "wt": str(wt), "branch": br}
     if not ok:
         return {"ok": False, "result": "environment", "error": err, "wt": str(wt), "branch": br}
     upstream = {d: job.state["tasks"].get(d, {}) for d in task.get("depends_on", [])}
@@ -1390,7 +1491,7 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
         cmd += ["--max-model", plan["max_model"]]
     if plan.get("advisor"):
         cmd += ["--advisor", plan["advisor"]]
-    for v in task["verify"]:
+    for v in task_checks(plan, task):
         cmd += ["--verify", v]
     if isinstance(task.get("baseline"), list):
         for b in task["baseline"]:
@@ -1412,18 +1513,43 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
     env = {**os.environ, "ORCHESTRATE_SLOT": str(slot), "ORCHESTRATE_JOB": job.id,
            "ORCHESTRATE_TASK": task["id"]}
     with open(logf, "a") as fh:
-        p = subprocess.run(cmd, cwd=wt, input=brief, stdout=subprocess.PIPE, stderr=fh, encoding="utf-8",
-                           errors="replace", env=env)
-    summary = extract_json(p.stdout) or {}
+        code, stdout = run_child(cmd, wt, brief, fh, env)
+    summary = extract_json(stdout) or {}
     report = summary.get("report")
     if not (isinstance(report, dict) and "summary" in report):
         report = extract_json(summary.get("final_message", "")) or {}
     cost = sum((s.get("cost_usd") or 0) + (s.get("classifier_cost_usd") or 0)
                for s in summary.get("steps", []))
-    return {"ok": p.returncode == 0, "result": summary.get("result", f"exit {p.returncode}"),
+    return {"ok": code == 0, "result": summary.get("result", f"exit {code}"),
             "steps": summary.get("steps", []), "proposals": summary.get("proposals", []),
+            "usage_limit": summary.get("usage_limit"),
             "report": report, "cost_usd": cost, "wt": str(wt), "branch": br,
             "final_message": (summary.get("final_message") or "")[-3000:]}
+
+
+_children: set = set()  # run_task processes, each the leader of its own group
+
+
+def run_child(cmd: list[str], cwd: Path, text: str, stderr, env: dict | None = None) -> tuple[int, str]:
+    """run_task.py in a group of its own, so it can be stopped with everything it started."""
+    p = subprocess.Popen([*cmd[:-1], "--parent", str(os.getpid()), cmd[-1]], cwd=cwd, env=env,
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, encoding="utf-8",
+                         errors="replace", start_new_session=True)
+    _children.add(p)
+    if claude_cli.stopping.is_set():  # interrupted while this one was being started
+        stop_child(p)
+    try:
+        out, _ = p.communicate(text)
+        return p.returncode, out
+    finally:
+        if p.poll() is None:  # interrupted while waiting
+            stop_child(p)
+        _children.discard(p)
+
+
+def stop_child(p: subprocess.Popen) -> None:
+    with contextlib.suppress(OSError):
+        os.killpg(p.pid, signal.SIGTERM)
 
 
 def read_claims(job: Job) -> dict:
@@ -1595,6 +1721,12 @@ Reply with the JSON object: resolved (true|false), notes."""
     busy = {s.get("slot") for t, s in job.state["tasks"].items() if s.get("status") == "running" and t != task["id"]}
     slot = next(i for i in range(len(busy) + 1) if i not in busy)
     env = {**os.environ, "ORCHESTRATE_SLOT": str(slot), "ORCHESTRATE_JOB": job.id, "ORCHESTRATE_TASK": task["id"]}
+    if cmds:
+        ok, err = setup_integration(job, plan, integ, confinement(plan))  # on the resolved tree
+        if not ok:
+            job.state["tasks"][task["id"]]["merge_verify"] = {"cmd": "setup", "ok": False, "tail": err[-3000:],
+                                                              "files": conflicted}
+            return False, f"integrator resolution fails verify: setup\n{err[-1500:]}"
     for c in cmds:  # commit_and_merge aborts the merge if this is interrupted
         code, out = sh(c, integ, 1800, env=env, confine=confinement(plan))
         if code:
@@ -1625,7 +1757,10 @@ def verify_and_review(job: Job, plan: dict, rnd_no: int) -> tuple[dict, list[dic
     integ = Path(job.state["integration_wt"])
     clear_unfinished_merge(integ)  # never verify or review a half-merged tree
     code, vout = 0, ""
-    for c in plan["verify"]:
+    ok, err = setup_integration(job, plan, integ, confinement(plan))  # merges may add a dependency
+    if not ok:
+        code, vout = 1, err[-4000:]
+    for c in plan["verify"] if ok else []:
         code, out = sh(c, integ, 1800, confine=confinement(plan))
         vout += f"$ {c}\n{out[-4000:]}\n"
         if code:
@@ -1709,18 +1844,20 @@ def legacy_fix_round(job: Job, plan: dict, rnd_no: int, blocking: list[dict]) ->
     if left is not None:
         cmd[-1:-1] = ["--budget-usd", f"{max(left, 0.01):.2f}"]
     with open(job.dir / "logs" / f"_fix-round-{rnd_no}.log", "a") as fh:
-        p = subprocess.run(cmd, cwd=integ, input=task, stdout=subprocess.PIPE, stderr=fh, encoding="utf-8",
-                           errors="replace")
+        _, stdout = run_child(cmd, integ, task, fh)
     if not on_branch(integ, job.state["branch"]):
         raise RuntimeError(f"review round {rnd_no}: the integration worktree left {job.state['branch']}; "
                            "nothing was committed")
     if git(integ, "rev-parse", "HEAD") != before:
         git(integ, "reset", "-q", "--soft", before)  # what it committed is judged like what it only edited
-    s = extract_json(p.stdout) or {}
+    s = extract_json(stdout) or {}
     for x in s.get("steps", []):
         record_call(job, "fix_round", {"total_cost_usd": (x.get("cost_usd") or 0) + (x.get("classifier_cost_usd") or 0),
                                        "metrics": x.get("metrics")}, None, x.get("config", ""))
     job.state["review"]["rounds"][-1]["fix"] = {"result": s.get("result"), "steps": s.get("steps")}
+    if s.get("result") == "usage_limit":
+        job.save()
+        raise UsageLimit(str(s.get("usage_limit") or ""))
     stray = scope_violations(integ, union)
     if stray:  # never commit what the fix (or anything else) left outside the job's files
         log(f"review round {rnd_no}: not committing {len(stray)} path(s) outside the job's files: "
@@ -2829,11 +2966,18 @@ the other areas expect. Reply with the JSON object: edge_cases, findings, raise_
 verdict."""
 
     am, ae = models.role("area_reviewer", plan)
+    each = budget_left(job, plan)
+    if each is not None and areas:
+        each /= len(areas)  # they run side by side
     with cf.ThreadPoolExecutor(max_workers=min(4, len(areas) or 1)) as ex:
         futs = {a: ex.submit(claude, area_prompt(a, fs), am, ae, integ, perm="dontAsk",
                              tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY, schema=schemas.AREA_REVIEW,
-                             budget_usd=budget_left(job, plan)) for a, fs in areas.items()}
-        results = {a: f.result() for a, f in futs.items()}
+                             budget_usd=each) for a, fs in areas.items()}
+        try:
+            results = {a: f.result() for a, f in futs.items()}
+        except KeyboardInterrupt:
+            claude_cli.stopping.set()
+            raise
     area_v = {}
     for a, res in results.items():  # main thread: record_call and the re-ask update job state
         record_call(job, "reviewer_area", res, None, f"{am}/{ae}")
@@ -3270,11 +3414,27 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
     return out
 
 
+def _judged(job: Job) -> tuple[str, str]:
+    """What a kept verdict is about: the commit, and the plan it was judged against."""
+    plan = json.dumps(job.plan, sort_keys=True).encode("utf-8", "surrogateescape")
+    return (git(Path(job.state["integration_wt"]), "rev-parse", "HEAD"),
+            hashlib.sha256(plan).hexdigest())
+
+
+def _still_judged(job: Job) -> None:
+    """The harness's own edits (cleanup, a raised bar) don't make a kept verdict stale; the user's do."""
+    kept = job.state["review"].get("undecided")
+    if kept:
+        kept["head"], kept["plan"] = _judged(job)
+        job.save()
+
+
 def final_gate(job: Job, plan: dict, rnd_no: int, review_v: dict | None) -> tuple[list[dict], str | None]:
     """After the reviewer passes: cleanup, then the advisor's check before hand-over.
     Returns (blocking findings, error). An advisor with no usable answer is an error (fail closed)."""
     cleanup_pass(job, plan)
     integ = Path(job.state["integration_wt"])
+    _still_judged(job)  # cleanup's commit
     rnd = job.state["review"]["rounds"][-1]
     if "advisor:final" in job.state.get("approved", []):
         log("advisor final check overridden by the user (--approve advisor:final)")
@@ -3296,6 +3456,7 @@ def final_gate(job: Job, plan: dict, rnd_no: int, review_v: dict | None) -> tupl
     if blocking:
         raise_bar(job, plan, regression_criteria(blocking, rnd_no), f"advisor-finding:round{rnd_no}",
                   BAR_MAX_REGRESSION)
+        _still_judged(job)  # the criteria it just added
     job.save()
     return blocking, None
 
@@ -3410,15 +3571,19 @@ def manager_call(cfg: dict, integ: Path, prompt: str, full: str, session: str | 
               extra_args=["--add-dir", str(job_dir)])
     res = claude(prompt, cfg["model"], cfg["effort"], integ, resume=session, budget_usd=budget, **kw)
     out = [res]
+
+    def left() -> float | None:  # one share for up to three calls
+        return None if budget is None else max(budget - sum(r.get("total_cost_usd") or 0 for r in out), 0.0)
+
     if res.get("is_error") and session and res.get("error_kind") not in ("budget",):
-        res = claude(full, cfg["model"], cfg["effort"], integ, budget_usd=budget, **kw)  # lost session
+        res = claude(full, cfg["model"], cfg["effort"], integ, budget_usd=left(), **kw)  # lost session
         out.append(res)
     d = res.get("structured")
     if not (isinstance(d, dict) and isinstance(d.get("actions"), list)) and res.get("error_kind") != "budget":
         res = claude("ORCHESTRATE_MANAGE\nEVENT: invalid_reply\nYour reply was not a valid decision. "
                      "Reply with ONLY the JSON object described in \"Manager output\".",
                      cfg["model"], cfg["effort"], integ,
-                     resume=res.get("session_id") or session, budget_usd=budget, **kw)
+                     resume=res.get("session_id") or session, budget_usd=left(), **kw)
         out.append(res)
     return out
 
@@ -3456,8 +3621,12 @@ def ask_manager(job: Job, plan: dict, event: dict) -> dict:
                              f"Latest event: {event.get('kind')} {event.get('task', '')}. How should we proceed?"}]}
     m["interventions"] += 1
     prompt, full = manager_prompt(job, plan, event)
-    results = manager_call(cfg, Path(job.state["integration_wt"]), prompt, full, m["session"],
-                           budget_left(job, plan), job.dir)
+    try:
+        results = manager_call(cfg, Path(job.state["integration_wt"]), prompt, full, m["session"],
+                               budget_left(job, plan), job.dir)
+    except UsageLimit:
+        m["interventions"] -= 1
+        raise
     return manager_finish(job, plan, results, event)
 
 
@@ -3824,6 +3993,8 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     repo = Path(job.state["repo"])
     budget = plan.get("budget_usd")
     running: dict[cf.Future, str] = {}
+    held: dict[str, float] = {}  # running call -> the budget it was given
+    job.held = held
     free_slots = list(range(cap))
     pool = cf.ThreadPoolExecutor(max_workers=cap)
     mgr_pool = cf.ThreadPoolExecutor(max_workers=1)
@@ -3832,6 +4003,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     mgr: dict | None = None
     holds: set[str] = set()
     stop_reason, human_q, abort_reason = None, None, None
+    limit_msg = budget_msg = ""
 
     def tasks():
         return {t["id"]: t for t in plan["tasks"]}
@@ -3856,18 +4028,32 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
         m["interventions"] += 1
         prompt, full = manager_prompt(job, plan, event)
         log(f"manager: {event['kind']} {event.get('task', '')}".rstrip())
+        share = budget_free(job, plan, held)
+        if share is not None and running:
+            share = min(share, max(MANAGER_BUDGET, share / 4))
+        if share is not None:
+            held[""] = share  # "" is no task id
         fut = mgr_pool.submit(manager_call, mcfg, integ, prompt, full, m["session"],
-                              budget_left(job, plan), job.dir)
+                              share, job.dir)
         mgr = {"future": fut, "event": event, "stage": stage, "entry": entry, "started": time.time()}
         holds = affected_tasks(plan, event if stage == "first" else entry["_event"])
 
     def complete() -> None:
-        nonlocal mgr, holds
+        nonlocal mgr, holds, stop_reason, limit_msg
         assert mgr is not None
+        held.pop("", None)
         if "done" in mgr:
             decision = mgr["done"]
         else:
-            decision = manager_finish(job, plan, mgr["future"].result(), mgr["event"])
+            try:
+                replies = mgr["future"].result()
+            except UsageLimit as e:
+                queue.insert(0, mgr["event"] if mgr["stage"] == "first" else mgr["entry"]["_event"])
+                manager_state(job)["interventions"] -= 1
+                stop_reason, limit_msg = "usage_limit", str(e)
+                mgr, holds = None, set()
+                return
+            decision = manager_finish(job, plan, replies, mgr["event"])
             m = manager_state(job)
             m["busy_s"] = round(m.get("busy_s", 0) + time.time() - mgr["started"], 1)
         if mgr["stage"] == "first":
@@ -3897,7 +4083,8 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
         while True:
             if mgr is not None and "done" in mgr:
                 complete()
-            if mgr is None and queue and not stop_reason:
+            if mgr is None and queue and not stop_reason \
+                    and (not running or budget is None or budget_free(job, plan, held) >= BUDGET_MIN):
                 ev = queue[0] if len(queue) == 1 else {"kind": "batch", "events": list(queue)}
                 queue.clear()
                 submit(ev, "first", None)
@@ -3908,6 +4095,10 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                 t for t in T if job.state["tasks"][t]["status"] in ("pending", "awaiting_approval")
                 and t not in holds and all(satisfied(d) for d in T[t].get("depends_on", []))]
             launched = False
+            share = budget_free(job, plan, held)
+            if share is not None:
+                open_now = [t for t in ready if not T[t].get("gate") or t in job.state["approved"]]
+                share /= max(min(len(open_now), cap - len(running)), 1)
             for tid in ready:
                 if len(running) >= cap:
                     break
@@ -3920,6 +4111,8 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                 if budget and job.state["cost_usd"] >= budget:
                     stop_reason = "budget"
                     break
+                if share is not None and share < BUDGET_MIN and (running or held):
+                    break  # all of it is with running calls
                 if running and not admission_ok(float(plan.get("mem_per_agent_gb", MEM_PER_AGENT_GB))):
                     break  # low memory right now: wait for a running task to finish
                 slot = free_slots.pop(0)
@@ -3928,8 +4121,9 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                 st.update(status="running", started=time.time(), start_sha=start_sha, slot=slot)
                 job.save()
                 log(f"start {tid} [{T[tid]['type']} {T[tid]['tier']}] slot {slot}")
-                running[pool.submit(exec_task, job, plan, T[tid], wt, br, slot,
-                                    budget_left(job, plan))] = tid
+                if share is not None:
+                    held[tid] = share
+                running[pool.submit(exec_task, job, plan, T[tid], wt, br, slot, share)] = tid
                 launched = True
             job.save()
             waits = list(running) + ([mgr["future"]] if mgr and "future" in mgr else [])
@@ -3943,6 +4137,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                 if fut not in running:
                     continue
                 tid = running.pop(fut)
+                given = held.pop(tid, None)
                 st = job.state["tasks"][tid]
                 free_slots.append(st["slot"])
                 free_slots.sort()
@@ -3977,13 +4172,24 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                 if res.get("result") == "budget":
                     st["status"] = "pending"
                     stop_reason = "budget"
+                    if given is not None:
+                        budget_msg = f"{tid} used up its ${given:.2f} share; resume gives it what is left"
                     log(f"STOP  {tid}: budget reached")
+                elif res.get("result") == "usage_limit":
+                    st["status"] = "pending"
+                    stop_reason, limit_msg = "usage_limit", str(res.get("usage_limit") or "")
+                    log(f"STOP  {tid}: usage limit")
                 elif res.get("ok"):
                     try:
                         ok, info = commit_and_merge(job, plan, T[tid], res)
+                    except UsageLimit as e:  # the integrator's: the merge was undone
+                        ok, info = None, str(e)
                     except Exception as e:  # noqa: BLE001
                         ok, info = False, f"commit/merge error: {e}"
-                    if ok:
+                    if ok is None:
+                        st["status"] = "pending"
+                        stop_reason, limit_msg = "usage_limit", info
+                    elif ok:
                         st.update(status="done", files=json.loads(info))
                         log(f"done  {tid} ({len(st['files'])} files merged)")
                         raise_bar(job, plan, (res.get("report") or {}).get("raise_bar") or [],
@@ -4016,6 +4222,9 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                              "log_tail": logtail})
                 job.save()
     except KeyboardInterrupt:
+        claude_cli.stopping.set()
+        for child in list(_children):  # in groups of their own, so Ctrl-C didn't reach them
+            stop_child(child)
         for fut, tid in running.items():
             job.state["tasks"][tid]["status"] = "pending"
         if mgr is not None and mgr.get("event"):
@@ -4025,6 +4234,7 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
         mgr_pool.shutdown(wait=True, cancel_futures=True)
+        job.held = {}
 
     if queue:
         job.state["pending_events"] = queue  # handled after the user answers / resumes
@@ -4038,7 +4248,9 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
     T = tasks()
     statuses = {t: job.state["tasks"][t]["status"] for t in T}
     if stop_reason == "budget":
-        return finish(job, plan, "budget", f"budget ${budget} reached")
+        return finish(job, plan, "budget", f"budget ${budget} reached" + (f" ({budget_msg})" if budget_msg else ""))
+    if stop_reason == "usage_limit":
+        return usage_limit_stop(job, plan, limit_msg)
     if any(s in ("failed", "blocked") for s in statuses.values()):
         bad = {t: s for t, s in statuses.items() if s in ("failed", "blocked")}
         env = [t for t in bad if job.state["tasks"][t].get("result") == "environment"]
@@ -4107,11 +4319,18 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
         return finish(job, plan, "environment",
                       f'plan.sandbox is true, but {why}. Install bubblewrap (or drop "sandbox"), then '
                       f"`orchestrate.py resume {job.id}`.")
+    if plan.get("commit_hook") and not has_commit_hook(repo):
+        return finish(job, plan, "environment",
+                      "plan.commit_hook is true, but the repo has no executable pre-commit hook. Install it (or "
+                      f'drop "commit_hook"), then `orchestrate.py resume {job.id}`.')
+    job.state["commit_hook_skipped"] = not plan.get("commit_hook") and has_commit_hook(repo)
+    if job.state["commit_hook_skipped"]:
+        log('note: the repo\'s pre-commit hook will not run (set "commit_hook": true to run it as a check on each task)')
     job.state["unconfined"] = "plan.sandbox is false" if mode == "off" else why
     if job.state["unconfined"]:
         log(f"warning: workers are NOT confined ({job.state['unconfined']}): they can write anywhere you can")
     confine = confinement(plan) if has_worker_code(job, integ) else None  # a resume; first time it's the user's code
-    ok, err = run_setup(plan.get("setup", []), integ, logf, confine)
+    ok, err = setup_integration(job, plan, integ, confine)
     if not ok:
         return finish(job, plan, "environment", err)
     if not skip_baseline and not job.state.get("baseline_ok"):
@@ -4137,6 +4356,7 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
         job.state["ui_preflight_ok"] = True
         job.save()
 
+    event = None
     if job.state.get("human_question"):
         if not answer:
             return finish(job, plan, "awaiting_human",
@@ -4144,7 +4364,18 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
                           f"Answer with: orchestrate.py resume {job.id} --answer \"...\"")
         q = job.state.pop("human_question")
         record_answer(job, plan, q, answer)
-        r = manage(job, plan, {"kind": "human_answer", "question": q, "answer": answer})
+        event = {"kind": "human_answer", "question": q, "answer": answer}
+    else:  # an answer the manager couldn't take yet is still decided before any task restarts
+        queued = job.state.get("pending_events") or []
+        event = next((e for e in queued if e.get("kind") == "human_answer"), None)
+        if event:
+            queued.remove(event)
+    if event:
+        try:
+            r = manage(job, plan, event)
+        except (UsageLimit, KeyboardInterrupt):
+            job.state.setdefault("pending_events", []).insert(0, event)
+            raise
         if r.get("hint") == "ask_human":
             job.state["human_question"] = r.get("question")
             return finish(job, plan, "awaiting_human", f"the manager needs your input: {r.get('question')}")
@@ -4163,10 +4394,27 @@ def review_round(job: Job, plan: dict) -> int | str:
     """One review round once every task has merged: final verify, reviewer, cleanup and the
     advisor's final check, then the manager on what blocks. Returns an exit code, or "more_tasks"
     when the manager queued fix tasks, or "fix_round" when nobody did and a fix is still owed."""
+    r = _review_round(job, plan)
+    # only a decision clears it: an exception (a usage limit, Ctrl-C) or a kill leaves it for resume
+    if job.state["review"].pop("undecided", None) is not None:
+        job.save()
+    return r
+
+
+def _review_round(job: Job, plan: dict) -> int | str:
     rounds = int(plan.get("review_rounds", 2))
-    rnd_no = len(job.state["review"]["rounds"]) + 1
-    log(f"all tasks merged; final verify + review (round {rnd_no})")
-    verdict, blocking = verify_and_review(job, plan, rnd_no)
+    integ = Path(job.state["integration_wt"])
+    kept = job.state["review"].get("undecided")
+    if kept and (kept["head"], kept.get("plan")) == _judged(job):
+        rnd_no, verdict, blocking = kept["round"], kept["verdict"], kept["blocking"]
+        log(f"round {rnd_no} was reviewed but not decided on; going on from its verdict")
+    else:
+        rnd_no = len(job.state["review"]["rounds"]) + 1
+        log(f"all tasks merged; final verify + review (round {rnd_no})")
+        verdict, blocking = verify_and_review(job, plan, rnd_no)
+        if not verdict.get("reviewer_error"):
+            job.state["review"]["undecided"] = {"round": rnd_no, "verdict": verdict, "blocking": blocking}
+            _still_judged(job)
     if verdict.get("reviewer_error"):
         what = verdict.get("not_reviewed")
         return finish(job, plan, "review_failed",
@@ -4228,6 +4476,20 @@ def run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
     """Headless mode: this process runs every worker itself (`claude -p` via run_task.py)."""
     job.state["pid"] = os.getpid()
     job.state["mode"] = "headless"
+    claude_cli.stopping.clear()
+    try:
+        return _run_job(job, plan, approve, max_parallel, skip_baseline, answer)
+    except UsageLimit as e:
+        return usage_limit_stop(job, plan, e)
+    except KeyboardInterrupt:  # anywhere outside the scheduler, e.g. waiting for a reset
+        claude_cli.stopping.set()
+        for child in list(_children):
+            stop_child(child)
+        return finish(job, plan, "interrupted", "interrupted by user")
+
+
+def _run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
+             skip_baseline: bool, answer: str | None = None) -> int:
     code = prepare_job(job, plan, approve, max_parallel, skip_baseline, answer)
     if code is not None:
         return code
@@ -4238,12 +4500,16 @@ def run_job(job: Job, plan: dict, approve: list[str], max_parallel: int | None,
         code = run_tasks(job, plan, job.state["capacity"]["cap"], ctx)
         if code is not None:
             return code
-        r = review_round(job, plan)
+        # a fix round a usage limit cut short is owed before anyone reviews the same code again
+        r = "fix_round" if job.state["review"].get("owed_fix") else review_round(job, plan)
         if isinstance(r, int):
             return r
         if r == "fix_round":
-            owed = job.state["review"].pop("owed_fix")
-            if not legacy_fix_round(job, plan, owed["round"], owed["findings"]):
+            owed = job.state["review"]["owed_fix"]
+            fixed = legacy_fix_round(job, plan, owed["round"], owed["findings"])
+            job.state["review"].pop("owed_fix", None)  # only once it ran: until then a resume owes it
+            job.save()
+            if not fixed:
                 # the same code again would only get a fresh reviewer's second opinion on it
                 return finish(job, plan, "review_failed",
                               f"the fix subagent changed nothing, so round {owed['round']}'s findings still "
@@ -4327,7 +4593,7 @@ Return {{"lessons": []}} if nothing qualifies.
 
 {fence('job notes', fit_json(material, 16000), 18000)}"""
     res = claude(prompt, cfg["model"], cfg["effort"], repo, perm="plan", tools=[], only=[],
-                 schema=schemas.LESSONS, budget_usd=None, timeout=600)
+                 schema=schemas.LESSONS, budget_usd=None, timeout=600, wait=False)  # best-effort
     record_call(job, "lessons", res, None, f"{cfg['model']}/{cfg['effort']}")
     lessons = (res.get("structured") or {}).get("lessons") or []
     area = plan.get("area", "cross") if router.AREA_RE.match(plan.get("area", "cross")) else "cross"
@@ -4451,6 +4717,8 @@ def skipped_checks(s: dict, plan: dict) -> list[str]:
             out.append(f"advisor final check: overridden by the user (--approve advisor:final), round {r.get('round')}")
     if s.get("baseline_skipped") and not s.get("baseline_ok"):
         out.append("job baseline: not run (--skip-baseline)")
+    if s.get("commit_hook_skipped"):
+        out.append('repo pre-commit hook: not run (plan "commit_hook": true runs it as a check on each task)')
     if s.get("unconfined"):
         out.append(f"worker confinement: none ({s['unconfined']}); workers could write outside their worktrees")
     gates = {t["id"] for t in plan.get("tasks", []) if t.get("gate")}
@@ -5561,4 +5829,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except UsageLimit as e:  # outside a headless job: plan, advise, an Orca step
+        print(f"your Claude usage limit stopped this: {e}\nRun it again after the reset.", file=sys.stderr)
+        sys.exit(3)

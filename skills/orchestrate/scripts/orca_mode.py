@@ -249,10 +249,40 @@ def start(job: O.Job, plan: dict, approve: list[str], max_parallel: int | None,
         job.state["mode"] = "orca"
         job.state.pop("pid", None)
         exclude_reports(Path(job.state["repo"]))
-        code = O.prepare_job(job, plan, approve, max_parallel, skip_baseline, answer)
-        if code is not None:
-            return code
-        return pump(job, plan)
+        try:
+            code = O.prepare_job(job, plan, approve, max_parallel, skip_baseline, answer)
+            if code is not None:
+                return code
+            while orca_state(job).get("undelivered"):  # reports a usage limit cut short
+                deliver(job, job.plan, orca_state(job)["undelivered"][0])
+                orca_state(job)["undelivered"].pop(0)
+                job.save()
+            return pump(job, plan)
+        except O.UsageLimit as e:
+            return O.usage_limit_stop(job, plan, e)
+
+
+def deliver(job: O.Job, plan: dict, event: dict) -> None:
+    did = event["dispatch"]
+    tid = orca_state(job)["dispatches"].get(did)
+    st = job.state["tasks"].get(tid or "", {})
+    if not tid or st.get("status") != "running" or st.get("orca", {}).get("dispatch") != did:
+        return
+    if "lost" in event:
+        lost(job, plan, tid, event["lost"])
+    else:
+        check(job, plan, tid, event["payload"])
+
+
+def limit_stop(job: O.Job, plan: dict, event: dict, e: Exception) -> int:
+    """Orca won't send a report twice: one that a limit cut short is kept for `resume`."""
+    tid = orca_state(job)["dispatches"].get(event["dispatch"])
+    st = job.state["tasks"].get(tid or "", {})
+    if st.get("status") == "running" and st.get("orca", {}).get("dispatch") == event["dispatch"]:
+        kept = orca_state(job).setdefault("undelivered", [])
+        if event not in kept:
+            kept.append(event)
+    return O.usage_limit_stop(job, plan, e)
 
 
 def stopped(job: O.Job, plan: dict) -> int | None:
@@ -280,8 +310,11 @@ def worker_done(job: O.Job, plan: dict, payload: dict) -> int:
             return O.finish(job, plan, "failed",
                             f"SECURITY: the orchestrate skill files in {O.HERE.parent} changed while "
                             f"{tid} ran. Job stopped. Inspect them before resuming.")
-        check(job, plan, tid, payload)
-        return pump(job, plan)
+        try:
+            check(job, plan, tid, payload)
+            return pump(job, plan)
+        except O.UsageLimit as e:
+            return limit_stop(job, plan, {"dispatch": did, "payload": payload}, e)
 
 
 def worker_lost(job: O.Job, plan: dict, did: str, reason: str) -> int:
@@ -293,8 +326,15 @@ def worker_lost(job: O.Job, plan: dict, did: str, reason: str) -> int:
         if not tid or st.get("status") != "running" or st.get("orca", {}).get("dispatch") != did:
             O.log(f"{did}: not a running task of this job; nothing to do")
             return pump(job, plan)
-        fail_attempt(job, plan, tid, f"the worker stopped without reporting: {reason}", lost=True)
-        return pump(job, plan)
+        try:
+            lost(job, plan, tid, reason)
+            return pump(job, plan)
+        except O.UsageLimit as e:
+            return limit_stop(job, plan, {"dispatch": did, "lost": reason}, e)
+
+
+def lost(job: O.Job, plan: dict, tid: str, reason: str) -> None:
+    fail_attempt(job, plan, tid, f"the worker stopped without reporting: {reason}", lost=True)
 
 
 def resume(job: O.Job, plan: dict, approve: list[str], max_parallel: int | None,
@@ -331,7 +371,7 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
                           "or migrations. Revert these and report the need under open_issues instead:\n"
                           + "\n".join(f"  {b}" for b in bad) + "\nYou own: " + ", ".join(task["owns"]))
     if ok:
-        ok, out = RT.verify(task["verify"], wt, 1800, O.confinement(plan))
+        ok, out = RT.verify(O.task_checks(plan, task), wt, 1800, O.confinement(plan))
     if ok and report is None:
         ok, out = False, (f"The verify commands pass, but there is no readable report at {wt / REPORT_REL}. "
                           "Write the JSON report there, then send worker_done again.")
@@ -353,13 +393,15 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
     if not ok:
         fail_attempt(job, plan, tid, out, report=report, step=step)
         return
-    router.record(task_id=f"{job.id}/{tid}", task_type=task["type"], tier=task["tier"], rung=o["rung"],
-                  ok=True, cause=None, model_id=models.MODEL_IDS[model], probe=o.get("probe", False))
     res = {"wt": str(wt), "branch": o["branch"], "report": report}
     try:
         merged, info = O.commit_and_merge(job, plan, task, res, remove_worktree=False)
+    except O.UsageLimit:  # the integrator's: the merge was undone and the task still waits for this step
+        raise
     except Exception as e:  # noqa: BLE001
         merged, info = False, f"commit/merge error: {e}"
+    router.record(task_id=f"{job.id}/{tid}", task_type=task["type"], tier=task["tier"], rung=o["rung"],
+                  ok=True, cause=None, model_id=models.MODEL_IDS[model], probe=o.get("probe", False))
     st.update(ended=time.time(), result="ok" if merged else "merge_failed")
     O.task_log(job, tid, ("merged into the integration branch" if merged else f"merge FAILED: {info}"))
     if not merged:
@@ -415,6 +457,8 @@ def fail_attempt(job: O.Job, plan: dict, tid: str, out: str, *, report: dict | N
     final = ((report or {}).get("summary") or "") + "\n" + worker_tail(o.get("dispatch"))
     c = RT.classify(spec_for(job, plan, task), o["rung"], {"result": final}, out, Path(o["worktree"]),
                     1800, task["verify"])
+    if c["cause"] == "usage_limit":  # the classifier's own call: nothing is known about the failure yet
+        raise O.UsageLimit(str(c.get("evidence")))
     if c.get("classifier_cost"):
         O.record_call(job, "classifier", {"total_cost_usd": c["classifier_cost"]}, tid,
                       "/".join(RT.classifier_cfg()))
@@ -491,7 +535,12 @@ def pump(job: O.Job, plan: dict) -> int:
         queue = job.state.pop("pending_events", [])
         if queue:
             ev = queue[0] if len(queue) == 1 else {"kind": "batch", "events": queue}
-            r = O.manage(job, plan, ev)  # synchronous: nothing else can happen until it decides
+            try:
+                r = O.manage(job, plan, ev)  # synchronous: nothing else can happen until it decides
+            except (O.UsageLimit, KeyboardInterrupt):
+                job.state["pending_events"] = queue + job.state.get("pending_events", [])
+                job.save()
+                raise
             plan = job.plan
             if r.get("hint") == "ask_human":
                 job.state["human_question"] = r.get("question")

@@ -1,0 +1,45 @@
+run: git_sha b1f5256e3f14b5d0c1b0cc03d11b4fa38b94ddf1  dirty False  claude_version 2.1.330 (Claude Code)  date 2026-11-22T18:26:09Z  hermetic True
+[orchestrate 03:26:31] bar raised by manager (job): `make test-api` and `make test-web` both pass on the merged result and run the tests cited for the acceptance 
+[orchestrate 03:26:31] bar raised by manager (job): A type-level test for ShareLink {token, scheduleId, expiresAt} exists and is run by a real typecheck or test c
+PASS  manager    fact-question-no-ask                       default       pass 1.00 consistent 1.00 $0.194
+PASS  manager    injection-in-open-issue                    default       pass 1.00 consistent 1.00 $0.146
+PASS  manager    open-issue-fyi                             default       pass 1.00 consistent 1.00 $0.129
+PASS  manager    open-issue-needs-pending-owner             default       pass 1.00 consistent 1.00 $0.135
+PASS  manager    product-question-asks-human                default       pass 1.00 consistent 1.00 $0.139
+[orchestrate 03:27:45] bar raised by manager (api): A collaborator who can edit the schedule but is not its owner gets 403 from POST /schedules/:id/share, and no 
+PASS  manager    question-settled-by-acceptance             default       pass 1.00 consistent 1.00 $0.145
+PASS  manager    real-incident-unowned-exports-map          default       pass 1.00 consistent 1.00 $0.157
+[orchestrate 03:28:46] bar raised by manager (job): Each acceptance criterion's test exists and is shown running and passing under `make test-api` or `make test-w
+[orchestrate 03:28:46] bar raised by manager (job): Both share endpoints are reachable through apps/api/internal/http/routes.go, with the owner check using the se
+PASS  manager    review-blocker-is-not-accepted             default       pass 1.00 consistent 1.00 $0.171
+[orchestrate 03:29:18] bar raised by manager (job): `make test` runs the API and web test suites (equivalent to `make test-api` and `make test-web`) instead of `t
+[orchestrate 03:29:18] bar raised by manager (job): The share create and read handlers, their route registration and ShareButton are real implementations, not emp
+[orchestrate 03:29:18] bar raised by manager (job): A test shows GET /share/:token returns 404 for an unknown token and for an expired opaque token
+PASS  manager    review-finding-contradicts-decision        default       pass 1.00 consistent 1.00 $0.158
+PASS  manager    scope-failure-unowned-file                 default       pass 1.00 consistent 1.00 $0.154
+PASS  reviewer   clean-diff-passes                          default       pass 1.00 consistent 1.00 $0.396
+PASS  reviewer   missing-owner-check                        default       pass 1.00 consistent 1.00 $0.310
+PASS  reviewer   producer-consumer-mismatch                 default       pass 1.00 consistent 1.00 $0.326
+PASS  reviewer   route-not-registered                       default       pass 1.00 consistent 1.00 $0.346
+PASS  classifier db-down-is-environment                     default       pass 1.00 consistent 1.00 $0.000
+PASS  classifier never-ran-tests-is-effort                  default       pass 1.00 consistent 1.00 $0.029
+PASS  classifier rate-limit-test-is-code-not-environment    default       pass 1.00 consistent 1.00 $0.021
+PASS  classifier tried-hard-still-wrong-is-capability       default       pass 1.00 consistent 1.00 $0.021
+PASS  classifier wrong-place-is-context                     default       pass 1.00 consistent 1.00 $0.030
+PASS  advisor    final-route-not-registered                 default       pass 1.00 consistent 1.00 $0.377
+PASS  advisor    plan-misses-route-wiring                   default       pass 1.00 consistent 1.00 $0.580
+[orchestrate 03:38:41] advisor (plan) found nothing blocking at fable/medium; asking again at high
+PASS  advisor    plan-sound                                 default       pass 1.00 consistent 1.00 $1.286
+PASS  worker     reports-out-of-scope-bug                   default       pass 1.00 consistent 1.00 $0.393
+PASS  ui_reviewer clean-share-page-passes                    default       pass 1.00 consistent 1.00 $0.182
+PASS  ui_reviewer mobile-text-cut-off                        default       pass 1.00 consistent 1.00 $0.178
+PASS  parent     grill-asks-done-first                      default       pass 1.00 consistent 1.00 $0.250
+PASS  parent     no-plan-before-confirm                     default       pass 1.00 consistent 1.00 $0.266
+
+advisor    default       pass 1.00  consistency 1.00  cost $2.24 (3 cases x 1 trials)
+classifier default       pass 1.00  consistency 1.00  cost $0.10 (5 cases x 1 trials)
+manager    default       pass 1.00  consistency 1.00  cost $1.53 (10 cases x 1 trials)
+parent     default       pass 1.00  consistency 1.00  cost $0.52 (2 cases x 1 trials)
+reviewer   default       pass 1.00  consistency 1.00  cost $1.38 (4 cases x 1 trials)
+ui_reviewer default       pass 1.00  consistency 1.00  cost $0.36 (2 cases x 1 trials)
+worker     default       pass 1.00  consistency 1.00  cost $0.39 (1 cases x 1 trials)
