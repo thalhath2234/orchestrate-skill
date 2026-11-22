@@ -5,6 +5,8 @@ Keep them forgiving where the harness is forgiving: the code still validates sem
 """
 from __future__ import annotations
 
+import re
+
 CATEGORIES = ["rename", "docs", "config", "bugfix", "feature", "refactor", "test", "migration",
               "review", "research"]
 TYPE_PATTERN = "^(" + "|".join(CATEGORIES) + r"):[a-z0-9][a-z0-9-]{0,31}$"
@@ -284,3 +286,18 @@ PLAN = {
         "tasks": {"type": "array", "items": TASK, "minItems": 1},
     },
 }
+
+
+NO_EVIDENCE = frozenset((
+    "none", "n/a", "na", "nil", "null", "nothing", "no evidence", "not applicable", "unknown", "tbd", "todo",
+    "yes", "true", "okay", "pass", "passed", "passes", "done", "works", "working", "verified", "checked",
+    "tested", "confirmed", "complete", "completed", "implemented", "handled", "fixed", "fine", "good",
+    "correct", "looks good", "looks fine", "all good", "it works", "see above", "as above", "same as above",
+    "see diff", "see code", "evidence"))
+
+
+def has_evidence(value) -> bool:
+    """Something to check (a command, file:line, test, output), not a placeholder word."""
+    text = " ".join(str(value or "").lower().split())
+    text = re.sub(r"^\W+|\W+$", "", text)
+    return len(text) >= 4 and text not in NO_EVIDENCE

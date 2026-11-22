@@ -77,6 +77,7 @@ FAKE = textwrap.dedent(r'''
         pathlib.Path(str(calls) + ".review_prompt").write_text(prompt)
         reviews = cfg.get("reviews", [{"verdict": "pass", "summary": "ok", "findings": []}])
         r = dict(reviews[min(n, len(reviews) - 1)])
+        r.setdefault("edge_cases", [{"case": "empty input", "handled": True, "evidence": "fake_test.go:2"}])
         if "acceptance" not in r and "Job acceptance criteria:" in prompt:
             block = prompt.split("Job acceptance criteria:\n", 1)[1].split("\n\n", 1)[0]
             r["acceptance"] = [{"criterion": l[2:], "met": True, "evidence": "fake_test.go:1"}
@@ -1194,6 +1195,242 @@ class OrchestrateTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertNotIn("Traceback", p.stderr)
         self.assertFalse((job.dir / "claims.json").exists(), "only the harness's own check records a claim")
+
+    # ------------------------------------------------- v0.8.2: bad work reported done
+    def _changed(self, files: dict):
+        """A worktree on the repo's base with one commit of `files`, as a job's integration branch."""
+        base = self.o.git(self.repo, "rev-parse", "HEAD")
+        wt = self.tmp / f"changed-{len(list(self.tmp.glob('changed-*')))}"
+        br = wt.name
+        self.o.git(self.repo, "worktree", "add", "-q", "-b", br, str(wt), base)
+        for name, body in files.items():
+            f = wt / name
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(body if isinstance(body, bytes) else body.encode())
+        self._as_worker(wt, "add", "-A")
+        self._as_worker(wt, "commit", "-qm", "the job's work")
+        job = type("J", (), {})()
+        job.id, job.dir, job.save = "j", self.tmp / f"job-{br}", lambda: None
+        job.dir.mkdir()
+        job.state = {"integration_wt": str(wt), "repo": str(self.repo), "base_sha": base, "branch": br,
+                     "tasks": {}, "review": {"rounds": [{}]}, "cost_usd": 0}
+        return job, wt, base
+
+    def _replies(self, *replies):
+        """Stand in for claude: each call gets the next reply; the calls' prompts and arguments are kept."""
+        seen, left = [], list(replies)
+
+        def fake(prompt, *a, **kw):
+            seen.append((prompt, kw))
+            r = left.pop(0) if left else replies[-1]
+            return {"structured": r, "session_id": "s", "result": "", "metrics": {}, "total_cost_usd": 0}
+        real = self.o.claude
+        self.o.claude = fake
+        self.addCleanup(setattr, self.o, "claude", real)
+        return seen
+
+    def _review_plan(self, *criteria):
+        return {**base_plan(self.repo), "acceptance": list(criteria or ["links work"])}
+
+    def _good_review(self, **over):
+        return {"verdict": "pass", "summary": "ok", "findings": [],
+                "acceptance": [{"criterion": "links work", "met": True, "evidence": "a_test.go:4"}],
+                "edge_cases": [{"case": "empty input", "handled": True, "evidence": "a_test.go:9"}], **over}
+
+    def test_judgment_calls_cannot_read_outside_their_directories(self):
+        fake, got = self.tmp / "argv-claude", self.tmp / "argv"
+        fake.write_text("#!/usr/bin/env python3\nimport sys, json\n"
+                        f"open({str(got)!r}, 'w').write(json.dumps(sys.argv))\n"
+                        "print(json.dumps({'result': 'ok', 'is_error': False}))\n")
+        fake.chmod(0o755)
+        old = os.environ["ROUTER_CLAUDE_BIN"]
+        os.environ["ROUTER_CLAUDE_BIN"] = str(fake)
+        self.addCleanup(os.environ.__setitem__, "ROUTER_CLAUDE_BIN", old)
+        for given in (None, {"permissions": {"blockWritesOutsideWorkingDirectories": True}}):
+            self.o.claude_cli.call("x", "opus", "medium", self.repo, perm="dontAsk", tools=["Read"],
+                                   only=["Read"], settings=given)
+            argv = json.loads(got.read_text())
+            perms = json.loads(argv[argv.index("--settings") + 1])["permissions"]
+            self.assertIs(perms["blockReadsOutsideWorkingDirectories"], True)
+            for k, v in (given or {}).get("permissions", {}).items():
+                self.assertIs(perms[k], v)
+
+    def test_cleanup_never_loads_the_branchs_settings_skills_or_styles(self):
+        job, wt, base = self._changed({"apps/api/x.go": "package x\n"})
+        seen = self._replies({"changed": False})
+        self.o.cleanup_pass(job, self._review_plan())
+        self.assertEqual(sorted(seen[0][1].get("only") or []), ["Edit", "Glob", "Grep", "Read", "Write"])
+
+    def test_gitattributes_cannot_hide_code_from_review(self):
+        for attr in ("*.go -diff", "*.go binary", "*.go diff=blank"):
+            with self.subTest(attr):
+                job, wt, base = self._changed({".gitattributes": attr + "\n", "auth.go": "package auth // BACKDOOR\n"})
+                self.o.git(self.repo, "config", "diff.blank.textconv", "true")
+                self.o.git(self.repo, "config", "diff.blank.binary", "true")
+                seen = self._replies(self._good_review())
+                self.o.review(job, self._review_plan(), "ok")
+                self.assertIn("BACKDOOR", seen[0][0], "the reviewer")
+                self.assertIn("BACKDOOR", self.o.final_body(wt, base, self._review_plan()), "the advisor")
+
+    def test_a_nul_byte_cannot_hide_code_from_review(self):
+        job, wt, base = self._changed({"auth.go": b"package auth // \x00 BACKDOOR\n" + b"// fine\n" * 20,
+                                       "logo.png": b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 8})
+        seen = self._replies(self._good_review())
+        v = self.o.review(job, self._review_plan(), "ok")
+        self.assertIn("BACKDOOR", seen[0][0])
+        self.assertIn("Binary files", seen[0][0], "a real image stays a one-line note")
+        self.assertEqual(v["verdict"], "pass")
+
+    def test_code_no_diff_can_show_blocks(self):
+        job, wt, base = self._changed({"auth.go": bytes(range(256)) * 8})
+        self._replies(self._good_review())
+        v = self.o.review(job, self._review_plan(), "ok")
+        self.assertEqual(v["verdict"], "changes_requested")
+        self.assertTrue([f for f in v["findings"] if "auth.go" in str(f.get("file")) + f["issue"]])
+
+    def test_making_binary_code_readable_or_deleting_it_does_not_block(self):
+        junk = bytes(range(256)) * 8
+        job, wt, base = self._changed({"auth.go": junk, "old.go": junk})
+        mid = self.o.git(wt, "rev-parse", "HEAD")
+        (wt / "auth.go").write_text("package auth // READABLE\n")
+        (wt / "old.go").unlink()
+        self._as_worker(wt, "add", "-A")
+        self._as_worker(wt, "commit", "-qm", "as text")
+        self.assertEqual(self.o.unreadable_code(wt, mid), [])
+        self.assertIn("READABLE", self.o.review_diff(wt, mid))
+
+    def test_a_file_name_cannot_hide_an_area_from_its_reviewer(self):
+        job, wt, base = self._changed({":(exclude)*": "x\n", "auth.go": "package auth // BACKDOOR\n"})
+        seen = self._replies(self._good_review())
+        self.o.review(job, {**self._review_plan(), "review_diff_chars": 80}, "ok")
+        self.assertIn("auth.go", seen[0][0])
+        self.assertIn("diff --git", seen[0][0])
+
+    def test_an_unhandled_blocker_is_never_lost_to_word_matching(self):
+        minor = lambda issue, conf="high": {"severity": "minor", "confidence": conf, "issue": issue}
+        for case, findings in (
+                ("expired token can login", [minor("rename the token helper"), minor("comment on expired cache entries"),
+                                             minor("the login page could validate input sooner", "low")]),
+                ("read", [minor("already threaded")]),
+                ("expired token can login", [minor("expired token can login is untested")]),
+                ("race", [{"severity": "major", "confidence": "high", "issue": "trace ids are not embraced"}])):
+            with self.subTest(case=case, findings=findings):
+                v = self.o.settle_verdict(self.o.enforce_edge_cases({"verdict": "pass", "findings": findings, "edge_cases": [
+                    {"case": case, "handled": False, "severity": "blocker", "confidence": "high", "evidence": "auth.go:9"}]}))
+                self.assertEqual(v["verdict"], "changes_requested")
+                self.assertTrue([f for f in v["findings"] if f["issue"] == f"edge case not handled: {case}"])
+
+    def test_placeholder_evidence_is_no_evidence(self):
+        import run_task
+        for word in ("none", "N/A", "done", "Yes.", "works", "verified", "looks good", "TODO", "----"):
+            with self.subTest(word):
+                self.assertTrue(run_task.done_gaps({"done_check": [{"id": "d1", "met": True, "evidence": word}]}, ["d1"]))
+                v = self.o.enforce_acceptance(self._review_plan(), self._good_review(
+                    acceptance=[{"criterion": "links work", "met": True, "evidence": word}]))
+                self.assertEqual(v["verdict"], "changes_requested")
+        self.assertFalse(run_task.done_gaps({"done_check": [{"id": "d1", "met": True, "evidence": "go test ./... passes"}]}, ["d1"]))
+
+    def test_one_row_answers_one_criterion(self):
+        plan = self._review_plan("Owner can delete a link", "Owner can create a link")
+        row = lambda c, met=True: {"criterion": c, "met": met, "evidence": "a_test.go:4"}
+        for rows in ([row("Owner can create a link")], [row("Owner can create a link"), row("Owner can create a link")]):
+            v = self.o.enforce_acceptance(plan, self._good_review(acceptance=rows))
+            self.assertEqual(v["verdict"], "changes_requested", rows)
+            self.assertIn("not assessed: Owner can delete a link", json.dumps(v["findings"]))
+        ok = self.o.enforce_acceptance(plan, self._good_review(
+            acceptance=[row("owner can create a link."), row("The owner can delete a link")]))
+        self.assertEqual(ok["verdict"], "pass", "a light rewording still counts")
+        no = self.o.enforce_acceptance(plan, self._good_review(
+            acceptance=[row("Owner can create a link"), row("Owner can delete a link"), row("Owner can delete a link", False)]))
+        self.assertIn("not met: Owner can delete a link", json.dumps(no["findings"]))
+
+    def test_a_review_with_no_edge_cases_is_asked_again_then_is_no_review(self):
+        job, wt, base = self._changed({"auth.go": "package auth\n"})
+        seen = self._replies(self._good_review(edge_cases=[]), self._good_review())
+        self.assertEqual(self.o.review(job, self._review_plan(), "ok")["verdict"], "pass")
+        self.assertEqual((len(seen), seen[1][1].get("resume")), (2, "s"), "one more turn in the same session")
+        job, wt, base = self._changed({"auth.go": "package auth\n"})
+        hollow = [{"case": "empty input", "handled": True, "evidence": "n/a"}]
+        for empty in ([], hollow):
+            seen = self._replies(self._good_review(edge_cases=empty))
+            self.assertTrue(self.o.review(job, self._review_plan(), "ok").get("reviewer_error"), empty)
+            self.assertEqual(len(seen), 2)
+        job, wt, base = self._changed({"NOTES.md": "words\n"})
+        seen = self._replies(self._good_review(edge_cases=[]))
+        self.assertEqual(self.o.review(job, self._review_plan(), "ok")["verdict"], "pass", "docs have none")
+        self.assertEqual(len(seen), 1)
+
+    def test_every_area_must_check_edge_cases(self):
+        job, wt, base = self._changed({"auth.go": "package auth\n" + "// line\n" * 40})
+        self._replies(self._good_review(edge_cases=[]))
+        self.assertTrue(self.o.review(job, {**self._review_plan(), "review_diff_chars": 80}, "ok").get("reviewer_error"))
+
+    def test_a_low_confidence_blocker_is_questioned_once_and_then_stands(self):
+        job, wt, base = self._changed({"auth.go": "package auth\n"})
+        low = {"severity": "blocker", "confidence": "low", "file": "auth.go", "issue": "SQL injection"}
+        seen = self._replies(self._good_review(findings=[low]), self._good_review(findings=[{**low, "confidence": "high"}]))
+        self.assertEqual(self.o.review(job, self._review_plan(), "ok")["verdict"], "changes_requested")
+        self.assertIn("SQL injection", seen[1][0])
+        seen = self._replies(self._good_review(findings=[low]))
+        v = self.o.review(job, self._review_plan(), "ok")
+        self.assertEqual((v["verdict"], len(seen)), ("pass", 2), "a doubt it stands by doesn't block")
+        self.assertIn(low, v["findings"])
+
+    def test_asking_again_can_add_to_a_review_never_take_away(self):
+        job, wt, base = self._changed({"auth.go": "package auth\n"})
+        bug = {"severity": "major", "confidence": "high", "file": "auth.go", "issue": "owner never checked"}
+        self._replies(self._good_review(edge_cases=[], findings=[bug]), self._good_review())
+        self.assertEqual(self.o.review(job, self._review_plan(), "ok")["verdict"], "changes_requested")
+        self._replies(self._good_review(edge_cases=[], acceptance=[{"criterion": "links work", "met": False, "evidence": "404"}]),
+                      self._good_review())
+        self.assertEqual(self.o.review(job, self._review_plan(), "ok")["verdict"], "changes_requested")
+
+    def test_only_the_conflicted_files_of_a_resolution_are_committed(self):
+        job, wt, base = self._changed({"a.txt": "base\n", "auth.go": "check()\n"})
+        self._as_worker(wt, "checkout", "-q", "-b", "side")
+        (wt / "a.txt").write_text("side\n")
+        self._as_worker(wt, "commit", "-qam", "side")
+        self._as_worker(wt, "checkout", "-q", job.state["branch"])
+        (wt / "a.txt").write_text("ours\n")
+        self._as_worker(wt, "commit", "-qam", "ours")
+        subprocess.run(["git", "merge", "side"], cwd=wt, capture_output=True)
+
+        def integrator(*a, **kw):
+            (wt / "a.txt").write_text("ours\nside\n")
+            (wt / "auth.go").write_text("// check removed\n")
+            (wt / "new.sh").write_text("hi\n")
+            return {"structured": {"resolved": True}, "result": "", "metrics": {}}
+        real, self.o.claude = self.o.claude, integrator
+        self.addCleanup(setattr, self.o, "claude", real)
+        task = {**base_plan(self.repo)["tasks"][0], "verify": ["true"]}
+        job.state["tasks"][task["id"]] = {"status": "running"}
+        ok, why = self.o.resolve_conflicts(job, {**base_plan(self.repo), "verify": ["true"]}, task,
+                                           ["-c", "user.email=t@t", "-c", "user.name=t"])
+        self.assertTrue(ok, why)
+        self.assertEqual(self.o.git(wt, "diff", "--name-only", "HEAD^1", "HEAD"), "a.txt")
+        self.assertEqual(((wt / "auth.go").read_text(), (wt / "new.sh").exists()), ("check()\n", False))
+
+    def test_cleanup_that_commits_is_undone(self):
+        for who in ("the agent", "its verify"):
+            with self.subTest(who):
+                job, wt, base = self._changed({"a.go": "package a\n", "other.go": "package other\n"})
+                head = self.o.git(wt, "rev-parse", "HEAD")
+                sneak = ("echo changed > other.go && git -c user.email=w@w -c user.name=w "
+                         "-c core.hooksPath=/dev/null commit -qam sneak")
+
+                def agent(*a, **kw):
+                    if who == "the agent":
+                        subprocess.run(sneak, shell=True, cwd=wt, check=True)
+                    else:
+                        (wt / "a.go").write_text("package a // tidy\n")
+                    return {"structured": {}, "result": "", "metrics": {}}
+                real, self.o.claude = self.o.claude, agent
+                self.addCleanup(setattr, self.o, "claude", real)
+                out = self.o.cleanup_pass(job, {**base_plan(self.repo), "sandbox": False,
+                                                "verify": [sneak if who == "its verify" else "true"]})
+                self.assertIn("reverted", out)
+                self.assertEqual(self.o.git(wt, "rev-parse", "HEAD"), head)
+                self.assertEqual((wt / "other.go").read_text(), "package other\n")
 
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate
@@ -3715,7 +3952,7 @@ class OrchestrateTest(unittest.TestCase):
         sent = []
 
         def fake(prompt, model, effort, cwd, **k):
-            if prompt.startswith("ORCHESTRATE_REVIEW_AREA (retry)"):
+            if prompt.startswith(("ORCHESTRATE_REVIEW_AREA (retry)", "ORCHESTRATE_REVIEW_AREA (incomplete)")):
                 a = k["resume"].split("-", 1)[1]
             elif prompt.startswith("ORCHESTRATE_REVIEW_AREA"):
                 a = prompt.split('ONE AREA ("', 1)[1].split('"', 1)[0]
@@ -3725,6 +3962,8 @@ class OrchestrateTest(unittest.TestCase):
             sent.append((a, prompt))
             replies = area.get(a, [{"verdict": "pass", "summary": f"{a} ok", "findings": []}])
             r = replies[min(sum(1 for x, _ in sent if x == a) - 1, len(replies) - 1)]
+            if isinstance(r, dict):  # the schema requires them
+                r = {"edge_cases": [{"case": "empty input", "handled": True, "evidence": "a_test.go:9"}], **r}
             if r == "budget":
                 return {"structured": None, "result": "", "error_kind": "budget", "session_id": f"s-{a}"}
             return {"structured": r if isinstance(r, dict) else None, "result": str(r),

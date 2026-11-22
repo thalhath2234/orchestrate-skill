@@ -208,8 +208,8 @@ def done_gaps(report, ids: list[str]) -> list[str]:
             gaps.append(f"{i}: not reported")
         elif not r.get("met"):
             gaps.append(f"{i}: not met ({str(r.get('evidence', ''))[:200]})")
-        elif len(str(r.get("evidence", "")).strip()) < 4:
-            gaps.append(f"{i}: marked met without evidence")
+        elif not schemas.has_evidence(r.get("evidence")):
+            gaps.append(f"{i}: marked met without evidence (name a command and its result, a test or file:line)")
     return gaps
 
 

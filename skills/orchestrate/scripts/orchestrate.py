@@ -1548,6 +1548,14 @@ Resolve every conflict so BOTH intents survive. Edit only the conflicted files a
 conflict markers. Do not run git, do not commit, do not touch other files.
 Reply with the JSON object: resolved (true|false), notes."""
     im, ie = models.role("integrator", plan)
+
+    def unstaged() -> set[str]:
+        return set(git_paths(integ, "diff", "--name-only", "--no-renames")) - set(conflicted)
+
+    def untracked() -> set[str]:
+        return set(git_paths(integ, "ls-files", "--others", "--exclude-standard"))
+
+    dirty, loose = unstaged(), untracked()
     res = claude(prompt, im, ie, integ, perm="acceptEdits", tools=["Read", "Grep", "Glob"],
                  only=["Read", "Grep", "Glob", "Edit", "Write"],  # it edits the conflict; no git, no shell
                  settings={"permissions": {"blockWritesOutsideWorkingDirectories": True}},
@@ -1568,7 +1576,18 @@ Reply with the JSON object: resolved (true|false), notes."""
     markers = [f for f in conflicted if re.search(r"^(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|)( |$)", text(f), re.M)]
     if markers:
         return False, f"still conflicted: {markers}; agent said: {str(res.get('result'))[-300:]}"
-    git(integ, "add", "-A")
+    # only the conflict is the integrator's to change: what else it edited or created is put back,
+    # so verify judges, and the merge commit holds, the resolution alone
+    edited, created = unstaged() - dirty, untracked() - loose
+    if edited:
+        git(integ, "--literal-pathspecs", "checkout", "--", *sorted(edited))
+    for f in created:
+        with contextlib.suppress(OSError):
+            (integ / f).unlink()
+    if edited or created:
+        log(f"integrator: undid {len(edited | created)} edit(s) outside the conflict: "
+            + ", ".join(printable(f) for f in sorted(edited | created)[:10]))
+    git(integ, "--literal-pathspecs", "add", "-A", "--", *conflicted)
     # Check the resolution before anything starts from it: later tasks run without a baseline, so a
     # bad merge would show up as the next task's failure and be escalated up the model ladder.
     cmds = resolution_verify(plan, task, conflicted, job.state["tasks"])
@@ -2252,13 +2271,13 @@ def reviewer_cfg(plan: dict) -> tuple[str, str]:
 
 def _ask_reviewer(job: Job, plan: dict, prompt: str, schema: dict, role: str,
                   cfg: tuple[str, str] | None = None, tag: str = "ORCHESTRATE_REVIEW",
-                  keep: dict | None = None) -> dict | None:
+                  keep: dict | None = None, resume: str | None = None) -> dict | None:
     """One reviewer call, plus one re-ask if the reply doesn't parse. None = no verdict (P0.1).
     `keep` gets the session id, for a follow-up turn."""
     integ = Path(job.state["integration_wt"])
     model, effort = cfg or reviewer_cfg(plan)
     res = claude(prompt, model, effort, integ, perm="dontAsk", tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY,
-                 schema=schema, budget_usd=budget_left(job, plan))
+                 resume=resume, schema=schema, budget_usd=budget_left(job, plan))
     record_call(job, role, res, None, f"{model}/{effort}")
     res = _reask(job, plan, res, (model, effort), schema, tag, role)
     if keep is not None:
@@ -2307,17 +2326,23 @@ def enforce_edge_cases(v: dict) -> dict:
     """An edge case the reviewer marked unhandled must surface as a finding: if no finding names
     it, add one at the severity (major when it gave none) and confidence the reviewer gave the
     case, so `pass` can't coexist with a known hole, while a minor gap or a doubt the reviewer
-    marked `low` doesn't block. An added case with no confidence blocks. A case some finding
-    already names (60% of its words) is not added: that finding's severity and confidence stand."""
+    marked `low` doesn't block. An added case with no confidence blocks. A case that one finding
+    names by itself (60% of its words, whole) is not added, and lends it what the case left out.
+    Except: a case that blocks is only covered by a finding that blocks, so a word match can
+    repeat a blocker but never lose one."""
     added = []
-    text = " ".join(f"{f.get('file', '')} {f.get('issue', '')}".lower() for f in v.get("findings") or [])
+    findings = [f for f in v.get("findings") or [] if isinstance(f, dict)]
     for ec in v.get("edge_cases") or []:
-        if not isinstance(ec, dict) or ec.get("handled", True):
+        if not isinstance(ec, dict) or ec.get("handled") is True:
             continue
         case = str(ec.get("case", "")).strip()
-        words = [w for w in re.findall(r"[a-z0-9_]{4,}", case.lower())]
-        if case and words and sum(w in text for w in words) / len(words) >= 0.6:
-            continue  # a finding already covers it
+        named = [f for f in findings if _names_case(f, case)]
+        if named:
+            f = next(iter(blocking_findings(named)), named[0])
+            as_judged = {"severity": ec.get("severity") or f.get("severity") or "major",
+                         "confidence": ec.get("confidence") or f.get("confidence")}
+            if blocking_findings([f]) or not blocking_findings([as_judged]):
+                continue  # a finding already covers it
         added.append({"severity": ec.get("severity") or "major", "file": ec.get("file", ""),
                       **({"confidence": ec["confidence"]} if ec.get("confidence") else {}),
                       "issue": f"edge case not handled: {case}",
@@ -2327,6 +2352,14 @@ def enforce_edge_cases(v: dict) -> dict:
         if blocking_findings(added):
             v["verdict"] = "changes_requested"
     return v
+
+
+def _names_case(f: dict, case: str) -> bool:
+    words = _issue_words(case)
+    said = set(_issue_words(f"{f.get('file', '')} {f.get('issue', '')}"))
+    if len(words) < 2:  # one word names nothing by itself
+        return bool(case) and case.lower() == str(f.get("issue", "")).strip().lower()
+    return sum(w in said for w in words) / len(words) >= 0.6
 
 
 def _issue_words(text) -> list[str]:
@@ -2370,6 +2403,50 @@ def settle_verdict(v: dict) -> dict:
             "verdict": "changes_requested" if blocking_findings(v.get("findings")) else "pass"}
 
 
+def checked_edge_cases(v: dict) -> bool:
+    """At least one edge case that is unhandled, or handled with evidence."""
+    return any(isinstance(e, dict) and (e.get("handled") is not True or schemas.has_evidence(e.get("evidence")))
+               for e in v.get("edge_cases") or [])
+
+
+def review_gaps(plan: dict, v: dict, need_edges: bool) -> list[str]:
+    """What makes a reviewer's reply too thin to judge by; it gets one more turn for these."""
+    gaps = []
+    if need_edges and not checked_edge_cases(v):
+        gaps.append("`edge_cases` has no case with evidence. List the ones you checked, each with a file:line or "
+                    "a test. If the change truly has none, give one case saying so, with the evidence for that.")
+    for c, rows in acceptance_rows(plan.get("acceptance") or [], v):
+        if not rows:
+            gaps.append(f"no `acceptance` row for this criterion (one row each, quoted): {c}")
+        elif all(r.get("met") is True and not schemas.has_evidence(r.get("evidence")) for r in rows):
+            gaps.append(f"met without evidence (a file:line or a test): {c}")
+    for x in (v.get("findings") or []) + [e for e in v.get("edge_cases") or []
+                                           if isinstance(e, dict) and e.get("handled") is not True]:
+        if isinstance(x, dict) and x.get("severity") == "blocker" and x.get("confidence") == "low":
+            gaps.append("a blocker at low confidence, so it would not block. Open the code and confirm it (high or "
+                        "medium) or keep low if this repo can't show it: "
+                        + sanitize(str(x.get("issue") or x.get("case") or ""), 300))
+    return gaps
+
+
+def ask_again_prompt(tag: str, gaps: list[str]) -> str:
+    return (f"{tag} (incomplete)\nYour review can't be used as it is:\n" + "\n".join(f"- {g}" for g in gaps[:20])
+            + "\n\nCheck those in the code, then reply with the complete JSON object again.")
+
+
+def merge_replies(v: dict, again: dict) -> dict:
+    """Both turns of one review: the second can add and raise, never drop what the first found."""
+    both = [x for x in (again.get("findings") or []) + (v.get("findings") or []) if isinstance(x, dict)]
+    cases = [e for e in again.get("edge_cases") or [] if isinstance(e, dict)]
+    cases += [e for e in v.get("edge_cases") or [] if isinstance(e, dict) and e not in cases
+              and (e.get("handled") is not True or e.get("case") not in {c.get("case") for c in cases})]
+    out = {**v, **again, "findings": _union_findings({"findings": blocking_findings(both)}, {"findings": both}),
+           "edge_cases": cases, "raise_bar": (v.get("raise_bar") or []) + (again.get("raise_bar") or [])}
+    if v.get("acceptance") or again.get("acceptance"):
+        out["acceptance"] = (again.get("acceptance") or []) + (v.get("acceptance") or [])
+    return out
+
+
 def no_verdict(why: str) -> dict:
     return {"verdict": "changes_requested", "reviewer_error": True,
             "summary": f"reviewer produced no verdict: {why}",
@@ -2377,31 +2454,100 @@ def no_verdict(why: str) -> dict:
                                                           "so the job cannot be reported as reviewed"}]}
 
 
+def acceptance_rows(crit: list[str], v: dict) -> list[tuple[str, list[dict]]]:
+    """Each criterion with the reviewer's rows about it. A row counts only for the criterion it is
+    closest to, so one row can't sign off two that read alike."""
+    import difflib
+    plain = [" ".join(re.findall(r"\w+", str(c).lower())) for c in crit]
+    out: list[list[dict]] = [[] for _ in crit]
+    for r in v.get("acceptance") or []:
+        if not isinstance(r, dict):
+            continue
+        said = " ".join(re.findall(r"\w+", str(r.get("criterion", "")).lower()))
+        scores = [difflib.SequenceMatcher(None, c, said, autojunk=False).ratio() for c in plain]
+        top = max(scores, default=0)
+        for i, s in enumerate(scores):
+            if s == top and s >= 0.5:
+                out[i].append(r)
+    return list(zip(crit, out))
+
+
 def enforce_acceptance(plan: dict, v: dict) -> dict:
     """Every acceptance criterion must be marked met with evidence; otherwise it is a blocker (P3.3)."""
-    import difflib
     crit = plan.get("acceptance") or []
     if not crit:
         return v
-    rows = [r for r in (v.get("acceptance") or []) if isinstance(r, dict)]
     added = []
-    for c in crit:
-        best, score = None, 0.0
-        for r in rows:
-            s = difflib.SequenceMatcher(None, c.lower(), str(r.get("criterion", "")).lower()).ratio()
-            if s > score:
-                best, score = r, s
-        if best is None or score < 0.5:
+    for c, rows in acceptance_rows(crit, v):
+        unmet = next((r for r in rows if r.get("met") is not True), None)
+        if not rows:
             added.append({"severity": "blocker", "issue": f"acceptance criterion not assessed: {c}"})
-        elif not best.get("met"):
+        elif unmet:
             added.append({"severity": "blocker", "issue": f"acceptance criterion not met: {c}",
-                          "suggestion": str(best.get("evidence", ""))[:500]})
-        elif len(str(best.get("evidence", "")).strip()) < 4:
+                          "suggestion": str(unmet.get("evidence", ""))[:500]})
+        elif not any(schemas.has_evidence(r.get("evidence")) for r in rows):
             added.append({"severity": "blocker", "issue": f"acceptance criterion marked met without "
                                                           f"evidence (file:line or test): {c}"})
     if added:
         v = {**v, "verdict": "changes_requested", "findings": list(v.get("findings") or []) + added}
     return v
+
+
+# Extensions whose changes must be readable in a review
+CODE_FILE = re.compile(
+    r"\.(?:[cm]?[jt]sx?|py|pyw|go|rs|rb|php|java|kts?|scala|swift|dart|c|h|cc|cpp|cxx|hpp|cs|fs|vb|mm?|lua|pl|pm"
+    r"|r|jl|exs?|erl|hs|clj|sh|bash|zsh|fish|ps1|bat|cmd|sql|vue|svelte|astro|html?|css|scss|json|ya?ml|toml"
+    r"|xml|gradle|tf|proto|graphql)$|(?:^|/)(?:Makefile|Dockerfile|Jenkinsfile)$", re.I)
+NOT_BEHAVIOUR = re.compile(r"\.(?:md|mdx|rst|adoc|txt|png|jpe?g|gif|webp|ico|pdf)$|(?:^|/)(?:LICENSE|NOTICE)$", re.I)
+CLEANUP_DIFF_MAX = 60000
+_NOT_TEXT = bytes(b for b in range(32) if b not in b"\t\n\r\f\v\b\x1b")
+
+
+def looks_text(data: bytes) -> bool:
+    """Text even with a few NULs planted in it, which is all it takes for git to call it binary."""
+    data = data[:1_000_000]
+    return len(data) - len(data.translate(None, _NOT_TEXT)) <= max(4, len(data) // 50)
+
+
+def binary_changes(cwd: Path, base: str, paths=()) -> tuple[list[str], list[str]]:
+    """Of the changed files git prints as "Binary files differ": (those that are text, those that aren't)."""
+    p = subprocess.run([*jail.GIT, "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                        "--numstat", "-z", f"{base}..HEAD", "--", *paths], cwd=cwd, capture_output=True)
+    text, opaque = [], []
+    for row in p.stdout.split(b"\0"):
+        if not row.startswith(b"-\t-\t"):
+            continue
+        name = row[4:]
+        sides = [b.stdout for b in (subprocess.run([*jail.GIT, "cat-file", "blob", os.fsencode(rev) + b":" + name],
+                                                   cwd=cwd, capture_output=True) for rev in (base, "HEAD"))
+                 if b.returncode == 0]
+        # judged by the side that stays: HEAD's, or the old one of a deleted file
+        (text if not sides or looks_text(sides[-1]) else opaque).append(os.fsdecode(name))
+    return text, opaque
+
+
+def review_diff(cwd: Path, base: str, paths=()) -> str:
+    """The diff a model judges. The branch can't hide code in it: no external diff or textconv, and
+    a text file that .gitattributes or a stray NUL makes "binary" is printed as text."""
+    args = ("--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv")
+    diff = git(cwd, *args, f"{base}..HEAD", "--", *paths)
+    text, _ = binary_changes(cwd, base, paths)
+    if text:
+        diff += "\n" + git(cwd, *args, "--text", f"{base}..HEAD", "--", *text)
+    return diff
+
+
+def unreadable_code(cwd: Path, base: str) -> list[dict]:
+    """A blocker per changed code file that no diff can show."""
+    return [{"severity": "blocker", "confidence": "high", "file": printable(f),
+             "issue": f"{printable(f)} is binary data under a code file's name, so no reviewer saw the change",
+             "suggestion": "Commit it as plain UTF-8 text, or under an extension that says it is binary."}
+            for f in binary_changes(cwd, base)[1] if CODE_FILE.search(f)
+            and git(cwd, "--literal-pathspecs", "ls-tree", "--name-only", "HEAD", "--", f)]
+
+
+def clipped(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + "\n... [cut; Read the files]"
 
 
 STALE_DOC_MAX = 20
@@ -2464,15 +2610,33 @@ def stale_docs_block(refs: list[str]) -> str:
 def review(job: Job, plan: dict, verify_out: str) -> dict:
     integ = Path(job.state["integration_wt"])
     base = job.state["base_sha"]
-    diff = git(integ, "diff", f"{base}..HEAD")
+    diff = review_diff(integ, base)
     limit = int(plan.get("review_diff_chars", 120000))
     refs = stale_doc_refs(integ, base)
     rounds = job.state.get("review", {}).get("rounds") or []
     if refs and rounds:
         rounds[-1]["stale_doc_refs"] = refs
-    v = review_once(job, plan, verify_out, diff, refs) if len(diff) <= limit \
-        else review_by_area(job, plan, verify_out, limit, refs)
-    return v if v.get("reviewer_error") else settle_verdict(enforce_acceptance(plan, enforce_edge_cases(v)))
+    whole = len(diff) <= limit
+    keep: dict = {}
+    v = review_once(job, plan, verify_out, diff, refs, keep) if whole \
+        else review_by_area(job, plan, verify_out, limit, refs, keep)
+    if v.get("reviewer_error"):
+        return v
+    # each area reviewer answers for its own edge cases
+    need_edges = whole and any(not NOT_BEHAVIOUR.search(f)
+                               for f in git_paths(integ, "diff", "--name-only", "--no-renames", f"{base}..HEAD"))
+    gaps = review_gaps(plan, v, need_edges)
+    if gaps and keep.get("session"):
+        log(f"the review is incomplete ({len(gaps)} gap(s)); asking the reviewer again")
+        again = _ask_reviewer(job, plan, ask_again_prompt("ORCHESTRATE_REVIEW", gaps), schemas.REVIEW, "reviewer",
+                              resume=keep["session"])
+        if again is not None:
+            v = merge_replies(v, again)
+    if need_edges and not checked_edge_cases(v):
+        # not a finding: a worker can't fix a review
+        return no_verdict("it checked no edge case of the change, with evidence, even when asked again")
+    v = {**v, "findings": list(v.get("findings") or []) + unreadable_code(integ, base)}
+    return settle_verdict(enforce_acceptance(plan, enforce_edge_cases(v)))
 
 
 REVIEW_COVERAGE = """Report every issue you find, including ones you are unsure about or think are minor. Don't
@@ -2519,11 +2683,11 @@ a finding). The bar only goes up, so propose additions, not relaxations.
 
 
 def review_once(job: Job, plan: dict, verify_out: str, diff: str | None = None,
-                stale: list[str] | None = None) -> dict:
+                stale: list[str] | None = None, keep: dict | None = None) -> dict:
     integ = Path(job.state["integration_wt"])
     base = job.state["base_sha"]
     stat = git(integ, "diff", "--stat", f"{base}..HEAD")
-    diff = git(integ, "diff", f"{base}..HEAD") if diff is None else diff
+    diff = review_diff(integ, base) if diff is None else diff
     ctx = _review_context(job, plan)
     prompt = f"""ORCHESTRATE_REVIEW
 You are the REVIEWER for job "{job.id}", with a fresh context. Goal: {plan['goal']}
@@ -2559,11 +2723,12 @@ Review the diff above against the definition of done. You can Read any file in t
 can't run commands: the job's verify commands already ran and passed. Reply with the JSON object
 from "Reviewer output": one `acceptance` entry per criterion, every edge case in `edge_cases`,
 every finding in `findings`."""
-    v = _ask_reviewer(job, plan, prompt, schemas.REVIEW, "reviewer")
+    v = _ask_reviewer(job, plan, prompt, schemas.REVIEW, "reviewer", keep=keep)
     return v if v is not None else no_verdict("unparseable or failed reviewer output")
 
 
-def review_by_area(job: Job, plan: dict, verify_out: str, limit: int, stale: list[str] | None = None) -> dict:
+def review_by_area(job: Job, plan: dict, verify_out: str, limit: int, stale: list[str] | None = None,
+                   keep: dict | None = None) -> dict:
     """Big diffs: one reviewer per area in parallel, then an integration reviewer over their
     verdicts and the cross-area interface surface (meta-review, P3.3). Nothing is truncated away."""
     integ = Path(job.state["integration_wt"])
@@ -2576,7 +2741,7 @@ def review_by_area(job: Job, plan: dict, verify_out: str, limit: int, stale: lis
     ctx = _review_context(job, plan)
 
     def area_prompt(area: str, files: list[str]) -> str:
-        d = git(integ, "diff", f"{base}..HEAD", "--", *files)
+        d = review_diff(integ, base, files)
         if len(d) > limit:
             d = d[:limit] + f"\n... [area diff cut at {limit} chars; Read the remaining files: " \
                             + ", ".join(files) + "]"
@@ -2625,9 +2790,20 @@ verdict."""
         if not _is_verdict(v):
             job.state.setdefault("review_errors", []).append(f"area {a}: {str(res.get('result'))[-500:]}")
             return no_verdict(f"area reviewer for {a} returned no verdict")
+        need = any(not NOT_BEHAVIOUR.search(f) for f in areas[a])
+        gaps = review_gaps({}, v, need)
+        if gaps and res.get("session_id"):
+            res2 = claude(ask_again_prompt("ORCHESTRATE_REVIEW_AREA", gaps), am, ae, integ, perm="dontAsk",
+                          tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY, resume=res["session_id"],
+                          schema=schemas.AREA_REVIEW, budget_usd=budget_left(job, plan))
+            record_call(job, "reviewer_area", res2, None, f"{am}/{ae}")
+            if _is_verdict(res2.get("structured")):
+                v = merge_replies(v, res2["structured"])
+        if need and not checked_edge_cases(v):
+            return no_verdict(f"area reviewer for {a} checked no edge case, with evidence, even when asked again")
         area_v[a] = enforce_edge_cases(v)
     surface = [f for f in changed if INTERFACE_FILE.search(f)]
-    sdiff = git(integ, "diff", f"{base}..HEAD", "--", *surface) if surface else ""
+    sdiff = review_diff(integ, base, surface) if surface else ""
     if len(sdiff) > limit // 2:
         sdiff = sdiff[:limit // 2] + "\n... [interface diff cut; Read the files listed]"
     stat = git(integ, "diff", "--stat", f"{base}..HEAD")
@@ -2662,7 +2838,7 @@ Own acceptance across the whole job and the integration between areas: producers
 agree, nothing is half-wired. Read any file you need. Reply with the JSON object from "Reviewer
 output", with one `acceptance` entry per criterion. Repeat only the area findings you agree still
 matter."""
-    v = _ask_reviewer(job, plan, prompt, schemas.REVIEW, "reviewer")
+    v = _ask_reviewer(job, plan, prompt, schemas.REVIEW, "reviewer", keep=keep)
     if v is None:
         return no_verdict("integration reviewer returned no verdict")
     own = [g for g in v.get("findings") or [] if isinstance(g, dict)]  # the integration reviewer's, before any area's
@@ -2838,7 +3014,7 @@ def plan_body(plan: dict, baseline_passed: list[str] | None = None) -> str:
 def final_body(cwd: Path, base: str, plan: dict, verify_out: str = "", review: dict | None = None,
                limit: int = 120000) -> str:
     stat = git(cwd, "diff", "--stat", f"{base}..HEAD")
-    diff = git(cwd, "diff", f"{base}..HEAD")
+    diff = review_diff(cwd, base)
     if len(diff) > limit:
         diff = diff[:limit] + "\n... [diff cut; Read the remaining files in the stat]"
     out = [f"<diff_stat>\n{stat[-4000:]}\n</diff_stat>",
@@ -2986,8 +3162,11 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
     m, e = models.role("cleanup", plan)
     prompt = (f"{CLEANUP_BRIEF}\n\n{chr(10).join(done_header(plan))}\nJob goal: {plan['goal']}\n\n"
               "Files this job changed (the only files you may edit):\n" + "\n".join(f"- {f}" for f in files)
-              + f"\n\nSee the job's changes with: git diff {base[:12]}..HEAD (read-only; ask nothing).")
+              + "\n\nThe job's changes to them:\n"
+              + fence_code("diff of the files you may edit", clipped(review_diff(integ, base, files), CLEANUP_DIFF_MAX))
+              + "\n\nYou can't run commands. Ask nothing.")
     res = claude(prompt, m, e, integ, perm="acceptEdits", tools=["Read", "Edit", "Write", "Grep", "Glob"],
+                 only=["Read", "Edit", "Write", "Grep", "Glob"],  # no shell, and none of the branch's settings or skills
                  settings={"permissions": {"blockWritesOutsideWorkingDirectories": True}},
                  schema=schemas.CLEANUP, budget_usd=budget_left(job, plan), timeout=1800,
                  confine=confinement(plan))
@@ -2999,7 +3178,7 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
     touched = sorted(set(git_paths(integ, "diff", "--name-only", "--no-renames", "HEAD")) | new_files)
 
     def revert(why: str) -> None:
-        git(integ, "reset", "-q", "--hard", "HEAD")
+        git(integ, "reset", "-q", "--hard", head)
         for f in new_files:
             (integ / f).unlink(missing_ok=True)
         out["reverted"] = why
@@ -3008,7 +3187,10 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
     outside = [f for f in touched if f not in files]
     if ui_files:
         out["ui_files_left_alone"] = len(ui_files)
-    if not touched:
+    moved = "committed by itself: a commit would skip the scope check and verify"
+    if git(integ, "rev-parse", "HEAD") != head:
+        revert(moved)
+    elif not touched:
         out["result"] = "no changes"
     elif outside:
         revert(f"edited files it may not edit (outside the job's diff, or UI files the screenshots were "
@@ -3019,8 +3201,13 @@ def cleanup_pass(job: Job, plan: dict) -> dict:
             if code:
                 revert(f"verify failed after cleanup: `{c}`: {vout[-500:]}")
                 break
+            if not on_branch(integ, job.state["branch"]):
+                raise RuntimeError(f"cleanup: the integration worktree left {job.state['branch']}; nothing was committed")
+            if git(integ, "rev-parse", "HEAD") != head:
+                revert(moved)
+                break
         else:
-            git(integ, "add", "-A", "--", *touched)
+            git(integ, "--literal-pathspecs", "add", "-A", "--", *touched)
             git(integ, *git_ident(Path(job.state["repo"])), "commit", "-q", "-m",
                 f"orchestrate({job.id}): cleanup")
             out["result"] = f"cleaned {len(touched)} file(s)"
@@ -4319,7 +4506,10 @@ def render_report(job: Job, plan: dict) -> str:
         ecs = [e for e in v.get("edge_cases", []) or [] if isinstance(e, dict)]
         if ecs:
             L.append(f"- edge cases checked: {len(ecs)}, unhandled: {sum(not e.get('handled', True) for e in ecs)}")
-        L += [f"- [{f.get('severity')}] {f.get('file', '')} {f.get('issue', '')}" for f in v.get("findings", [])[:15]]
+        rank = {"blocker": 0, "major": 1}
+        L += [f"- [{f.get('severity')}] {f.get('file', '')} {f.get('issue', '')}"
+              + (" (low confidence: didn't block)" if f.get("severity") in rank and f.get("confidence") == "low" else "")
+              for f in sorted(v.get("findings", []), key=lambda f: rank.get(str(f.get("severity")), 2))[:15]]
         if r.get("stale_doc_refs"):
             L.append(f"- docs that still name a file the job deleted or renamed ({len(r['stale_doc_refs'])}):")
             L += [f"  - `{x[:200]}`" for x in r["stale_doc_refs"][:10]]
