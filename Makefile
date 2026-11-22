@@ -1,7 +1,7 @@
 .PHONY: test eval-quick eval-parent eval eval-sweep-manager eval-sweep-classifier eval-sweep-reviewer eval-sweep-advisor eval-sweep-worker validate-plugin release-check live-smoke
 
 # Harness tests: fake `claude`, no tokens spent. CI (.github/workflows/test.yml) runs this target on
-# Linux and macOS, Python 3.9 and 3.13. Evals and live-smoke never run in CI: they cost tokens.
+# Linux, Python 3.9 and 3.13. Evals and live-smoke never run in CI: they cost tokens.
 # The browser tests skip without Chrome, so CI checks for one first (`ui_review.py chrome`).
 test:
 	python3 tests/test_routing.py

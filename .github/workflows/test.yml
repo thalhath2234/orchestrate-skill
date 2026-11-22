@@ -21,8 +21,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.13"]
+        include:
+          # 3.9 is the oldest Python supported; setup-python has no build of it for Ubuntu 26.04
+          # (ubuntu-latest), so that one leg stays on 24.04.
+          - {os: ubuntu-24.04, python: "3.9"}
+          - {os: ubuntu-latest, python: "3.13"}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
         with:

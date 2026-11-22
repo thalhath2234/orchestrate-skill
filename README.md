@@ -59,7 +59,7 @@ This installs five skills:
 | `orchestrate-manage` | The manager agent's playbook: events, diagnosis, actions, and when to ask you |
 | `orchestrate-review` | What the integrator, reviewer and UI reviewer subagents check, severities, and output format |
 
-Requirements: Python 3.9+ (stdlib only), macOS or Linux (CI runs `make test` on both, with Python 3.9 and 3.13), and `git` and `claude` on PATH. UI review also needs Google Chrome or Chromium (only for plans with a `ui` block).
+Requirements: Python 3.9+ (stdlib only), Linux (CI runs `make test` there with Python 3.9 and 3.13; macOS is not supported), and `git` and `claude` on PATH. UI review also needs Google Chrome or Chromium (only for plans with a `ui` block).
 
 ## Update
 
@@ -282,7 +282,7 @@ make release-check     # fails if skills/, hooks/ or .claude-plugin changed sinc
 make live-smoke        # one Haiku call (about a cent): the plugin's approval hook really stops an --approve
 ```
 
-CI runs `make test` on every pull request and push to main, on Linux and macOS with Python 3.9 and 3.13. Evals and the live smoke test never run in CI, because they cost tokens. Run `make live-smoke` before each release and after a Claude Code update that changes hooks or `-p`.
+CI runs `make test` on every pull request and push to main, on Linux with Python 3.9 and 3.13. Evals and the live smoke test never run in CI, because they cost tokens. Run `make live-smoke` before each release and after a Claude Code update that changes hooks or `-p`.
 
 Any PR that changes `skills/`, `hooks/` or `.claude-plugin/` bumps `version` in `.claude-plugin/plugin.json`: plugin installs only update when it changes. Tag each release `vX.Y.Z`.
 

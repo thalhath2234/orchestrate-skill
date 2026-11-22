@@ -13,7 +13,7 @@ You are the **parent**. You decide *what* to do: grill the user, then triage, pl
 
 **The advisor is asked twice:** before a plan executes and before the result is handed over for pushing. Both happen inside a job automatically; for a single task you run them (Step 3a).
 
-Scripts are in `scripts/` next to this file (Python 3.9+, stdlib only, macOS/Linux, `git` and `claude` CLIs on PATH). Set `S` once:
+Scripts are in `scripts/` next to this file (Python 3.9+, stdlib only, Linux, `git` and `claude` CLIs on PATH). Set `S` once:
 
 ```bash
 S=
