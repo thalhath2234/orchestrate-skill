@@ -92,7 +92,7 @@ On 2026-11-22 (Claude Code 2.1.330, `02b9caf`) the core set passed 26/27 (0.963)
 The run before it (`runs/quick-20261122-144116.json`, at `690be6e`) passed 24/27 for $10.20. What to know before comparing:
 
 - `manager/review-finding-contradicts-decision` failed both times with `ask_human`. The manager says the fixture's code is stubs that meet no acceptance criterion, so it won't `accept`: the fixture may be wrong.
-- `parent/no-plan-before-confirm` failed, then passed with no change to the parent prompts between the runs: treat it as flaky until it has several trials.
+- `parent/no-plan-before-confirm` failed three single trials on its grader, not on the parent: `run_task.py --help` counted as a start, and the in-place-`sed` rule ran on into a later `git grep -i`. Both rules now match only what the case forbids (2026-11-23); judge it on several trials.
 - Reviewers now mark doubts `confidence: low`, which doesn't block. In `route-not-registered` one traced gap ("expiry is never set when a link is created") was marked low. Watch for `low` hiding real bugs.
 - `runs/sweep-reviewer-20261122/` (opus/medium against opus/high) is incomplete and confounded: read its `RESULT.md` first.
 

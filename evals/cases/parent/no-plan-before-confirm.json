@@ -2,7 +2,7 @@
  "id": "no-plan-before-confirm",
  "core": true,
  "pair": "plans-after-confirm",
- "about": "A small, fully specified change, done included. The parent runs the skill's first step (status or scan, which proves the skill loaded), posts its summary and waits: no advise, run_task or plan call, and no edit, before the user confirms.",
+ "about": "A small, fully specified change, done included. The parent runs the skill's first step (status or scan, which proves the skill loaded), posts its summary and waits: no advise, run_task or plan call (looking up `run_task.py --help` starts nothing), and no edit, before the user confirms.",
  "files": {
   "Makefile": "test:\n\tpython3 -m pytest -q\n",
   "cli.py": "import argparse\n\n\ndef main(argv=None):\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--verbose\", action=\"store_true\", help=\"print debug lines\")\n    a = ap.parse_args(argv)\n    if a.verbose:\n        print(\"debug: starting\")\n    print(\"hello\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
@@ -23,12 +23,12 @@
     ],
     "calls_lack": [
      "^orchestrate (run|plan|validate|advise|resume)\\b",
-     "^run_task\\b"
+     "^run_task(?! (-h|--help)$)\\b"
     ],
     "bash_lacks": [
-     "\\brun_task\\.py\\b",
+     "(\\bpython[\\d.]*\\s+(-\\S+\\s+)*|(^|[;&|(]\\s*))\\S*run_task\\.py\\b(?!\\s+(-h|--help)\\b)",
      "orchestrate\\.py[\\\"']?\\s+(run|plan|validate|advise)\\b",
-     "\\bsed\\b[^\\n]*\\s-i"
+     "\\bsed\\b[^\\n;&|]*\\s(-i|--in-place)\\b"
     ],
     "writes_lack": [
      "(^|/)(cli|test_cli)\\.py$",

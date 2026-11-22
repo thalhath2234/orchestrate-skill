@@ -388,6 +388,22 @@ class EvalRunnerTest(unittest.TestCase):
         calls = [json.loads(x) for x in (scripts / "_calls.jsonl").read_text().splitlines()]
         self.assertEqual(calls, [["orchestrate", "wait", "j", "--timeout", "5"], ["run_task", "--repo", ".", "x"]])
 
+    def test_no_plan_before_confirm_flags_starts_and_edits_not_lookups(self):
+        exp = all_cases()["no-plan-before-confirm"]["turns"][0]["expect"]
+        S = "S=/x/plugin/skills/orchestrate/scripts"
+
+        def fails(cmd, call=()):
+            return run.grade_parent({k: v for k, v in exp.items() if k in ("bash_lacks", "calls_lack")},
+                                    {"bash": [cmd], "writes": [], "reply": "", "texts": []}, [list(call)] if call else [])
+        for cmd in ("for f in cli.py; do cat -A $f | sed 's/x$//'; done; git grep -n -i -E 'verbose'",
+                    f"{S}; python3 $S/run_task.py --help; grep -n worktree $S/run_task.py"):
+            self.assertEqual(fails(cmd, ["run_task", "--help"] if "--help" in cmd else ()), [], cmd)
+        for cmd in ("sed -i 's/--verbose/--debug/' cli.py", "sed -e 's/a/b/' --in-place cli.py",
+                    "cd x && sed 's/a/b/' -i cli.py; ls", f"{S}; python3 $S/run_task.py --repo . --type x",
+                    f"{S}; python3 -B $S/run_task.py -", f"cd x; $S/run_task.py --repo ."):
+            self.assertTrue(fails(cmd), cmd)
+        self.assertTrue(fails("true", ["run_task", "--repo", "."]))
+
     def test_parent_grading_reads_tool_calls_from_the_stream(self):
         lines = [
             {"type": "system", "subtype": "init", "session_id": "s1"},
