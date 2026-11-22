@@ -2084,6 +2084,50 @@ class OrchestrateTest(unittest.TestCase):
         job.state, job.held = {"cost_usd": 0.0}, {"web": 0.8}
         self.assertLessEqual(self.o.budget_left(job, {"budget_usd": 0.8}), 0.21)
 
+    # ------------------------------------------------- v0.10
+    def test_a_retried_attempt_is_still_paid_for(self):
+        fake, mark = self.tmp / "retry-claude", self.tmp / "retry-mark"
+        fake.write_text("#!/usr/bin/env python3\nimport json, pathlib\n"
+                        f"m = pathlib.Path({str(mark)!r})\n"
+                        "r = ({'is_error': False, 'session_id': 'b', 'total_cost_usd': 0.25, 'result': 'ok'} if m.exists() else\n"
+                        "     {'is_error': True, 'session_id': 'a', 'total_cost_usd': 0.5, 'api_error_status': 529, 'result': 'Overloaded'})\n"
+                        "m.touch()\n"
+                        "print(json.dumps(r))\n")
+        fake.chmod(0o755)
+        old = os.environ["ROUTER_CLAUDE_BIN"]
+        os.environ["ROUTER_CLAUDE_BIN"] = str(fake)
+        self.addCleanup(os.environ.__setitem__, "ROUTER_CLAUDE_BIN", old)
+        r = self.o.claude_cli.call("x", "opus", "medium", self.repo, perm="dontAsk", tools=[], retries=1)
+        self.assertEqual((r.get("error_kind"), r["total_cost_usd"]), (None, 0.75))
+
+    def test_a_timed_out_call_reports_what_it_spent(self):
+        import jail
+        fake = self.tmp / "slow-claude"
+        fake.write_text("#!/usr/bin/env python3\nimport json, signal, sys, time\n"
+                        "if 'auth' in sys.argv:\n    sys.exit()\n"
+                        "def stop(*_):\n"
+                        "    print(json.dumps({'is_error': True, 'subtype': 'error_during_execution', 'session_id': 's-slow',\n"
+                        "                      'total_cost_usd': 0.4}), flush=True)\n"
+                        "    sys.exit(0)\n"
+                        "signal.signal(signal.SIGINT, stop)\n"
+                        "time.sleep(30)\n")
+        deaf = self.tmp / "deaf-claude"
+        deaf.write_text("#!/usr/bin/env python3\nimport signal, sys, time\n"
+                        "if 'auth' in sys.argv:\n    sys.exit()\n"
+                        "signal.signal(signal.SIGINT, signal.SIG_IGN)\ntime.sleep(30)\n")
+        old = os.environ["ROUTER_CLAUDE_BIN"]
+        self.addCleanup(os.environ.__setitem__, "ROUTER_CLAUDE_BIN", old)
+        C = self.o.claude_cli
+        for confine in [None] + ([] if jail.available() else [self.state]):
+            for exe, cost in ((fake, 0.4), (deaf, None)):
+                with self.subTest(exe.name, confined=bool(confine)):
+                    exe.chmod(0o755)
+                    os.environ["ROUTER_CLAUDE_BIN"] = str(exe)
+                    t0 = time.time()
+                    r = C.call("x", "opus", "medium", self.repo, perm="dontAsk", tools=[], timeout=3, confine=confine)
+                    self.assertEqual((r.get("error_kind"), r.get("timeout"), r.get("total_cost_usd")), ("timeout", True, cost))
+                    self.assertLess(time.time() - t0, 25, "one that ignores the interrupt is still killed")
+
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate
         v = orchestrate.settle_verdict({"verdict": "pass", "findings": [

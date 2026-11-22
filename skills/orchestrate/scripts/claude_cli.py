@@ -37,6 +37,7 @@ import datetime
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -116,6 +117,47 @@ def _cost_of_this_call(data: dict, resume: str | None) -> None:
         tmp = seen.with_name(f"{sid}.{os.getpid()}.{threading.get_ident()}")
         tmp.write_text(repr(float(total)))
         os.replace(tmp, seen)
+
+
+INTERRUPT_GRACE_S = 10
+
+
+def _interrupt(pid: int) -> None:
+    """SIGINT to claude itself. In the jail that is the first process under the bwraps (bwrap doesn't
+    pass signals on, and killing it loses the reply)."""
+    with contextlib.suppress(OSError, ValueError):
+        while Path(f"/proc/{pid}/comm").read_text().strip() == "bwrap":
+            kids = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+            if not kids:
+                return
+            pid = int(kids[0])
+        os.kill(pid, signal.SIGINT)
+
+
+def _run(cmd: list[str], cwd: Path, env: dict, piped: str | None, timeout: float) -> tuple[str, str, bool]:
+    """(stdout, stderr, timed out). At the timeout claude is interrupted first: it then prints its
+    result with what the call cost, which a kill loses. It is killed if that doesn't stop it."""
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=None if piped is None else subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace")
+    try:
+        try:
+            out, err = p.communicate(piped, timeout=timeout)
+            return out, err, False
+        except subprocess.TimeoutExpired:
+            _interrupt(p.pid)
+        try:
+            out, err = p.communicate(timeout=INTERRUPT_GRACE_S)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            try:
+                out, err = p.communicate(timeout=5)
+            except subprocess.TimeoutExpired:  # something it started holds the pipes
+                out, err = "", ""
+        return out, err, True
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
 
 
 def reset_wait(text: str, now: float | None = None) -> float | None:
@@ -342,27 +384,36 @@ def _call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: 
     backoff = float(os.environ.get("ORCHESTRATE_API_BACKOFF_S", "20"))
     data: dict = {}
     kind: str | None = "exec"
+    paid = 0.0  # by attempts that were retried
     t0 = time.time()
     for attempt in range(max(tries, 0) + 1):
         t0 = time.time()
+        with login_kept_fresh(bool(confine)):
+            out, err, timed_out = _run(cmd, cwd, env, piped, timeout)
+        if timed_out:
+            res = {"is_error": True, "error_kind": "timeout", "timeout": True,
+                   "result": f"claude timed out after {timeout}s", "structured": None,
+                   "metrics": {"wall_s": round(time.time() - t0, 1)}}
+            with contextlib.suppress(ValueError, IndexError):  # nothing to parse: it had to be killed
+                last = _parse(out)
+                _cost_of_this_call(last, resume)
+                if isinstance(last.get("total_cost_usd"), (int, float)):
+                    res["total_cost_usd"] = last["total_cost_usd"]
+            if paid:
+                res["total_cost_usd"] = paid + (res.get("total_cost_usd") or 0.0)
+            return res
         try:
-            with login_kept_fresh(bool(confine)):
-                p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, input=piped, encoding="utf-8",
-                                   errors="replace", timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return {"is_error": True, "error_kind": "timeout", "timeout": True,
-                    "result": f"claude timed out after {timeout}s", "structured": None,
-                    "metrics": {"wall_s": round(time.time() - t0, 1)}}
-        try:
-            data = _parse(p.stdout)
+            data = _parse(out)
         except (ValueError, IndexError):
-            data = {"is_error": True, "result": (p.stdout + p.stderr)[-2000:], "subtype": "unparseable"}
+            data = {"is_error": True, "result": (out + err)[-2000:], "subtype": "unparseable"}
             kind = ("usage_limit" if USAGE_RE.match(data["result"]) else
                     "overloaded" if OVERLOAD_RE.search(data["result"]) else
                     "rate_limit" if RATE_RE.search(data["result"]) else "unparseable")
         else:
             kind = _kind(data)
+        _cost_of_this_call(data, resume)
         if kind in ("overloaded", "rate_limit") and attempt < tries:
+            paid += data.get("total_cost_usd") or 0.0
             time.sleep(backoff * (2 ** attempt))
             continue
         break
@@ -372,7 +423,8 @@ def _call(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: 
     usage = data.get("modelUsage") or {}
     data["model_id"] = next((k for k in usage if model in k), next(iter(usage), None))
     data["metrics"] = _metrics(data, time.time() - t0)
-    _cost_of_this_call(data, resume)
+    if paid:
+        data["total_cost_usd"] = paid + (data.get("total_cost_usd") or 0.0)
     so = data.get("structured_output")
     data["structured"] = so if isinstance(so, dict) else extract_json(str(data.get("result", "")))
     if kind == "cut_off":
