@@ -689,7 +689,8 @@ def main(argv=None) -> int:
                          f"(default {ROLE_FLOOR}), so a whole role can't fail behind a good overall mean")
     ap.add_argument("--keep", action="store_true", help="keep the scratch fixture repos for inspection")
     ap.add_argument("--no-hermetic", action="store_true",
-                    help="load your own MCP servers and hooks in every model call (default: neither loads)")
+                    help="load your own hooks, and your MCP servers in calls that may have them (workers; judgment "
+                         "roles never do) (default: neither loads)")
     a = ap.parse_args(argv)
     # Hermetic by default: the user's MCP servers and hooks change what a prompt does, so a run
     # measured with them doesn't compare with one measured without (claude_cli.call reads this).

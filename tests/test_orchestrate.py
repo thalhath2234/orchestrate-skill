@@ -62,6 +62,9 @@ FAKE = textwrap.dedent(r'''
         budget = a[a.index("--max-budget-usd") + 1] if "--max-budget-usd" in a else None
         with open(calls, "a") as fh:
             fh.write(json.dumps({"kind": kind, "model": model, "effort": effort, "cwd": cwd.name,
+                                 "only": a[a.index("--tools") + 1] if "--tools" in a else None,
+                                 "no_mcp": "--strict-mcp-config" in a,
+                                 "no_advisor": os.environ.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == "1",
                                  "t": time.time(), "budget": budget, "schema": "--json-schema" in a,
                                  **kw}) + "\n")
     if prompt.startswith("FAILURE_CLASSIFIER"):
@@ -771,6 +774,101 @@ class OrchestrateTest(unittest.TestCase):
             {"case": "store error reported as 404", "handled": False, "severity": "minor", "evidence": "handler.go:20"}]}))
         self.assertEqual(minor["verdict"], "pass", "the reviewer's own severity is kept")
         self.assertEqual(minor["findings"][0]["severity"], "minor")
+
+    def test_an_unhandled_edge_case_blocks_unless_the_reviewer_marked_it_low_confidence(self):
+        def judged(findings=(), **case):
+            raw = {"verdict": "pass", "findings": list(findings), "edge_cases": [
+                {"case": "schedule store outage reported as 404", "handled": False, "evidence": "h.go:30", **case}]}
+            v = self.o.enforce_edge_cases(raw)
+            return v, self.o.settle_verdict(v)["verdict"]
+
+        v, final = judged(severity="major", confidence="low")
+        self.assertEqual(final, "pass")
+        self.assertEqual(v["verdict"], "pass", "the integration reviewer reads this verdict: a doubt doesn't flip it")
+        self.assertEqual([(f["severity"], f["confidence"]) for f in v["findings"]], [("major", "low")],
+                         "the doubt is still reported")
+        self.assertEqual(judged(severity="blocker", confidence="low")[1], "pass", "the same rule as for findings")
+        # the incident: the doubt was also a low finding, worded differently, so the case was added too
+        doubt = {"severity": "major", "confidence": "low", "issue": "every Get error becomes not found"}
+        self.assertEqual(judged([doubt], severity="major", confidence="low")[1], "pass")
+        for case in ({"confidence": "high"}, {"confidence": "medium"}, {}, {"confidence": ""}, {"confidence": None},
+                     {"confidence": "unsure"}):
+            v, final = judged(severity="major", **case)
+            self.assertEqual((v["verdict"], final), ("changes_requested", "changes_requested"), case)
+        self.assertEqual(judged([doubt], severity="major", confidence="high")[1], "changes_requested")
+        self.assertEqual(judged(severity="minor", confidence="high")[1], "pass")
+
+    def test_the_reviewers_can_give_an_edge_case_a_confidence(self):
+        import schemas
+        for s in (schemas.REVIEW, schemas.AREA_REVIEW):
+            self.assertEqual(s["properties"]["edge_cases"]["items"]["properties"]["confidence"]["enum"],
+                             ["high", "medium", "low"])
+        self.assertIn("`confidence`", self.o.EDGE_CASE_BRIEF)
+
+    def test_a_doubtful_edge_case_from_an_area_reviewer_does_not_block(self):
+        for conf, want in (("low", "pass"), ("high", "changes_requested")):
+            with self.subTest(conf):
+                job, plan = self._area_job() if conf == "low" else (job, plan)
+                case = {"case": "store outage reported as missing", "handled": False, "evidence": "h.go:30",
+                        "severity": "major", "confidence": conf}
+                self._stub_reviewers({"api": [{"verdict": "pass", "summary": "s", "findings": [], "edge_cases": [case]}]},
+                                     {"verdict": "pass", "summary": "s", "findings": []})
+                v = self.o.settle_verdict(self.o.review_by_area(job, plan, "", 100000))
+                self.assertEqual(v["verdict"], want)
+                self.assertIn("store outage reported as missing", json.dumps(v["findings"]))
+
+    def test_judgment_roles_run_read_only_and_without_the_users_advisor(self):
+        ro, seen = "Read,Grep,Glob", {}
+
+        def collect():
+            for line in self.calls.read_text().splitlines():
+                c = json.loads(line)
+                seen.setdefault(c["kind"], []).append(c)
+        blocker = {"verdict": "changes_requested", "summary": "x", "findings": [
+            {"severity": "blocker", "confidence": "high", "issue": "not wired", "file": "apps/api/share/handler.go"}]}
+        self.cli("run", str(self.write_plan(base_plan(self.repo))), "--workers", "headless",
+                 cfg={"tasks": WRITES, "reviews": [blocker, {"verdict": "pass", "summary": "ok", "findings": []}]})
+        self.cli("plan", "--repo", str(self.repo), "--goal", "g", "--done", "I can see the schedule from the link",
+                 cfg={"plan": base_plan(self.repo)})
+        collect()
+        for kind in ("review", "advise", "manage", "plan"):
+            self.assertIn(kind, seen)
+            for c in seen[kind]:
+                self.assertEqual((c["only"], c["no_mcp"]), (ro, True), kind)
+        self.assertIn("lessons", seen)
+        for c in seen["lessons"]:
+            self.assertEqual((c["only"], c["no_mcp"]), ("", True))
+        for c in seen["worker"]:
+            self.assertEqual((c["only"], c["no_mcp"]), (None, False), "workers need their shell and the user's servers")
+        for kind, cs in seen.items():
+            for c in cs:
+                self.assertTrue(c["no_advisor"], f"{kind}: the user's advisorModel reached a child")
+
+    def test_the_integrator_can_edit_but_has_no_shell(self):
+        self._conflicting_merge({})
+        c = self.calls_of("merge")[0]
+        self.assertEqual((c["only"], c["no_mcp"]), ("Read,Grep,Glob,Edit,Write", True))
+
+    def test_every_claude_call_states_its_tool_set(self):
+        # a new role must choose: `only=` or a place on this short list of roles with the default set
+        import ast
+        default_set = {"cleanup_pass"}
+        tree, missing = ast.parse(ORCH.read_text()), []
+        for fn in [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name not in default_set]:
+            shared = any(isinstance(n, ast.keyword) and n.arg == "only" and n.value is not None
+                         for d in ast.walk(fn) if isinstance(d, ast.Call) and getattr(d.func, "id", "") == "dict"
+                         for n in d.keywords)
+            for c in ast.walk(fn):
+                if not isinstance(c, ast.Call):
+                    continue
+                submitted = getattr(c.func, "attr", "") == "submit" and c.args and getattr(c.args[0], "id", "") == "claude"
+                if getattr(c.func, "id", "") != "claude" and not submitted:
+                    continue
+                names = [k.arg for k in c.keywords
+                         if not (k.arg == "only" and getattr(k.value, "value", "") is None)]  # only=None is no choice
+                if "only" not in names and not (None in names and shared):
+                    missing.append(f"{fn.name}:{c.lineno}")
+        self.assertEqual(missing, [])
 
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate

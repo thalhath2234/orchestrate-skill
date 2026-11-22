@@ -113,7 +113,8 @@ def fallback_args(model: str) -> list[str]:
 def advisor_args(model: str, advisor: str | None, max_model: str | None = None) -> list[str]:
     """`--advisor X` for a worker running `model`, or [] when the pairing can't work.
 
-    The advisor tool (claude --advisor) is off by default: [COST] measured it buying about what
+    The advisor tool (claude --advisor) is off by default, whatever the user's `advisorModel`
+    setting says (claude_cli.child_env). [COST] measured it buying about what
     more effort buys (+1.7 points for 2.1x), and on another benchmark Opus rarely consulted it
     and scored 7 points lower. It is opt-in per plan, for long tasks that are hard in spots.
     `max_model` caps the advisor like any role (Fable capped at Opus -> an Opus advisor).

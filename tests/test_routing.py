@@ -29,6 +29,8 @@ FAKE_CLAUDE = textwrap.dedent('''\
                              "resume": "--resume" in a, "hint": "Note from a previous" in prompt,
                              "fallback": a[a.index("--fallback-model") + 1] if "--fallback-model" in a else None,
                              "advisor": a[a.index("--advisor") + 1] if "--advisor" in a else None,
+                             "no_advisor": os.environ.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == "1",
+                             "only": a[a.index("--tools") + 1] if "--tools" in a else None,
                              "consult": "consult the advisor" in prompt.lower()}) + "\\n")
     if "--advisor" in a and cfg.get("advisor_launch_fail"):
         sys.stderr.write("Error: Fable as the advisor needs your consent to bill usage credits. Run /model fable.\\n")
@@ -440,6 +442,9 @@ class RoutingTest(unittest.TestCase):
             #!/usr/bin/env python3
             import json, pathlib, sys
             pathlib.Path({str(argv)!r}).write_text(json.dumps(sys.argv[1:]))
+            import os
+            pathlib.Path({str(self.tmp / "no-advisor.json")!r}).write_text(
+                json.dumps(os.environ.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL")))
             sys.stdout.buffer.write(json.dumps({reply!r}, ensure_ascii=False).encode() + b"\\n")
         """))
         fake.chmod(0o755)
@@ -489,6 +494,41 @@ class RoutingTest(unittest.TestCase):
             self.assertNotIn("--strict-mcp-config", argv)
             self.assertNotIn("--mcp-config", argv)
             self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), own)
+
+    def test_only_is_the_whole_tool_set_and_drops_mcp_servers_once(self):
+        fake = self._argv_fake({"is_error": False, "subtype": "success", "result": "ok"})
+        for only, want in (([], ""), (["Read", "Grep", "Glob"], "Read,Grep,Glob")):
+            for env in ({}, {"ORCHESTRATE_HERMETIC": "1"}):
+                _, argv = self._cli_call(fake, env, only=only)
+                self.assertEqual(argv[argv.index("--tools") + 1], want)
+                self.assertEqual(argv.count("--strict-mcp-config"), 1)
+                self.assertEqual(json.loads(argv[argv.index("--mcp-config") + 1]), {"mcpServers": {}})
+        _, argv = self._cli_call(fake, {"ORCHESTRATE_HERMETIC": "0"})
+        self.assertNotIn("--tools", argv, "a worker keeps the default set")
+
+    def test_the_advisor_tool_is_off_unless_the_call_asks_for_it(self):
+        fake, var = self._argv_fake({"is_error": False, "subtype": "success", "result": "ok"}), "CLAUDE_CODE_DISABLE_ADVISOR_TOOL"
+        got = lambda: json.loads((self.tmp / "no-advisor.json").read_text())
+        before = os.environ.get(var)
+        self._cli_call(fake, {})
+        self.assertEqual(got(), "1")
+        self._cli_call(fake, {var: "1"}, extra_args=["--advisor", "opus"])
+        self.assertIsNone(got(), "the switch disables --advisor too, so a call that asks for one drops it")
+        self._cli_call(fake, {}, extra_args=["--fallback-model", "opus"])
+        self.assertEqual(got(), "1")
+        self.assertEqual(os.environ.get(var), before, "set per child, never in this process")
+
+    def test_a_task_gets_the_advisor_only_from_its_own_flag_and_the_classifier_never(self):
+        _, _, calls, _ = self.run_task("feature:web", "T1", {"pass": ["opus/high"], "cause": "capability"},
+                                       extra=("--start", "opus/medium", "--advisor", "opus"))
+        workers = [c for c in calls if not c["classifier"]]
+        judged = [c for c in calls if c["classifier"]]
+        self.assertTrue(workers and judged, calls)
+        for c in workers:
+            self.assertEqual(c["no_advisor"], c["advisor"] is None, c)
+            self.assertIsNone(c["only"])
+        for c in judged:
+            self.assertEqual((c["no_advisor"], c["only"]), (True, ""), c)
 
     def test_a_reply_that_is_json_but_not_an_object_is_unparseable(self):
         fake = self._argv_fake({"is_error": False, "subtype": "success", "result": "ok"})

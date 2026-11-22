@@ -116,6 +116,8 @@ When `scan` returns a `ui_suggestion` and the job changes the UI, add a `ui` blo
                                               //   refused (e.g. Fable usage-credits consent) the task
                                               //   runs on without it. Not the plan/final advisor checks,
                                               //   which always run (models.advisor)
+                                              //   Headless workers only: Orca workers follow
+                                              //   the user's own advisorModel setting.
   "max_escalations": 2,                       // optional; model escalations per task before the manager steps in
   "area": "cross",                            // area used for review-fix routing
   "extra_tools": ["Bash(docker compose *)"],  // optional extra allowed tools for subagents

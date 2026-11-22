@@ -63,6 +63,8 @@ After every task has merged: the job's final verify, then a reviewer with a fres
 
 Reviewers and the advisor report every finding with a `severity` and a `confidence`, and the harness decides what blocks (`blocking_findings`): blocker or major, unless the model marked it low confidence. The model's own `verdict` is kept as `model_verdict`, but the findings set the verdict. This follows Anthropic's code-review harness guidance: a reviewer told to be selective finds bugs and then leaves them out. An unhandled edge case the reviewer didn't list as a finding is added at the severity it gave the case. Judgment schemas put the evidence fields first and the verdict last, because structured output is generated in field order. Reviewer and advisor prompts put the material first (diff, reports, verify output, each fenced), then the playbook and the definition of done, then the task.
 
+An unhandled edge case that no finding names becomes a finding at the case's `severity` and `confidence` (`enforce_edge_cases`). One marked `low` is reported and doesn't block, like any other finding; one added with no confidence blocks. A case counts as named when 60% of its words appear in the findings' text, and then those findings' severity and confidence decide, not the case's.
+
 ## UI review
 
 **Preflight.** In `prepare_job`, after setup and the baseline and before any model call, `ui_review.preflight` starts `ui.dev` once in the integration worktree (under the dev-server lock, port check included) and waits for `ui.url`, then stops it and puts the worktree back. Then `check_chrome` starts Chrome, opens `about:blank` and takes one PNG screenshot. A busy port, a dev command that never answers, or a Chrome that can't take that screenshot (`plan.ui: Chrome can't take screenshots here: ...`) ends the job as `environment`. It runs once per job (`job.state["ui_preflight_ok"]`).
@@ -144,9 +146,24 @@ Learning, all as proposals the user approves:
 
 `budget_usd` is passed to every model call as `--max-budget-usd` (the remaining amount), and the scheduler stops launching tasks once it is spent.
 
+## Tools and the advisor tool in each call
+
+`--allowedTools` only pre-approves: every other tool is still offered, and the user's allow rules apply to it. So judgment calls pass `only=` to `claude_cli.call`, which adds `--tools <list>` and an empty `--strict-mcp-config` (`--tools` doesn't cover MCP tools):
+
+| Call | Tools it has |
+|---|---|
+| reviewer, area, UI and integration reviewers, advisor, manager, planner | Read, Grep, Glob |
+| failure classifier, lessons | none (`--tools ""`; `StructuredOutput` still works) |
+| integrator | Read, Grep, Glob, Edit, Write |
+| workers, cleanup | the default set, under their permission mode |
+
+Every child gets `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` unless the call passes `--advisor` (the plan's `advisor`, workers only); then the variable is removed, because it disables `--advisor` too. An empty `advisorModel` in `--settings` does not turn the tool off. Orca workers aren't started by `claude_cli`, so they follow the user's settings.
+
+A manager session started without these flags (an older job resumed) still lists the old tools, from its saved prompt, but the CLI refuses to run them.
+
 ## Hermetic calls
 
-`ORCHESTRATE_HERMETIC=1` makes every `claude_cli.call` add `--strict-mcp-config`, `--mcp-config '{"mcpServers":{}}'` and `disableAllHooks` merged into its `--settings` (so `blockWritesOutsideWorkingDirectories` stays), and the user's MCP servers and hooks don't load. CLAUDE.md, rules and other setting sources still load. It is off by default in jobs; `evals/run.py` sets it unless given `--no-hermetic`.
+`ORCHESTRATE_HERMETIC=1` makes every `claude_cli.call` add `--strict-mcp-config`, `--mcp-config '{"mcpServers":{}}'` and `disableAllHooks` merged into its `--settings` (so `blockWritesOutsideWorkingDirectories` stays), and the user's MCP servers and hooks don't load. CLAUDE.md, rules and other setting sources still load. It is off by default in jobs, though restricted calls never load MCP servers (above); `evals/run.py` sets it unless given `--no-hermetic`.
 
 ## Finding jobs and checking the install
 

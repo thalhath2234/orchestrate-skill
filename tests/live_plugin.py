@@ -63,6 +63,7 @@ class PluginApprovalHook(unittest.TestCase):
                   "else, don't retry a command that is denied, then reply DONE.\n\n"
                   f"1. {ctl_cmd}\n2. {probe_cmd}\n")
         env = {k: v for k, v in os.environ.items() if not k.startswith(("ORCHESTRATE_", "CLAUDE_PLUGIN"))}
+        env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"  # a user's advisorModel would add a paid second model
         p = subprocess.run(
             ["claude", "-p", prompt, "--model", "haiku", "--output-format", "json",
              "--plugin-dir", str(self.plugin), "--setting-sources", "project,local",

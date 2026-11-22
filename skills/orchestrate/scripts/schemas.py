@@ -114,15 +114,17 @@ FINDING = {
 
 # One edge case the reviewer checked. Every reviewer enumerates the edge cases of what changed
 # (empty, null, boundaries, errors, concurrency, auth...) and says how each is handled; one marked
-# unhandled without a matching finding becomes a finding in code, at the severity the
-# reviewer gave it (major when it gave none).
+# unhandled without a matching finding becomes a finding in code, at the severity (major when it
+# gave none) and confidence the reviewer gave it: like any finding, only `low` doesn't block.
 EDGE_CASE = {
     "type": "object",
     "required": ["case", "evidence", "handled"],
     "properties": {"case": {"type": "string"}, "file": {"type": "string"},
                    "evidence": {"type": "string"}, "handled": {"type": "boolean"},
                    # for an unhandled case: how much it matters (default major)
-                   "severity": {"type": "string", "enum": ["blocker", "major", "minor"]}},
+                   "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+                   # for an unhandled case: how sure the reviewer is (missing blocks, like high)
+                   "confidence": {"type": "string", "enum": ["high", "medium", "low"]}},
 }
 
 REVIEW = {

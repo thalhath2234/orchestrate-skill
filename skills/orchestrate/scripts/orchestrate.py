@@ -272,11 +272,11 @@ def skill_text(name: str) -> str:
 def claude(prompt: str, model: str, effort: str, cwd: Path, *, perm: str, tools: list[str],
            resume: str | None = None, timeout: int = 3600, settings: dict | None = None,
            schema: dict | None = None, budget_usd: float | None = None,
-           extra_args: list[str] | None = None) -> dict:
+           extra_args: list[str] | None = None, only: list[str] | None = None) -> dict:
     extra = list(extra_args or []) + models.fallback_args(model)  # no Fable access -> Opus
     return claude_cli.call(prompt, model, effort, cwd, perm=perm, tools=tools, resume=resume,
                            timeout=timeout, settings=settings, schema=schema,
-                           budget_usd=budget_usd, extra_args=extra)
+                           budget_usd=budget_usd, extra_args=extra, only=only)
 
 
 def record_call(job, role: str, res: dict, task: str | None = None, cfg: str = "") -> None:
@@ -1443,6 +1443,7 @@ conflict markers. Do not run git, do not commit, do not touch other files.
 Reply with the JSON object: resolved (true|false), notes."""
     im, ie = models.role("integrator", plan)
     res = claude(prompt, im, ie, integ, perm="acceptEdits", tools=["Read", "Grep", "Glob"],
+                 only=["Read", "Grep", "Glob", "Edit", "Write"],  # it edits the conflict; no git, no shell
                  settings={"permissions": {"blockWritesOutsideWorkingDirectories": True}},
                  schema=schemas.INTEGRATOR, budget_usd=budget_left(job, plan))
     record_call(job, "integrator", res, task["id"], f"{im}/{ie}")
@@ -1777,7 +1778,7 @@ def _reask_missing(job: Job, plan: dict, keep: dict, missing: list[str]) -> dict
                  f"screenshots. Open each with Read and judge it like the others:\n{lines}\n\nThen reply with the "
                  "complete JSON object again: a `pages` entry for every screenshot (these and the ones you "
                  "already judged), every finding, expected entry, earlier answer, summary and verdict.",
-                 model, effort, Path(job.state["integration_wt"]), perm="dontAsk", tools=["Read", "Grep", "Glob"],
+                 model, effort, Path(job.state["integration_wt"]), perm="dontAsk", tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY,
                  resume=keep["session"], schema=schemas.UI_REVIEW, budget_usd=budget_left(job, plan))
     record_call(job, "ui_reviewer", res, None, f"{model}/{effort}")
     v = res.get("structured")
@@ -2137,7 +2138,7 @@ def _ask_reviewer(job: Job, plan: dict, prompt: str, schema: dict, role: str,
     `keep` gets the session id, for a follow-up turn."""
     integ = Path(job.state["integration_wt"])
     model, effort = cfg or reviewer_cfg(plan)
-    res = claude(prompt, model, effort, integ, perm="dontAsk", tools=["Read", "Grep", "Glob"],
+    res = claude(prompt, model, effort, integ, perm="dontAsk", tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY,
                  schema=schema, budget_usd=budget_left(job, plan))
     record_call(job, role, res, None, f"{model}/{effort}")
     res = _reask(job, plan, res, (model, effort), schema, tag, role)
@@ -2164,7 +2165,7 @@ def _reask(job: Job, plan: dict, res: dict, cfg: tuple[str, str], schema: dict, 
     res2 = claude(f"{tag} (retry)\nYour reply was not the verdict JSON object. "
                   "Reply with ONLY that JSON object.",
                   model, effort, Path(job.state["integration_wt"]), perm="dontAsk",
-                  tools=["Read", "Grep", "Glob"], resume=res.get("session_id"), schema=schema,
+                  tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY, resume=res.get("session_id"), schema=schema,
                   budget_usd=budget_left(job, plan))
     record_call(job, role, res2, None, f"{model}/{effort}")
     return res2
@@ -2178,13 +2179,17 @@ races, retries and timeouts; partial failure and rollback; permissions (anonymou
 revoked access); very large inputs; and compatibility with existing data, clients and config.
 Return every one in `edge_cases` with `handled` and evidence (file:line or a test). For each
 unhandled one, give its `severity` (an unhandled case that can cause incorrect behaviour on a
-reachable path is major or worse) and list it in `findings` too."""
+reachable path is major or worse) and its `confidence`, and list it in `findings` too with the same
+confidence. Use `low` only when you can't confirm the problem from this repo (the code that decides
+it isn't here); a failure you traced in the code is high or medium, however rare its input."""
 
 
 def enforce_edge_cases(v: dict) -> dict:
     """An edge case the reviewer marked unhandled must surface as a finding: if no finding names
-    it, add one at the severity the reviewer gave the case (major when it gave none), so `pass`
-    can't coexist with a known hole and a minor gap isn't inflated into a blocker."""
+    it, add one at the severity (major when it gave none) and confidence the reviewer gave the
+    case, so `pass` can't coexist with a known hole, while a minor gap or a doubt the reviewer
+    marked `low` doesn't block. An added case with no confidence blocks. A case some finding
+    already names (60% of its words) is not added: that finding's severity and confidence stand."""
     added = []
     text = " ".join(f"{f.get('file', '')} {f.get('issue', '')}".lower() for f in v.get("findings") or [])
     for ec in v.get("edge_cases") or []:
@@ -2195,10 +2200,13 @@ def enforce_edge_cases(v: dict) -> dict:
         if case and words and sum(w in text for w in words) / len(words) >= 0.6:
             continue  # a finding already covers it
         added.append({"severity": ec.get("severity") or "major", "file": ec.get("file", ""),
+                      **({"confidence": ec["confidence"]} if ec.get("confidence") else {}),
                       "issue": f"edge case not handled: {case}",
                       "suggestion": str(ec.get("evidence", ""))[:500]})
     if added:
-        v = {**v, "verdict": "changes_requested", "findings": list(v.get("findings") or []) + added}
+        v = {**v, "findings": list(v.get("findings") or []) + added}
+        if blocking_findings(added):
+            v["verdict"] = "changes_requested"
     return v
 
 
@@ -2487,7 +2495,7 @@ verdict."""
     am, ae = models.role("area_reviewer", plan)
     with cf.ThreadPoolExecutor(max_workers=min(4, len(areas) or 1)) as ex:
         futs = {a: ex.submit(claude, area_prompt(a, fs), am, ae, integ, perm="dontAsk",
-                             tools=["Read", "Grep", "Glob"], schema=schemas.AREA_REVIEW,
+                             tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY, schema=schemas.AREA_REVIEW,
                              budget_usd=budget_left(job, plan)) for a, fs in areas.items()}
         results = {a: f.result() for a, f in futs.items()}
     area_v = {}
@@ -2654,7 +2662,7 @@ def advise(stage: str, plan: dict, cwd: Path, body: str, *, budget=lambda: None,
               f"{ADVICE_EXAMPLES}\n\nReply with only the JSON object.")
     advice = None
     for eff in efforts:
-        res = claude(prompt, model, eff, cwd, perm="dontAsk", tools=["Read", "Grep", "Glob"],
+        res = claude(prompt, model, eff, cwd, perm="dontAsk", tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY,
                      schema=schemas.ADVICE, budget_usd=budget(), timeout=1800)
         res["escalated"] = eff != effort  # the re-check, not the advisor's own effort
         on_call(res, f"{model}/{eff}")
@@ -2662,7 +2670,7 @@ def advise(stage: str, plan: dict, cwd: Path, body: str, *, budget=lambda: None,
         if not _advice_ok(v) and res.get("error_kind") != "budget" and res.get("session_id"):
             res = claude("ORCHESTRATE_ADVISE (retry)\nYour reply was not the advice JSON object. "
                          "Reply with ONLY that JSON object.", model, eff, cwd, perm="dontAsk",
-                         tools=["Read", "Grep", "Glob"], resume=res.get("session_id"),
+                         tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY, resume=res.get("session_id"),
                          schema=schemas.ADVICE, budget_usd=budget(), timeout=600)
             res["escalated"] = eff != effort
             on_call(res, f"{model}/{eff}")
@@ -3037,7 +3045,7 @@ def manager_call(cfg: dict, integ: Path, prompt: str, full: str, session: str | 
                  budget: float | None, job_dir: Path) -> list[dict]:
     """The model side of a manager decision. Pure: touches no job state, so it can run in a
     background thread while the scheduler keeps launching tasks (P2.1)."""
-    kw = dict(perm="dontAsk", tools=["Read", "Grep", "Glob"], schema=schemas.MANAGER,
+    kw = dict(perm="dontAsk", tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY, schema=schemas.MANAGER,
               extra_args=["--add-dir", str(job_dir)])
     res = claude(prompt, cfg["model"], cfg["effort"], integ, resume=session, budget_usd=budget, **kw)
     out = [res]
@@ -3948,7 +3956,7 @@ Return at most 5 lessons as JSON: {{"lessons": [{{"file": "<one of the candidate
 Return {{"lessons": []}} if nothing qualifies.
 
 {fence('job notes', fit_json(material, 16000), 18000)}"""
-    res = claude(prompt, cfg["model"], cfg["effort"], repo, perm="plan", tools=[],
+    res = claude(prompt, cfg["model"], cfg["effort"], repo, perm="plan", tools=[], only=[],
                  schema=schemas.LESSONS, budget_usd=None, timeout=600)
     record_call(job, "lessons", res, None, f"{cfg['model']}/{cfg['effort']}")
     lessons = (res.get("structured") or {}).get("lessons") or []
@@ -4598,7 +4606,7 @@ Use "repo": "{repo}". Reply with ONLY the plan JSON object."""
     pm, pe = models.parse(planner) if planner else models.role("planner")
     print(f"planning with {pm}/{pe}", file=sys.stderr)
     res = claude(prompt, pm, pe, repo, perm="dontAsk",
-                 tools=["Read", "Grep", "Glob", "Bash(git ls-files*)", "Bash(git log*)"],
+                 tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY,
                  schema=schemas.PLAN)
     cost = res.get("total_cost_usd") or 0.0
     plan, errs = res.get("structured"), ["reply was not a JSON object"]
@@ -4614,7 +4622,7 @@ Use "repo": "{repo}". Reply with ONLY the plan JSON object."""
         if i == 2:
             break
         res = claude("The plan is invalid:\n" + "\n".join(errs) + "\nReply with ONLY the corrected plan JSON.",
-                     pm, pe, repo, perm="dontAsk", tools=["Read", "Grep", "Glob"],
+                     pm, pe, repo, perm="dontAsk", tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY,
                      resume=res.get("session_id"), schema=schemas.PLAN)
         cost += res.get("total_cost_usd") or 0.0
         plan = res.get("structured")

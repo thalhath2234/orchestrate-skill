@@ -17,14 +17,14 @@ You were given conflicted files and each side's task report.
 
 - **Keep both intents.** A conflict between two tasks almost always means both changes are needed, for example two routes registered or two exports added. Combine them. Don't pick one side.
 - Use the **interfaces** in the reports as the source of truth for names and signatures.
-- Edit **only** the conflicted files, and remove every conflict marker. `git add` each resolved file. Don't commit.
+- Edit **only** the conflicted files, and remove every conflict marker. You have no git or shell: the harness stages your edits, checks and commits them.
 - **Lockfiles:** don't hand-merge them. Take the side that includes the dependency-adding task's changes, and say in your notes that the lockfile needs regenerating.
 - If you can't resolve a conflict without making a product decision, leave it, return `"resolved": false` and explain why.
 - Reply with the JSON object `{"resolved": true|false, "notes": "..."}`.
 
 ## Reviewing (reviewer)
 
-Read the actual diff (`git diff <base>..HEAD`, `git show`, open files). Your prompt opens with the user's definition of done in their own words: judge everything against it. Check, in this order:
+Read the actual diff in your prompt, and open the files it touches (Read, Grep and Glob are your only tools: you can't run git or any command; where a diff says it was cut, Read those files). Your prompt opens with the user's definition of done in their own words: judge everything against it. Check, in this order:
 
 1. **Acceptance:** every job acceptance criterion is met, with evidence in the code or tests. Missing criteria are blockers. Evidence doesn't count when the code only satisfies the test: a hardcoded result where a lookup or computation is needed, a branch on a test fixture's input, or a fallback that hides a failed call behind canned data. That is a major finding, or a blocker when an acceptance criterion rests on it. A named, documented config constant the criteria allow is fine.
 2. **Integration across tasks:** this is what no single subagent could see.
@@ -32,7 +32,7 @@ Read the actual diff (`git diff <base>..HEAD`, `git show`, open files). Your pro
    - Nothing is half-wired: routes registered, exports added, navigation entries present, flags on.
    - There is no duplicated logic where a task should have reused another's work, and no new helper, client or module that duplicates one the repo already had (Grep for it and cite its path). A duplicate is minor, or major when it bypasses a shared contract or type.
 3. **Each subtask's `done`** criteria hold.
-4. **Every edge case.** Not a sample: for each behaviour the diff adds or changes, list its edge cases and trace each through the code. Empty, missing and null input; boundaries (0, 1, max, off-by-one, overflow); invalid, malformed and hostile input; duplicates and idempotency; unicode and encoding; time (timezones, expiry, clock skew, DST); concurrency, races, retries and timeouts; partial failure and rollback; permissions (anonymous, wrong user, revoked access); very large inputs; compatibility with existing data, clients and config. Return every one in `edge_cases` with `handled` and evidence, and give each unhandled one a `severity`. An unhandled case that can cause incorrect behaviour on a reachable path is major or worse; the harness adds a finding at that severity for any unhandled case you didn't list in `findings`. Then the rest of correctness: error handling and logic errors.
+4. **Every edge case.** Not a sample: for each behaviour the diff adds or changes, list its edge cases and trace each through the code. Empty, missing and null input; boundaries (0, 1, max, off-by-one, overflow); invalid, malformed and hostile input; duplicates and idempotency; unicode and encoding; time (timezones, expiry, clock skew, DST); concurrency, races, retries and timeouts; partial failure and rollback; permissions (anonymous, wrong user, revoked access); very large inputs; compatibility with existing data, clients and config. Return every one in `edge_cases` with `handled` and evidence, and give each unhandled one a `severity` and a `confidence` (`low` only when you can't confirm it from this repo; a failure you traced in the code is high or medium, however rare its input). An unhandled case that can cause incorrect behaviour on a reachable path is major or worse; the harness adds a finding at that severity and confidence for any unhandled case you didn't list in `findings`. Then the rest of correctness: error handling and logic errors.
 5. **Security:** authorization on new endpoints and actions, input validation, injection, secrets or tokens in code or logs, unsafe defaults.
 6. **Data:** migrations are reversible and match the models, there are no destructive changes without a gate, and indexes exist for new lookups.
 7. **Tests:** they exercise the real behavior (not tautologies or mocks of the thing under test), and the core paths are covered.
@@ -80,8 +80,8 @@ Reply with only the JSON object (structured output). Fields in this order: `acce
   ],
   "edge_cases": [
     {"case": "token for a deleted schedule", "evidence": "handler.go:58 returns 404; handler_test.go:TestDeletedSchedule", "handled": true},
-    {"case": "clipboard API unavailable (http, old Safari)", "file": "apps/web/src/share/ShareButton.tsx",
-     "evidence": "ShareButton.tsx:30 calls navigator.clipboard unguarded", "handled": false, "severity": "major"}
+    {"case": "when the clipboard API is unavailable", "file": "apps/web/src/share/ShareButton.tsx",
+     "evidence": "ShareButton.tsx:30 calls navigator.clipboard unguarded", "handled": false, "severity": "major", "confidence": "high"}
   ],
   "findings": [
     {"file": "apps/web/src/share/ShareButton.tsx", "line": 42, "issue": "uses `expires_at` but the API returns `expiresAt`",
@@ -109,8 +109,8 @@ Reply with only the JSON object (structured output). Fields in this order: `acce
   ],
   "edge_cases": [
     {"case": "month with no invoices", "evidence": "csv.py:20 writes the header only; test_csv.py:test_empty_month", "handled": true},
-    {"case": "amount with more than two decimals", "file": "billing/export/csv.py",
-     "evidence": "csv.py:31 uses round(); banker's rounding may differ from the ledger", "handled": false, "severity": "minor"}
+    {"case": "banker's rounding differs from the ledger", "file": "billing/export/csv.py",
+     "evidence": "csv.py:31 uses round(); banker's rounding may differ from the ledger, whose code isn't in this repo", "handled": false, "severity": "major", "confidence": "low"}
   ],
   "findings": [
     {"file": "billing/export/csv.py", "line": 12, "issue": "`fmt2` doesn't say what it formats", "confidence": "high", "severity": "minor", "suggestion": "rename to format_amount"},

@@ -292,7 +292,9 @@ class EvalRunnerTest(unittest.TestCase):
             calls = [json.loads(x) for x in log.read_text().splitlines()]
             self.assertTrue(calls)
             for a in calls:
-                self.assertEqual("--strict-mcp-config" in a, hermetic, a)
+                # a manager call is restricted, so it never loads MCP servers; the flag still decides hooks
+                self.assertEqual(a[a.index("--tools") + 1], "Read,Grep,Glob")
+                self.assertEqual(a.count("--strict-mcp-config"), 1, "no MCP servers either way, never passed twice")
                 settings = json.loads(a[a.index("--settings") + 1]) if "--settings" in a else {}
                 self.assertEqual(settings.get("disableAllHooks", False), hermetic, a)
 
