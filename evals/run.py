@@ -714,9 +714,45 @@ def run_parent(o, case: dict, tmp: Path, config: str | None) -> dict:
             "detail": out["reply"][:300], **served(pairs)}
 
 
+def grade_briefer(exp: dict, briefs: dict, tid: str) -> list[str]:
+    """One task's brief: what it must name (`brief_mentions`, `|` for alternatives), what it must not
+    say (`brief_lacks`, regexes), and for a bug fix a reproduction (`repro_mentions`)."""
+    b = briefs.get(tid)
+    if not b:
+        return [f"no brief for {tid}"]
+    text = b.get("brief", "").lower()
+    fails = [f"the brief never names {t!r}" for t in exp.get("brief_mentions", [])
+             if not any(alt.lower() in text for alt in t.split("|"))]
+    fails += [f"the brief says {rx!r}" for rx in exp.get("brief_lacks", []) if re.search(rx, b.get("brief", ""), re.I)]
+    repro = json.dumps(b.get("repro") or {}).lower()
+    if exp.get("repro_mentions") and not b.get("repro"):
+        fails.append("no reproduction for a bug fix")
+    fails += [f"the reproduction never names {t!r}" for t in exp.get("repro_mentions", [])
+              if b.get("repro") and not any(alt.lower() in repro for alt in t.split("|"))]
+    return fails
+
+
+def run_briefer(o, case: dict, tmp: Path, config: str | None) -> dict:
+    """The briefer on a fixture repo: write_briefs for the case's tasks, graded on what each says."""
+    case = _from(case)
+    repo, sha = make_repo(tmp, case.get("files") or case.get("head_files") or case.get("base_files", {}))
+    plan = full_plan(case, repo)
+    if config:
+        plan.setdefault("models", {})["briefer"] = config
+    job = StubJob(tmp / "job", job_state(case, plan, repo, sha))
+    why = o.write_briefs(job, plan, [t["id"] for t in plan["tasks"]])
+    briefs = job.state.get("briefs") or {}
+    fails = [why] if why else []
+    for tid, exp in (case.get("expect") or {}).items():
+        fails += [f"{tid}: {f}" for f in grade_briefer(exp, briefs, tid)]
+    return {"ok": not fails, "label": "written" if not why else "missing", "fails": fails, "cost": job.state["cost_usd"],
+            "detail": " | ".join(f"{t}: {b.get('brief', '')[:140]}" for t, b in briefs.items()), **_calls(job)}
+
+
 RUNNERS = {"manager": run_manager, "reviewer": run_reviewer, "classifier": run_classifier,
            "advisor": run_advisor, "planner": run_planner, "worker": run_worker,
-           "ui_reviewer": run_ui_reviewer, "parent": run_parent}
+           "ui_reviewer": run_ui_reviewer, "parent": run_parent,
+           "briefer": run_briefer}
 
 
 def load_cases(roles, ids, core) -> list[tuple[str, dict]]:

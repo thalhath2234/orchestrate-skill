@@ -34,6 +34,8 @@ A good plan makes subagents independent. Each one gets a clear goal, its own fil
 
 Every task, whatever its tier, starts on the worker model: Opus 5.5 at medium. Failures re-run at `high`; capability failures go to `xhigh`, then Fable 5.2, the top rung. Don't raise a tier to buy a stronger model: the ladder does that on evidence. Before the plan runs, the advisor (Fable 5.2) checks it against the definition of done and can stop the job, so a plan that misses part of done comes back to you.
 
+Don't write a task's brief or a bug's reproduction into the plan: when the job runs, the briefer (Fable) reads the code and writes each subagent's brief (how to do it, how to test it, what done looks like), and for a `bugfix:` task the scenario and symptom the subagent reproduces before and after its fix. Put what it must know in the task's `goal`, `interfaces` and `done`.
+
 Type is `<category>:<area>`. Categories: `rename docs config bugfix feature refactor test migration review research`. The area is the package's area from `scan` (for example `api`, `web`, `mobile`, `contract`), or `cross`. Keep areas consistent across jobs, because routing learns per type.
 
 ## Monorepo rules
@@ -104,9 +106,9 @@ When `scan` returns a `ui_suggestion` and the job changes the UI, add a `ui` blo
   "manager": {"enabled": true, "max_interventions": 12, "max_task_retries": 2},  // optional; defaults
   "models": {"reviewer": "opus/high"},        // optional per-role override, "<model>/<effort>". Roles and
                                               //   defaults: advisor fable/medium (then high if it finds
-                                              //   nothing), planner fable/medium, manager, worker, reviewer,
-                                              //   area_reviewer, ui_reviewer, cleanup and integrator
-                                              //   opus/medium,
+                                              //   nothing), planner, briefer and manager fable/medium,
+                                              //   worker, reviewer, area_reviewer, ui_reviewer, cleanup and
+                                              //   integrator opus/medium,
                                               //   classifier haiku/low, lessons haiku/medium
                                               //   (scripts/models.py has the sources)
   "max_model": "opus",                        // optional: nothing above this model, roles or ladder

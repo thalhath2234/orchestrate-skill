@@ -217,6 +217,33 @@ def done_gaps(report, ids: list[str]) -> list[str]:
     return gaps
 
 
+def _cmd(run) -> str:
+    return " ".join(str((run or {}).get("command") or "").split()) if isinstance(run, dict) else ""
+
+
+def repro_gaps(report) -> list[str]:
+    """A bug fix shows the bug before the fix and the same scenario after it, from its report."""
+    r = (report or {}).get("repro")
+    if not isinstance(r, dict):
+        return ["no `repro` in your report: reproduce the bug first with the scenario in your brief, fix it, then run "
+                "the same scenario again, and report both runs (command and output)"]
+    before, after = r.get("before"), r.get("after")
+    gaps = []
+    if not _cmd(before) or not str((before or {}).get("output") or "").strip():
+        gaps.append("`repro.before` needs the command you ran on the untouched code and its output")
+    if not _cmd(after) or not str((after or {}).get("output") or "").strip():
+        gaps.append("`repro.after` needs the same scenario run again after your fix, with its output")
+    elif _cmd(before) and _cmd(after) != _cmd(before):
+        gaps.append(f"`repro.after` ran `{_cmd(after)}`, not the same scenario as before (`{_cmd(before)}`): run "
+                    "that one again")
+    return gaps
+
+
+def not_reproduced(report) -> bool:
+    r = (report or {}).get("repro")
+    return isinstance(r, dict) and r.get("reproduced") is False
+
+
 # The advisor tool only helps when the worker actually calls it: Claude decides when, and on one
 # Anthropic benchmark Opus rarely did and scored 7 points below Opus alone. So say when [ADVISOR].
 CONSULT = ("\nYou have an advisor (a stronger model) available as a tool. Consult the advisor: "
@@ -335,6 +362,8 @@ def main(argv=None) -> int:
     ap.add_argument("--budget-usd", type=float, help="stop when this run has spent this much")
     ap.add_argument("--exclude-dynamic-prompt", action="store_true",
                     help="pass --exclude-dynamic-system-prompt-sections (cache reuse across worktrees)")
+    ap.add_argument("--bugfix", action="store_true",
+                    help="a bug fix: its report must show the scenario before and after the fix (repro)")
     ap.add_argument("--done-ids", nargs="*", default=[],
                     help="definition-of-done ids ([D1].., [U1]..) the report's done_check must show "
                          "met with evidence; a gap counts as a failed attempt")
@@ -437,9 +466,19 @@ def main(argv=None) -> int:
             if worker.get("is_error"):
                 vout = str(worker.get("result"))
                 break
+            if a.bugfix and not_reproduced(worker.get("structured")):
+                # nothing to fix blind: the manager decides (a wrong scenario, already fixed, a question)
+                r = worker["structured"]["repro"]
+                vout = (f"the bug didn't reproduce: `{_cmd(r.get('before'))}` gave: "
+                        + str((r.get("before") or {}).get("output") or "")[-1500:])
+                summary["result"] = "not_reproduced"
+                log(vout[:400])
+                break
             ok, vout = verify(a.verify, repo, a.verify_timeout, confine, a.trusted_verify)
             if ok and a.done_ids:
                 gaps = done_gaps(worker.get("structured"), a.done_ids)
+                if a.bugfix:
+                    gaps += repro_gaps(worker.get("structured"))
                 if gaps:
                     ok = False
                     vout = ("The verify commands pass, but your definition of done is not met yet. "
@@ -465,6 +504,10 @@ def main(argv=None) -> int:
                     task_id=task_id, task_type=a.type, tier=a.tier, rung=rung, ok=True, cause=None,
                     model_id=worker.get("model_id"), probe=probe, cost_usd=cost)
             log(f"PASS at {model}/{effort}")
+            break
+
+        if summary.get("result") == "not_reproduced":
+            step.update(cause="not_reproduced", evidence=vout[:300])
             break
 
         if worker.get("error_kind") == "budget":

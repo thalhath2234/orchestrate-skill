@@ -1,6 +1,6 @@
 # Evals
 
-Snapshot evals for the model judgments orchestrate depends on: the **manager**, the **reviewer**, the **failure classifier**, the **advisor** (plan and final checks), the **planner**, the **worker** prompt (one real coding session on a tiny repo), the **UI reviewer** (fixture screenshots), and the **parent** (the orchestrate and grill skills themselves). The harness tests in `tests/` use a fake `claude` and prove the plumbing; these use the real one and measure the prompts.
+Snapshot evals for the model judgments orchestrate depends on: the **manager**, the **reviewer**, the **failure classifier**, the **advisor** (plan and final checks), the **planner**, the **briefer** (each subagent's brief), the **worker** prompt (one real coding session on a tiny repo), the **UI reviewer** (fixture screenshots), and the **parent** (the orchestrate and grill skills themselves). The harness tests in `tests/` use a fake `claude` and prove the plumbing; these use the real one and measure the prompts.
 
 Each case **constructs a state** (fixture repo, plan, job state, event or diff), runs the real prompt builder and parser, and **grades the outcome**: the manager's action batch, the reviewer's verdict and findings, the classifier's cause. The path the model took isn't graded.
 
@@ -46,6 +46,7 @@ A trial answered by a fallback model (Fable was asked for, but the account has n
 - **manager**: `any_action` (at least one of these kinds), `no_action` (none of these), `touches` (task ids acted on, matched exactly: an `add_task` whose new task owns `apps/api/...` doesn't touch task `api`), `mentions` (strings in the actions, such as a retry's instructions; the free-text `note` doesn't count), `valid` (default true: the batch must pass `apply_actions`)
 - **reviewer**: `verdict`, `finding_mentions` and `finding_file` (all in one blocker/major finding of the reviewer's own that it doesn't mark low confidence; a term can list alternatives with `|`), `no_finding_mentions` (in none of them). Findings the harness adds (`source: harness`, such as an unassessed criterion, which quotes the plan) never count
 - **classifier**: `cause`
+- **briefer**, keyed by task id: `brief_mentions` (terms the brief must name; `|` for alternatives), `brief_lacks` (regexes it must not match), `repro_mentions` (a bug fix's reproduction must exist and name these). Fixture: `files` and `plan`
 - **advisor**: `verdict` (`revise` when anything blocks, else `proceed`), `finding_mentions` (in a blocking finding or a raised criterion)
 - **planner**: `owned` (paths some task must own), `criteria_mention`, `min_acceptance`, `min_tasks`, `max_tasks`, `assumption_matches` / `no_assumption_matches` (regexes, case-insensitive, over the plan's `assumptions`), `decisions` (the exact list the plan's `decisions` must hold); the plan must validate and keep `definition_of_done` verbatim
 - **worker**: `ok` (default true: verify and the done check pass), `file_contains`, `file_lacks`, `unchanged`, `issue_mentions` (in the report's open issues)

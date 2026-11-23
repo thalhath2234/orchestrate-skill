@@ -149,7 +149,7 @@ def spec_for(job: O.Job, plan: dict, task: dict, hint: str = "") -> str:
     """The brief plus how to work and how to report, for an Orca worker."""
     integ = Path(job.state["integration_wt"])
     upstream = {d: job.state["tasks"].get(d, {}) for d in task.get("depends_on", [])}
-    brief = O.build_brief(plan, task, integ, upstream)
+    brief = O.build_brief(plan, task, integ, upstream, (job.state.get("briefs") or {}).get(task["id"]))
     setup = plan.get("setup") or []
     v = "\n".join(f"  {c}" for c in task["verify"])
     parts = [brief, "", "## How to work",
@@ -181,6 +181,10 @@ def start_worker(job: O.Job, plan: dict, tid: str, rung: int, *, fresh: bool, hi
     task = next(t for t in plan["tasks"] if t["id"] == tid)
     if O.jail.mode_of(plan) == "required":  # the plan can be edited while the job runs
         return f"plan.sandbox is true and Orca workers can't be confined ({O.ORCA_UNCONFINED})"
+    if tid not in (job.state.get("briefs") or {}):  # a task added since the job started
+        why = O.write_briefs(job, plan, [tid])
+        if why:
+            return why
     st = job.state["tasks"][tid]
     o = st.setdefault("orca", {"starts": 0, "escalations": 0})
     model, effort = router.cfg(rung)
@@ -404,11 +408,16 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
                           + "\n".join(f"  {b}" for b in bad) + "\nYou own: " + ", ".join(task["owns"]))
     if ok:
         ok, out = RT.verify(O.task_checks(plan, task), wt, 1800, O.confinement(plan))
+    if ok and O.is_bugfix(task) and RT.not_reproduced(report):
+        r = report["repro"]
+        return give_up(job, plan, tid, "not_reproduced",
+                       f"the bug didn't reproduce: `{RT._cmd(r.get('before'))}` gave: "
+                       + str((r.get("before") or {}).get("output") or "")[-1500:])
     if ok and report is None:
         ok, out = False, (f"The verify commands pass, but there is no readable report at {wt / REPORT_REL}. "
                           "Write the JSON report there, then send worker_done again.")
     if ok:
-        gaps = RT.done_gaps(report, O.done_ids(plan, task))
+        gaps = RT.done_gaps(report, O.done_ids(plan, task)) + (RT.repro_gaps(report) if O.is_bugfix(task) else [])
         if gaps:
             ok, out = False, ("The verify commands pass, but your definition of done is not met yet. "
                               "Finish these items, then report a done_check entry with evidence for "

@@ -129,6 +129,17 @@ EDGE_CASE = {
                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]}},
 }
 
+# Each task's brief from the briefer: its words for the subagent, and for a bug fix how to see the bug.
+BRIEFS = {
+    "type": "object",
+    "required": ["briefs"],
+    "properties": {"briefs": {"type": "array", "items": {
+        "type": "object", "required": ["id", "brief"],
+        "properties": {"id": {"type": "string"}, "brief": {"type": "string"},
+                       "repro": {"type": "object", "required": ["scenario", "symptom"],
+                                 "properties": {"scenario": {"type": "string"}, "symptom": {"type": "string"}}}}}}},
+}
+
 REVIEW = {
     "type": "object",
     "required": ["acceptance", "edge_cases", "findings", "summary", "verdict"],
@@ -243,6 +254,11 @@ DONE_CHECK = {
                    "evidence": {"type": "string"}},
 }
 
+RUN = {"type": "object", "required": ["command", "output"],
+       "properties": {"command": {"type": "string"}, "output": {"type": "string"}}}
+REPRO = {"type": "object", "required": ["reproduced", "before"],
+         "properties": {"reproduced": {"type": "boolean"}, "before": RUN, "after": RUN}}
+
 REPORT = {
     "type": "object",
     "required": ["summary", "interfaces", "notes_for_dependents", "open_issues", "done_check", "raise_bar"],
@@ -253,6 +269,7 @@ REPORT = {
         "open_issues": {"type": "array", "items": OPEN_ISSUE},
         "done_check": {"type": "array", "items": DONE_CHECK},   # one per [D#]/[U#] in the brief
         "raise_bar": {"type": "array", "items": BAR_ITEM},
+        "repro": REPRO,   # bug fixes: the scenario run before the fix and again after it
     },
 }
 

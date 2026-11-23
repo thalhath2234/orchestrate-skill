@@ -46,9 +46,12 @@ ROLES: dict[str, tuple[str, str]] = {
     # model; the Fable 5.2 prompting guide: "early testers had good results with Claude Fable 5.2
     # as the planner and orchestrator for other models". Falls back to Opus without Fable access.
     "planner": ("fable", "medium"),
-    # Small decisions in a long job. [COST] "For most agent workloads, start with Claude
-    # Opus 5.5 at its default effort (medium)". Our sweep: opus/medium 13/13 (= opus/high).
-    "manager": ("opus", "medium"),
+    # Retries, splits and steers the tasks. Fable 5.2 at medium (the user's choice, 2026-11-23:
+    # Fable delegates). Was Opus 5.5 at medium, where our sweep had 13/13.
+    "manager": ("fable", "medium"),
+    # Writes each subagent's brief: what to do, how to test it, what done looks like, and for a
+    # bug fix the scenario that shows the bug. Fable 5.2 at medium (the user's choice, 2026-11-23).
+    "briefer": ("fable", "medium"),
     # Every subagent starts here, whatever its tier, and escalates on failure
     # (opus/high -> opus/xhigh -> fable/high). Opus 5.5 at its default effort.
     "worker": ("opus", "medium"),

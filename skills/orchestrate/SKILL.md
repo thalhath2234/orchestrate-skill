@@ -9,7 +9,7 @@ You are the **parent**. You decide *what* to do: grill the user, then triage, pl
 
 **Keep done in view.** The first thing you ask the user is what done looks like, in their words. That sentence (`definition_of_done`) goes verbatim into the plan, every subagent's brief, the manager's, reviewer's and advisor's prompts, and your final report. Judge every step against it.
 
-**Models.** Advisor: Fable 5.2 at medium, re-asked at high when medium finds nothing. Planner: Fable 5.2 at medium. Manager, workers, reviewer, UI reviewer and cleanup: Opus 5.5 at medium (workers escalate on failure). Per plan: `"models": {"<role>": "model/effort"}`.
+**Models.** Advisor: Fable 5.2 at medium, re-asked at high when medium finds nothing. Planner, briefer (writes each subagent's brief) and manager: Fable 5.2 at medium. Workers, reviewer, UI reviewer and cleanup: Opus 5.5 at medium (workers escalate on failure). Per plan: `"models": {"<role>": "model/effort"}`.
 
 **The advisor is asked twice:** before a plan executes and before the result is handed over for pushing. Both happen inside a job automatically; for a single task you run them (Step 3a).
 

@@ -10,7 +10,7 @@ A multi-agent coding orchestrator for Claude Code, for single repos and monorepo
 6. Have a fresh reviewer check every edge case, and fix what it finds. For a web app, a UI reviewer also looks at screenshots of the running app, on desktop and mobile.
 7. Clean up the diff, and ask the advisor for a final check before the branch is handed over.
 
-A **manager agent** (one persistent Opus session per job) supervises the subagents throughout. Open issues that a rule can settle (an FYI, or a file that a not-yet-started task owns) are handled without it. When a task fails, a subagent reports something else outside its scope, or the reviewer requests changes, the manager reads the logs and code and decides what to do. It thinks in the background while other tasks keep running, and events that arrive meanwhile reach it as one batch:
+A **manager agent** (one persistent Fable session per job) supervises the subagents throughout. Open issues that a rule can settle (an FYI, or a file that a not-yet-started task owns) are handled without it. When a task fails, a subagent reports something else outside its scope, or the reviewer requests changes, the manager reads the logs and code and decides what to do. It thinks in the background while other tasks keep running, and events that arrive meanwhile reach it as one batch:
 - retry with better instructions or corrected ownership
 - split a task that's too big
 - add a follow-up task
@@ -34,7 +34,7 @@ request ─► grill (Q1: what does done look like? → rounds → glossary/ADRs
                                  ─► review, every edge case (per area + integration when big) ─► UI reviewer
                                  ─► cleanup ─► advisor: final check ─► report
         rules ◄── open issues: fyi → report · needs a pending task's file → amend it
-        manager (Opus, background, batched) ◄── task failed · other open issues · review findings · your answers
+        manager (Fable, background, batched) ◄── task failed · other open issues · review findings · your answers
                                    ──► retry · split · add_task · amend · skip · accept · ask you
 ```
 
@@ -231,7 +231,8 @@ Defaults follow Anthropic's model guidance ([choosing a model](https://platform.
 |---|---|---|
 | Advisor | Fable 5.2 / medium, then high if medium finds nothing | Second opinion before the plan executes and before hand-over. A clean pass at medium is only believed after a second look at high |
 | Planner | Fable 5.2 / medium | One call decides the whole job and writes the checkable proof of your definition of done |
-| Manager | Opus 5.5 / medium | Supervises the subagents: retries, splits, follow-up tasks, questions to you |
+| Briefer | Fable 5.2 / medium | Writes each subagent's brief before it starts: what to do in this codebase, how to test it, what done looks like; for a bug fix, the scenario that shows the bug |
+| Manager | Fable 5.2 / medium | Supervises the subagents: retries, splits, follow-up tasks, questions to you |
 | Worker | Opus 5.5 / medium | Every subtask, whatever its tier; failures re-run at high, then xhigh, then Fable 5.2 |
 | Reviewer | Opus 5.5 / medium | Fresh-context review that lists every edge case of the diff and how each is handled (area reviewers too) |
 | UI reviewer | Opus 5.5 / medium | Looks at every screenshot of the running app, desktop and mobile, against acceptance and decisions |

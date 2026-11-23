@@ -1,0 +1,55 @@
+{
+ "id": "feature-names-the-real-code",
+ "core": false,
+ "about": "A feature task: the brief must name the real files and the tests to write, and must not invent a reproduction for something that isn't a bug.",
+ "files": {
+  "Makefile": "lint:\n\tgolangci-lint run ./apps/api/... && pnpm --filter web lint\ntest:\n\tcd apps/api && go test ./...\n\tpnpm --filter web test\n",
+  "packages/contract/src/share.ts": "export type ShareLink = { token: string; scheduleId: string; expiresAt: string }\n",
+  "apps/api/internal/http/routes.go": "package http\n\nimport \"example.com/api/internal/schedules\"\n\nfunc Register(r Router) {\n\tschedules.Register(r)\n}\n",
+  "apps/api/internal/schedules/handler.go": "package schedules\n\nfunc Register(r Router) {\n\tr.GET(\"/schedules/:id\", Get)\n}\n",
+  "apps/web/src/share/.keep": ""
+ },
+ "plan": {
+  "goal": "Users can copy a schedule's share link",
+  "definition_of_done": "There is a share button that copies the link and says when it can't",
+  "acceptance": [
+   "The web share button copies the link (test)"
+  ],
+  "decisions": [],
+  "non_goals": [],
+  "verify": [
+   "make test"
+  ],
+  "tasks": [
+   {
+    "id": "web-share",
+    "title": "Share button",
+    "goal": "Add a share button that copies the link",
+    "type": "feature:web",
+    "tier": "T1",
+    "owns": [
+     "apps/web/src/share/**"
+    ],
+    "done": [
+     "ShareButton copies the share link to the clipboard (test)",
+     "ShareButton shows an error message when copying fails (test)"
+    ],
+    "verify": [
+     "make test"
+    ]
+   }
+  ]
+ },
+ "expect": {
+  "web-share": {
+   "brief_mentions": [
+    "apps/web/src/share",
+    "clipboard",
+    "test"
+   ],
+   "brief_lacks": [
+    "git\\s+commit"
+   ]
+  }
+ }
+}

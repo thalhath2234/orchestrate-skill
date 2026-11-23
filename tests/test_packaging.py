@@ -60,7 +60,7 @@ BODY_CEILING = {
 # How the docs name each role in models.ROLES (lowercase). The README table, the SKILL.md
 # "Models." line, the orchestrate-plan schema comment and internals.md must agree with ROLES.
 ROLE_NAMES = {
-    "advisor": "advisor", "planner": "planner", "manager": "manager",
+    "advisor": "advisor", "planner": "planner", "manager": "manager", "briefer": "briefer",
     "worker": "worker", "workers": "worker", "reviewer": "reviewer",
     "area reviewer": "area_reviewer", "area reviewers": "area_reviewer", "area_reviewer": "area_reviewer",
     "ui reviewer": "ui_reviewer", "ui_reviewer": "ui_reviewer", "cleanup": "cleanup",

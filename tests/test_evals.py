@@ -648,7 +648,8 @@ class EvalRunnerTest(unittest.TestCase):
     # brief); the worker cases cover it.
     PROMPT_ROLES = {"ORCHESTRATE_REVIEW": "reviewer", "ORCHESTRATE_MANAGE": "manager",
                     "ORCHESTRATE_PLAN": "planner", "ORCHESTRATE_ADVISE_": "advisor",  # ADVISE_{stage}
-                    "FAILURE_CLASSIFIER": "classifier", "ORCHESTRATE_UI_REVIEW": "ui_reviewer"}
+                    "FAILURE_CLASSIFIER": "classifier", "ORCHESTRATE_UI_REVIEW": "ui_reviewer",
+                    "ORCHESTRATE_BRIEF": "briefer"}
     EXEMPT = {"ORCHESTRATE_MERGE": "TODO: no eval cases yet",
               "ORCHESTRATE_CLEANUP": "TODO: no eval cases yet",
               "ORCHESTRATE_LESSONS": "TODO: no eval cases yet",

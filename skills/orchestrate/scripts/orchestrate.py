@@ -774,6 +774,10 @@ def validate(plan: dict) -> tuple[list[str], list[str], list[list[str]]]:
         for k in ("title", "goal", "type", "tier", "owns", "done", "verify"):
             if not t.get(k):
                 errs.append(f"task {tid}: {k} is required")
+        for k in ("brief", "repro"):
+            if k in t:
+                errs.append(f"task {tid}: {k} is written by the briefer (Fable) when the job runs, not in the plan; "
+                            "put extra guidance in the task's goal or interfaces")
         need = MIN_DONE.get(t.get("tier"), 1)
         if t.get("done") and len(t["done"]) < need:
             errs.append(f"task {tid}: a {t.get('tier')} task needs at least {need} done criteria "
@@ -1023,13 +1027,20 @@ def done_header(plan: dict) -> list[str]:
     return ["## What done means (the user's own words; keep it in mind at every step)", d, ""] if d else []
 
 
-def build_brief(plan: dict, task: dict, repo: Path, upstream: dict) -> str:
+def is_bugfix(task: dict) -> bool:
+    return str(task.get("type", "")).startswith("bugfix:")
+
+
+def build_brief(plan: dict, task: dict, repo: Path, upstream: dict, written: dict | None = None) -> str:
+    """The subagent's prompt: the job's rules, then its task, then the briefer's words for it.
+    `written`: the briefer's brief for this task ({"brief", "repro", "by"})."""
     docs = agents_docs_for(repo, task["owns"])
     L, inlined = _job_block(plan, repo)
     reads = [r for r in task.get("reads", []) if r not in docs]
     docs = [d for d in docs if d not in inlined]
     L += ["---", "", f"# Subtask {task['id']}: {task['title']}", f"Task id: {task['id']}", "",
           "## Your goal", task["goal"].strip(), "",
+          *(_written_brief(task, written) if written else []),
           "## You own (the ONLY paths you may create, edit or delete)",
           *[f"- `{p}`" for p in task["owns"]], ""]
     if docs or reads:
@@ -1065,6 +1076,105 @@ def build_brief(plan: dict, task: dict, repo: Path, upstream: dict) -> str:
           "- Do not commit; end with the report described above, with a `done_check` entry for "
           "every [D#] and [U#]."]
     return "\n".join(L)
+
+
+def _written_brief(task: dict, written: dict) -> list[str]:
+    L = [f"## Your brief (from the planner, {written.get('by') or 'Fable'}: how to do it, how to test it, "
+         "what done looks like; the rules above and the paths you own still apply)",
+         str(written.get("brief") or "").strip(), ""]
+    repro = written.get("repro") if is_bugfix(task) else None
+    if repro:
+        scenario = str(repro.get("scenario") or "").strip()
+        L += ["## The bug",
+              f"Scenario: `{scenario}`" if "\n" not in scenario and "`" not in scenario
+              else "Scenario:\n```\n" + scenario + "\n```",
+              f"Symptom: {str(repro.get('symptom') or '').strip()}", "",
+              "## How to work (bug fix)",
+              "1. Reproduce first: run the scenario on the untouched code and confirm you see the symptom. If it "
+              "needs adjusting to run here, adjust it and keep that version.",
+              "2. Then fix the cause, and add a test that fails without the fix.",
+              "3. Then run the same scenario again, exactly as in step 1, and confirm the symptom is gone.",
+              "Report both runs in `repro`: "
+              '`{"reproduced": true, "before": {"command": "...", "output": "..."}, '
+              '"after": {"command": "<the same command>", "output": "..."}}`. '
+              "If the bug doesn't reproduce, change nothing: report `\"reproduced\": false` with the command and what "
+              "it printed, and stop. A fix for a bug nobody saw is a guess.", ""]
+    return L
+
+
+BRIEF_MAX = 8000
+
+
+def write_briefs(job: "Job", plan: dict, tids: list[str]) -> str | None:
+    """The briefer (Fable) writes the brief for each task in `tids`: what to do, how to test it, what
+    done looks like, and for a bug fix the scenario and symptom. Stored in job state, so only the
+    briefer writes them. Returns why it couldn't, or None."""
+    tasks = [t for t in plan["tasks"] if t["id"] in tids]
+    if not tasks:
+        return None
+    integ = Path(job.state["integration_wt"])
+    m, e = models.role("briefer", plan)
+    listing = "\n".join(f"- task: {t['id']} ({t['type']})\n" + fit_json(t, 6000) for t in tasks)
+    prompt = f"""ORCHESTRATE_BRIEF
+You write the brief each subagent gets: one coding agent per task, alone in its own git worktree,
+with no one to ask. Read the code you need first (you are read-only). The harness adds the job's
+rules, the task's goal, owned paths, done criteria [D#], verify commands and report format around
+your text, so don't repeat those: say how to do this task in this codebase.
+
+For each task below, write `brief` (plain markdown, under {BRIEF_MAX} characters) with three parts:
+- What to do: the files, functions and existing patterns to follow, in order. Name real paths and
+  symbols you found. Point out the traps.
+- How to test it: the tests to write or change (names, the cases including error and edge paths,
+  what each asserts) and the commands to run, with what passing looks like.
+- What done looks like: each of the task's done criteria as what the subagent will see when it holds.
+  Add no new criteria and drop none.
+For a task whose type starts with bugfix:, also give `repro`: `scenario`, the exact command (or
+steps) that shows the bug on the current code, and `symptom`, what it prints or does wrong. Read the
+code to make the scenario concrete; the subagent runs it before and after its fix.
+
+Never tell a subagent to commit, to edit outside the paths it owns, to skip a check, or anything the
+plan's decisions or non-goals rule out.
+
+{chr(10).join(done_header(plan))}
+<plan>
+{fit_json({k: plan[k] for k in ("goal", "acceptance", "decisions", "non_goals", "verify", "setup") if k in plan}, 12000)}
+</plan>
+
+<tasks>
+{listing}
+</tasks>
+
+Reply with the JSON object: {{"briefs": [{{"id": "<task id>", "brief": "...", "repro": {{"scenario": "...", "symptom": "..."}}}}]}}
+(repro only for bug fixes)."""
+    got: dict[str, dict] = {}
+    session = None
+    for attempt in range(2):
+        missing = [t for t in tasks if t["id"] not in got]
+        ask = prompt if attempt == 0 else (
+            "ORCHESTRATE_BRIEF (incomplete)\nYour reply had no usable brief for: "
+            + ", ".join(f"- task: {t['id']}" for t in missing)
+            + ". Reply with the complete JSON object for those tasks"
+            + (" (a bug fix also needs repro.scenario and repro.symptom)." if any(is_bugfix(t) for t in missing) else "."))
+        res = claude(ask, m, e, integ, perm="dontAsk", tools=["Read", "Grep", "Glob"], only=claude_cli.READ_ONLY,
+                     schema=schemas.BRIEFS, budget_usd=budget_left(job, plan), resume=session)
+        record_call(job, "briefer", res, ",".join(t["id"] for t in missing), f"{m}/{e}")
+        session = res.get("session_id") or session
+        for b in (res.get("structured") or {}).get("briefs") or []:
+            t = next((x for x in missing if isinstance(b, dict) and x["id"] == b.get("id")), None)
+            text = str((b or {}).get("brief") or "").strip()
+            repro = b.get("repro") if t and isinstance(b.get("repro"), dict) else None
+            if not t or len(text) < 40 or (is_bugfix(t) and not (repro and str(repro.get("scenario") or "").strip()
+                                                                 and str(repro.get("symptom") or "").strip())):
+                continue
+            got[t["id"]] = {"brief": text[:BRIEF_MAX], "by": f"{m}/{e}",
+                            **({"repro": {"scenario": str(repro["scenario"])[:2000], "symptom": str(repro["symptom"])[:2000]}}
+                               if is_bugfix(t) else {})}
+        if len(got) == len(tasks) or not session:
+            break
+    job.state.setdefault("briefs", {}).update(got)
+    job.save()
+    left = [t["id"] for t in tasks if t["id"] not in got]
+    return f"the briefer ({m}/{e}) wrote no usable brief for: {', '.join(left)}" if left else None
 
 
 # ================================================================ the bar ===
@@ -1478,7 +1588,7 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
     if not ok:
         return {"ok": False, "result": "environment", "error": err, "wt": str(wt), "branch": br}
     upstream = {d: job.state["tasks"].get(d, {}) for d in task.get("depends_on", [])}
-    brief = build_brief(plan, task, wt, upstream)
+    brief = build_brief(plan, task, wt, upstream, (job.state.get("briefs") or {}).get(task["id"]))
     (job.dir / "briefs" / f"{task['id']}.md").write_text(brief, encoding="utf-8", errors="replace")
     start = (job.state["tasks"].get(task["id"]) or {}).get("start_sha")
     scope = (f"{shlex.join(PY)} {shlex.quote(str(HERE / 'orchestrate.py'))} scope-check "
@@ -1488,6 +1598,8 @@ def exec_task(job: Job, plan: dict, task: dict, wt: Path, br: str, slot: int, bu
     cmd = [*PY, str(HERE / "run_task.py"), "--repo", str(wt), "--type", task["type"],
            "--tier", task["tier"], "--verify", scope, "--report-schema", json.dumps(schemas.REPORT)]
     cmd += ["--done-ids", *done_ids(plan, task)]
+    if is_bugfix(task):
+        cmd.append("--bugfix")
     cmd += ["--start", "/".join(models.role("worker", plan))]
     if plan.get("max_model"):
         cmd += ["--max-model", plan["max_model"]]
@@ -3194,7 +3306,7 @@ def advice_blocking(advice: dict) -> list[dict]:
     return blocking_findings(advice.get("findings"))
 
 
-def plan_body(plan: dict, baseline_passed: list[str] | None = None) -> str:
+def plan_body(plan: dict, baseline_passed: list[str] | None = None, briefs: dict | None = None) -> str:
     """The plan for the advisor. `baseline_passed`: commands that already ran green on the base
     commit (the job runs its baseline before the plan check), so the advisor needn't guess
     whether the repo builds from reading it."""
@@ -3206,7 +3318,9 @@ def plan_body(plan: dict, baseline_passed: list[str] | None = None) -> str:
                 "and its existing tests run:\n" + "\n".join(f"- {c}" for c in baseline_passed)
                 + "\nYou can't run commands yourself; read the code for anything else.\n</baseline>\n\n")
     return (base + "<bar>\nEvery task is also held to:\n" + "\n".join(f"- {b}" for b in bar_items(plan))
-            + "\n</bar>\n\n<plan>\n" + fit_json({k: plan[k] for k in keep if k in plan}, 60000) + "\n</plan>")
+            + "\n</bar>\n\n<plan>\n" + fit_json({k: plan[k] for k in keep if k in plan}, 60000) + "\n</plan>"
+            + ("\n\n<briefs>\nWhat each subagent will be told, beyond its task in the plan:\n"
+               + fit_json(briefs, 40000) + "\n</briefs>" if briefs else ""))
 
 
 def final_body(cwd: Path, base: str, plan: dict, verify_out: str = "", review: dict | None = None,
@@ -3263,7 +3377,7 @@ def plan_gate(job: Job, plan: dict) -> int | None:
         return None
     log("asking the advisor about the plan before executing it")
     passed = plan.get("baseline", plan["verify"]) if job.state.get("baseline_ok") else None
-    a = job_advise(job, plan, "plan", plan_body(plan, passed))
+    a = job_advise(job, plan, "plan", plan_body(plan, passed, job.state.get("briefs")))
     if a is None:
         return finish(job, plan, "advisor_blocked",
                       f"the advisor produced no usable advice on the plan ({job.state['advice']['plan'][-1]['cause']}), "
@@ -4115,6 +4229,11 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
                     break
                 if share is not None and share < BUDGET_MIN and (running or held):
                     break  # all of it is with running calls
+                if tid not in (job.state.get("briefs") or {}):  # added since the job started
+                    why = write_briefs(job, plan, [tid])
+                    if why:
+                        stop_reason, limit_msg = "no_brief", why
+                        break
                 if running and not admission_ok(float(plan.get("mem_per_agent_gb", MEM_PER_AGENT_GB))):
                     break  # low memory right now: wait for a running task to finish
                 slot = free_slots.pop(0)
@@ -4253,6 +4372,9 @@ def run_tasks(job: Job, plan: dict, cap: int, ctx: dict) -> int | None:
         return finish(job, plan, "budget", f"budget ${budget} reached" + (f" ({budget_msg})" if budget_msg else ""))
     if stop_reason == "usage_limit":
         return usage_limit_stop(job, plan, limit_msg)
+    if stop_reason == "no_brief":
+        return finish(job, plan, "environment", f"{limit_msg}. No task starts without its brief: `orchestrate.py "
+                      f"resume {job.id}` asks again.", resumable=True)
     if any(s in ("failed", "blocked") for s in statuses.values()):
         bad = {t: s for t, s in statuses.items() if s in ("failed", "blocked")}
         env = [t for t in bad if job.state["tasks"][t].get("result") == "environment"]
@@ -4392,6 +4514,14 @@ def prepare_job(job: Job, plan: dict, approve: list[str], max_parallel: int | No
     job.state["capacity"] = cap_info
     job.save()
     log(f"parallel cap = {cap_info['cap']} (limited by {cap_info['limited_by']}: {cap_info['limits']})")
+    unwritten = [t["id"] for t in plan["tasks"] if t["id"] not in (job.state.get("briefs") or {})
+                 and job.state["tasks"].get(t["id"], {}).get("status") not in ("done", "skipped")]
+    if unwritten:
+        log(f"the briefer writes the briefs for: {', '.join(unwritten)}")
+        why = write_briefs(job, plan, unwritten)
+        if why:
+            return finish(job, plan, "environment", f"{why}. No task starts without its brief: `orchestrate.py resume "
+                          f"{job.id}` asks again.", resumable=True)
     return plan_gate(job, plan)
 
 

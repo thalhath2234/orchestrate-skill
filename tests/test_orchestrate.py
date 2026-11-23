@@ -106,6 +106,16 @@ FAKE = textwrap.dedent(r'''
             r["earlier"] = [{"id": e, "observations": "fixed now", "fixed": True}
                             for e in re.findall(r"^- id: (E\d+) ", prompt, re.M)]
         out(json.dumps(r))
+    if prompt.startswith("ORCHESTRATE_BRIEF"):
+        n = sum(1 for l in calls.read_text().splitlines() if '"kind": "brief"' in l) if calls.exists() else 0
+        note("brief")
+        pathlib.Path(str(calls) + f".brief_prompt{n}").write_text(prompt)
+        wanted = re.findall(r"^- task: (\S+)", prompt, re.M)
+        skip = cfg.get("briefs_missing", [])
+        out(json.dumps({"briefs": [
+            {"id": i, "brief": f"BRIEF-FOR-{i}: change the code, test it with a table test, done when it passes.",
+             "repro": {"scenario": f"make repro-{i}", "symptom": f"{i} returns 500 instead of 404"}}
+            for i in wanted if i not in skip]}))
     if prompt.startswith("ORCHESTRATE_LESSONS"):
         note("lessons")
         pathlib.Path(str(calls) + ".lessons_prompt").write_text(prompt)
@@ -182,7 +192,11 @@ FAKE = textwrap.dedent(r'''
         "notes_for_dependents": f"use {tid}-api", "open_issues": t.get("open_issues", []),
         "done_check": [{"id": i, "met": i not in unmet, "evidence": f"{tid}_test.go:{n}"}
                        for n, i in enumerate(ids, 1)],
-        "raise_bar": t.get("raise_bar", [])}) + "\n```")
+        "raise_bar": t.get("raise_bar", []),
+        **({"repro": t["repro"]} if "repro" in t else
+           {"repro": {"reproduced": True, "before": {"command": m.group(1), "output": "500 Internal Server Error"},
+                      "after": {"command": m.group(1), "output": "404 Not Found"}}}
+           if (m := re.search(r"^Scenario: `([^`]+)`", prompt, re.M)) else {})}) + "\n```")
 ''').lstrip()
 
 
@@ -241,6 +255,12 @@ FAKE_ORCA = textwrap.dedent(r"""
                "open_issues": t.get("open_issues", []) if not retry else [],
                "done_check": [{"id": i, "met": i not in unmet, "evidence": f"{d['tid']}_test.go:{n}"}
                               for n, i in enumerate(ids, 1)], "raise_bar": t.get("raise_bar", [])}
+        m = re.search(r"^Scenario: `([^`]+)`", spec, re.M)
+        if "repro" in t:
+            rep["repro"] = t["repro"]
+        elif m:  # the fake works a bug fix the way its brief asks
+            rep["repro"] = {"reproduced": True, "before": {"command": m.group(1), "output": "500"},
+                            "after": {"command": m.group(1), "output": "404"}}
         if not t.get("no_report"):
             (wt / ".orchestrate").mkdir(exist_ok=True)
             (wt / ".orchestrate" / "report.json").write_text(json.dumps(rep))
@@ -2342,6 +2362,112 @@ class OrchestrateTest(unittest.TestCase):
         self.assertEqual(dash.job_payload(job.id)["review_rounds_used"], 1, "never 3 / 2")
         self.assertIn("superseded", self.o.render_report(job, plan))
 
+    # ------------------------------------------------- v0.11: Fable writes the briefs and manages
+    def test_fable_writes_every_subagents_brief_and_manages(self):
+        import models
+        self.assertEqual(models.role("manager"), ("fable", "medium"))
+        self.assertEqual(models.role("briefer"), ("fable", "medium"))
+        plan = base_plan(self.repo)
+        plan["tasks"][1]["type"] = "bugfix:api"
+        code, out, err = self.cli("run", str(self.write_plan(plan)), "--workers", "headless", cfg={"tasks": WRITES})
+        self.assertEqual(code, 0, err[-2000:])
+        briefs = self.calls_of("brief")
+        self.assertEqual([(c["model"], c["effort"]) for c in briefs], [("fable", "medium")], "one call for the job")
+        self.assertEqual(sorted(self.job_state()["briefs"]), ["api", "contract", "web"])
+        for tid in ("contract", "api", "web"):
+            text = (self.state / f"jobs/share/briefs/{tid}.md").read_text()
+            self.assertIn(f"BRIEF-FOR-{tid}", text)
+            self.assertIn("[D1]", text, "the harness still adds its checks and rules")
+            self.assertIn("You own", text)
+        api = (self.state / "jobs/share/briefs/api.md").read_text()
+        self.assertIn("Scenario: `make repro-api`", api)
+        self.assertIn("api returns 500 instead of 404", api)
+        for step in ("reproduce", "fix", "same scenario"):
+            self.assertIn(step, api.lower())
+        self.assertNotIn("Scenario:", (self.state / "jobs/share/briefs/web.md").read_text(), "only bug fixes")
+        self.assertIn("BRIEF-FOR-api", (self.tmp / "calls.jsonl.advise_plan_prompt").read_text(),
+                      "the advisor checks the briefs with the plan")
+        prompt = (self.tmp / "calls.jsonl.brief_prompt0").read_text()
+        for tid in ("contract", "api", "web"):
+            self.assertIn(f"- task: {tid}", prompt)
+
+    def test_a_plan_cannot_bring_its_own_briefs(self):
+        plan = base_plan(self.repo)
+        plan["tasks"][0]["brief"] = "do it my way"
+        plan["tasks"][1]["repro"] = {"scenario": "x", "symptom": "y"}
+        errs, _, _ = self.o.validate(plan)
+        self.assertTrue([e for e in errs if "contract" in e and "brief" in e], errs)
+        self.assertTrue([e for e in errs if "api" in e and "repro" in e], errs)
+
+    def test_no_brief_means_no_task_starts(self):
+        for cfg in ({"garbage_for": ["ORCHESTRATE_BRIEF"]}, {"briefs_missing": ["web"]}):
+            with self.subTest(cfg):
+                self.tearDown()
+                self.setUp()
+                code, out, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), "--workers", "headless",
+                                          cfg={"tasks": WRITES, **cfg})
+                st = self.job_state()
+                self.assertEqual((code, st["status"]), (3, "environment"), err[-1500:])
+                self.assertIn("brief", st["message"])
+                self.assertFalse(self.calls_of("worker"))
+                self.assertEqual(len(self.calls_of("brief")), 2, "asked once more for what was missing")
+
+    def test_a_task_the_manager_adds_gets_a_brief_from_fable(self):
+        cfg = {"tasks": {**WRITES, "web": {**WRITES["web"], "open_issues": ["route must be registered in apps/web/src/routes.ts"]},
+                         "web-route": {"write": {"apps/web/src/routes.ts": "export const r = ['share']\n"}}},
+               "manager": [{"actions": [{"action": "add_task", "task": {
+                   "id": "web-route", "title": "register route", "goal": "register the share route",
+                   "type": "bugfix:web", "tier": "T0", "owns": ["apps/web/src/routes.ts"], "depends_on": ["web"],
+                   "done": ["route registered"], "verify": ["test -f apps/web/src/routes.ts"]}}]}]}
+        code, _, err = self.cli("run", str(self.write_plan(base_plan(self.repo))), "--workers", "headless", cfg=cfg)
+        self.assertEqual(code, 0, err[-3000:])
+        self.assertEqual(len(self.calls_of("brief")), 2)
+        self.assertIn("- task: web-route", (self.tmp / "calls.jsonl.brief_prompt1").read_text())
+        self.assertIn("BRIEF-FOR-web-route", (self.state / "jobs/share/briefs/web-route.md").read_text())
+
+    def test_a_bug_fix_must_show_the_same_scenario_before_and_after(self):
+        import run_task
+        ok = {"reproduced": True, "before": {"command": "make repro", "output": "500"},
+              "after": {"command": " make  repro ", "output": "404"}}
+        self.assertEqual(run_task.repro_gaps({"repro": ok}), [])
+        for bad, why in (({}, "reproduce"), ({"repro": {**ok, "after": {"command": "make other", "output": "404"}}}, "same"),
+                         ({"repro": {**ok, "after": {"command": "make repro", "output": ""}}}, "after"),
+                         ({"repro": {**ok, "before": None}}, "before")):
+            with self.subTest(why):
+                gaps = run_task.repro_gaps(bad)
+                self.assertTrue(gaps and any(why in g.lower() for g in gaps), gaps)
+        plan = base_plan(self.repo)
+        plan["tasks"][1]["type"] = "bugfix:api"
+        tasks = {**WRITES, "api": {**WRITES["api"], "repro": {"reproduced": True, "before": {"command": "make repro-api", "output": "500"}}}}
+        code, out, err = self.cli("run", str(self.write_plan(plan)), "--workers", "headless", cfg={"tasks": tasks})
+        api = [c for c in self.calls_of("worker") if c["tid"] == "api"]
+        self.assertTrue(len(api) >= 2 and api[1]["retry"], "sent back for the missing after-run")
+        self.assertNotEqual(self.job_state()["tasks"]["api"]["status"], "done")
+
+    def test_a_bug_that_does_not_reproduce_goes_to_the_manager(self):
+        plan = base_plan(self.repo)
+        plan["tasks"][1]["type"] = "bugfix:api"
+        tasks = {**WRITES, "api": {**WRITES["api"], "repro": {"reproduced": False,
+                 "before": {"command": "make repro-api", "output": "404 Not Found"}}}}
+        code, out, err = self.cli("run", str(self.write_plan(plan)), "--workers", "headless", cfg={"tasks": tasks})
+        st = self.job_state()["tasks"]["api"]
+        self.assertEqual((st["status"], st["result"]), ("failed", "not_reproduced"), err[-1500:])
+        self.assertEqual(len([c for c in self.calls_of("worker") if c["tid"] == "api"]), 1, "no blind fix, no escalation")
+        self.assertFalse(self.calls_of("classifier"))
+        self.assertEqual([c["event"] for c in self.calls_of("manage")], ["task_failed"])
+        self.assertEqual(self.calls_of("manage")[0]["model"], "fable")
+
+    def test_orca_workers_get_fables_brief_and_the_same_checks(self):
+        self.orca_env()
+        plan = base_plan(self.repo)
+        plan["tasks"][1]["type"] = "bugfix:api"
+        tasks = {**WRITES, "api": {**WRITES["api"], "repro": {"reproduced": False,
+                 "before": {"command": "make repro-api", "output": "404"}}}}
+        code, out = self.drive_orca(("run", str(self.write_plan(plan))), {"tasks": tasks})
+        self.assertIn("BRIEF-FOR-web", (self.state / "jobs/share/briefs/web.md").read_text())
+        st = self.job_state()["tasks"]["api"]
+        self.assertEqual((st["status"], st.get("result")), ("failed", "not_reproduced"), out[-1500:])
+
     def test_verdict_follows_findings_and_low_confidence_does_not_block(self):
         import orchestrate
         v = orchestrate.settle_verdict({"verdict": "pass", "findings": [
@@ -2634,7 +2760,7 @@ class OrchestrateTest(unittest.TestCase):
         self.assertEqual(code, 0, err[-3000:])
         m = self.calls_of("manage")
         self.assertEqual([c["event"] for c in m], ["task_failed"])
-        self.assertEqual((m[0]["model"], m[0]["effort"]), ("opus", "medium"))
+        self.assertEqual((m[0]["model"], m[0]["effort"]), ("fable", "medium"))  # the manager is Fable since v0.11
         self.assertTrue(m[0]["has_playbook"])
         brief = (self.state / "jobs/share/briefs/api.md").read_text()
         self.assertIn("Notes from the manager", brief)
