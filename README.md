@@ -95,7 +95,7 @@ python3 $S/orchestrate.py status --repo . --open        # this repo's unfinished
 python3 $S/orchestrate.py plan --repo . --goal "..." --done "..." --decision "..."   # optional: Fable drafts plan.json (also --acceptance, --non-goal)
 python3 $S/orchestrate.py advise plan.json              # advisor's second opinion (exit 9 = revise · 1 = no usable answer, ask again)
 python3 $S/orchestrate.py validate plan.json            # waves, ownership conflicts, cap
-python3 $S/orchestrate.py brief plan.json <task-id>     # exact handoff a subagent will get
+python3 $S/orchestrate.py brief plan.json <task-id>     # the handoff a subagent will get (Fable's part once written)
 python3 $S/orchestrate.py run plan.json                 # inside Orca: starts Orca workers, exit 10
 python3 $S/orchestrate.py worker-done <job> --dispatch <id> --report-path <path>   # when Orca wakes you with a worker_done
 python3 $S/orchestrate.py run plan.json --detach        # outside Orca: headless, then:
@@ -108,7 +108,7 @@ python3 $S/orchestrate.py dashboard [<job>] [--port 8765] [--no-start | --stop] 
 python3 $S/orchestrate.py clean <job> [--branches]   # removes the worktrees; screenshots move to jobs/<job>/screenshots
 python3 $S/orchestrate.py guard-hook                    # print the approval hook, for npx-skills installs
 
-python3 $S/run_task.py --repo . --type bugfix:api --tier T1 --verify "make test" "Fix …"   # single task
+python3 $S/run_task.py --repo . --type feature:api --tier T1 --verify "make test" "Add …"  # single task (not for bug fixes)
 python3 $S/router.py proposals | approve <id> | reject <id> | status                       # routing (you)
 ```
 
@@ -240,6 +240,8 @@ Defaults follow Anthropic's model guidance ([choosing a model](https://platform.
 | Integrator (conflicts) | Opus 5.5 / medium | Merge conflicts between subagent branches |
 | Failure classifier | Haiku 5.5 / low | Sorts a failed attempt into environment / context / effort / capability |
 | Lessons extractor | Haiku 5.5 / medium | Proposes AGENTS.md notes after a job |
+
+**Bug fixes reproduce first.** Every bug fix runs as a job, even a one-task one. The briefer reads the code and gives the subagent a scenario (a command or steps) and the symptom it shows. The subagent runs the scenario on the untouched code, fixes the cause with a test that fails without the fix, then runs the same scenario again. Its report must show both runs, with the same command, the bug shown before and different output after; otherwise it is sent back. If the bug doesn't show, the subagent changes nothing and the task goes to the manager as `not_reproduced`; a retry gets a new brief whose scenario the briefer rewrites from what the first one printed. A brief is also rewritten when its task changes (a plan edit, a manager's retry or split, a raised bar) or when the advisor blocks the plan.
 
 Whether the advisor's second, high-effort look pays is measured: `report.md` has an `Advisor:` line (re-checks run, how often they found a blocking issue, their cost) and `router.py status` adds it up across jobs. If it stays near zero over many jobs, lower `ADVISOR_ESCALATE` in `scripts/models.py`.
 

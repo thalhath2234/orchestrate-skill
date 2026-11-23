@@ -229,6 +229,9 @@ def repro_gaps(report) -> list[str]:
                 "the same scenario again, and report both runs (command and output)"]
     before, after = r.get("before"), r.get("after")
     gaps = []
+    if r.get("reproduced") is not True:
+        gaps.append("`repro.reproduced` must be true: the scenario showed the bug on the untouched code (if it "
+                    "didn't, report false and change nothing)")
     if not _cmd(before) or not str((before or {}).get("output") or "").strip():
         gaps.append("`repro.before` needs the command you ran on the untouched code and its output")
     if not _cmd(after) or not str((after or {}).get("output") or "").strip():
@@ -236,7 +239,14 @@ def repro_gaps(report) -> list[str]:
     elif _cmd(before) and _cmd(after) != _cmd(before):
         gaps.append(f"`repro.after` ran `{_cmd(after)}`, not the same scenario as before (`{_cmd(before)}`): run "
                     "that one again")
+    elif _out(before) and _out(after) == _out(before):
+        gaps.append("`repro.after` printed exactly what `repro.before` did: the scenario still shows the same thing, "
+                    "so the bug isn't shown gone")
     return gaps
+
+
+def _out(run) -> str:
+    return " ".join(str((run or {}).get("output") or "").split()) if isinstance(run, dict) else ""
 
 
 def not_reproduced(report) -> bool:
@@ -363,7 +373,8 @@ def main(argv=None) -> int:
     ap.add_argument("--exclude-dynamic-prompt", action="store_true",
                     help="pass --exclude-dynamic-system-prompt-sections (cache reuse across worktrees)")
     ap.add_argument("--bugfix", action="store_true",
-                    help="a bug fix: its report must show the scenario before and after the fix (repro)")
+                    help="set by orchestrate.py for a bug fix, whose brief has the briefer's scenario: its "
+                    "report must show that scenario before and after the fix (repro)")
     ap.add_argument("--done-ids", nargs="*", default=[],
                     help="definition-of-done ids ([D1].., [U1]..) the report's done_check must show "
                          "met with evidence; a gap counts as a failed attempt")
@@ -475,8 +486,8 @@ def main(argv=None) -> int:
                 log(vout[:400])
                 break
             ok, vout = verify(a.verify, repo, a.verify_timeout, confine, a.trusted_verify)
-            if ok and a.done_ids:
-                gaps = done_gaps(worker.get("structured"), a.done_ids)
+            if ok and (a.done_ids or a.bugfix):
+                gaps = done_gaps(worker.get("structured"), a.done_ids) if a.done_ids else []
                 if a.bugfix:
                     gaps += repro_gaps(worker.get("structured"))
                 if gaps:

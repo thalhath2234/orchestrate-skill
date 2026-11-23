@@ -181,7 +181,7 @@ def start_worker(job: O.Job, plan: dict, tid: str, rung: int, *, fresh: bool, hi
     task = next(t for t in plan["tasks"] if t["id"] == tid)
     if O.jail.mode_of(plan) == "required":  # the plan can be edited while the job runs
         return f"plan.sandbox is true and Orca workers can't be confined ({O.ORCA_UNCONFINED})"
-    if tid not in (job.state.get("briefs") or {}):  # a task added since the job started
+    if O.needs_brief(job, plan, task):  # pump() writes them first; this covers a restart in between
         why = O.write_briefs(job, plan, [tid])
         if why:
             return why
@@ -410,6 +410,7 @@ def check(job: O.Job, plan: dict, tid: str, payload: dict) -> None:
         ok, out = RT.verify(O.task_checks(plan, task), wt, 1800, O.confinement(plan))
     if ok and O.is_bugfix(task) and RT.not_reproduced(report):
         r = report["repro"]
+        O.stale_brief(job, tid, O.repro_miss(report))  # a retry gets a new scenario from the briefer
         return give_up(job, plan, tid, "not_reproduced",
                        f"the bug didn't reproduce: `{RT._cmd(r.get('before'))}` gave: "
                        + str((r.get("before") or {}).get("output") or "")[-1500:])
@@ -620,6 +621,13 @@ def pump(job: O.Job, plan: dict) -> int:
                 continue
             if budget and job.state.get("cost_usd", 0) >= budget:
                 break
+            if O.needs_brief(job, plan, T[tid]):  # added, changed or sent back since its last brief
+                why = O.write_briefs(job, plan, [tid])
+                if why and running:  # the next worker's report runs this step again, and asks again
+                    O.log(f"{tid} waits for its brief: {why}")
+                    break
+                if why:
+                    return O.brief_stop(job, plan, why)
             d = router.route(T[tid]["type"], T[tid]["tier"], max_model=plan.get("max_model"),
                              start="/".join(models.role("worker", plan)))
             err = start_worker(job, plan, tid, d["rung"], fresh=True, probe=d["probe"])

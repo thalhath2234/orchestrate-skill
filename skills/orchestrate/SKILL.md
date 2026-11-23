@@ -30,7 +30,7 @@ It takes the plugin you are running first, then a manual install, then the newes
 Support skills, which you load when you reach that step:
 - **orchestrate-grill**: the interview that comes before any plan (Matt Pocock's grill-with-docs).
 - **orchestrate-plan**: how to plan, split, tier, assign file ownership and write `plan.json`.
-- **orchestrate-manage**: the playbook of the **manager agent** (one Opus 5.5 session per job that supervises the subagents). Load it to understand or second-guess its decisions.
+- **orchestrate-manage**: the playbook of the **manager agent** (one Fable 5.2 session per job that supervises the subagents). Load it to understand or second-guess its decisions.
 - **orchestrate-review**: what the integrator, reviewer and UI reviewer subagents check. Load it if you need to judge a review.
 
 Who does what inside a job, and how the manager, the parallelism cap, subagent briefs and routing work: [references/internals.md](references/internals.md). You rarely need it to run a job.
@@ -61,9 +61,9 @@ Classify the confirmed request:
 | T2 | More than that across several modules or packages, or needs some design | **job** (plan + parallel subagents) |
 | T3 | Architecture, auth, migrations, cross-cutting refactor, unclear scope | **job**, with gates and the user's sign-off on the plan |
 
-Every handoff between subagents loses context, and a job adds a manager and a reviewer on top. Take the single-task route whenever one agent can hold the whole change. The UI review (screenshots checked by a UI reviewer) runs only in jobs: when a small UI change should be checked on screen, run it as a one-task job (Step 3b).
+Every handoff between subagents loses context, and a job adds a manager and a reviewer on top. Take the single-task route whenever one agent can hold the whole change, **except for a bug fix**: run every bug fix, however small, as a job (Step 3b; one task of type `bugfix:<area>` for a small one). There the briefer (Fable) reads the code and writes the subagent's brief with a scenario that shows the bug, and the subagent must reproduce it, fix it, and run the same scenario again; its report has to show both runs. The single-task route has none of that. The UI review (screenshots checked by a UI reviewer) runs only in jobs: when a small UI change should be checked on screen, run it as a one-task job (Step 3b).
 
-## Step 3a: Single task (T0/T1/T1x)
+## Step 3a: Single task (T0/T1/T1x, not a bug fix)
 
 Inside Orca, run a single task as a one-task job instead (Step 3b with a plan of one task), so it runs as an Orca worker with the same checks, merge and final advisor check. The steps below are for headless use.
 
@@ -119,7 +119,7 @@ Inside Orca, run a single task as a one-task job instead (Step 3b with a plan of
    python3 $S/orchestrate.py run plan.json --detach
    python3 $S/orchestrate.py wait <job> --timeout 540     # repeat while exit code is 75
    ```
-   Use `status <job>` for a progress table, `metrics <job>` for the cost split, and `brief plan.json <task-id>` to preview a subagent's handoff.
+   Use `status <job>` for a progress table, `metrics <job>` for the cost split, and `brief plan.json <task-id>` to preview a subagent's handoff (the briefer's part is in it once the job has written it).
 
    `run` and `resume` log `dashboard: <url>` on stderr (with `--detach`, the `dashboard` key of their JSON). If it differs from the link you gave, give the user the new one.
 5. **Handle the outcome** (exit code of `wait`, or of the Orca step that ended the job):
