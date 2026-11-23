@@ -316,14 +316,15 @@ class RoutingTest(unittest.TestCase):
     def test_role_defaults_follow_anthropic_guidance(self):
         import models
         self.assertEqual(models.role("classifier"), ("haiku", "low"))
-        self.assertEqual(models.role("manager"), ("opus", "medium"))
+        self.assertEqual(models.role("manager"), ("fable", "medium"))  # the user's choice, 2026-11-23
+        self.assertEqual(models.role("briefer"), ("fable", "medium"))
         self.assertEqual(models.role("planner"), ("fable", "medium"))
         self.assertEqual(models.role("planner", {"max_model": "opus"}), ("opus", "high"))
         # the user's assignment (2026-11-16)
         self.assertEqual(models.role("advisor"), ("fable", "medium"))
         self.assertEqual(models.ADVISOR_ESCALATE, "high")
         self.assertEqual(models.role("advisor", {"max_model": "opus"}), ("opus", "high"))
-        for r in ("manager", "worker", "reviewer", "area_reviewer", "cleanup"):
+        for r in ("worker", "reviewer", "area_reviewer", "cleanup"):
             self.assertEqual(models.role(r), ("opus", "medium"), r)
         self.assertEqual(models.role("manager", {"models": {"manager": "sonnet/high"}}), ("sonnet", "high"))
         self.assertEqual(models.role("lessons", {"models": {"lessons": "sonnet"}}), ("sonnet", "high"))

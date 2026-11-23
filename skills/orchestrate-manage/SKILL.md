@@ -38,6 +38,8 @@ You get the task definition, its model path and failure causes (`steps`), the er
 | `integrator resolution fails verify` (its work passed, but the merge conflict's resolution broke a verify command; the output tail follows) | The integration branch didn't move. Read the tail: a flaky test is worth one `retry`; a real break means the two tasks' intents clash, so `retry` with `instructions` naming the other task's change it must keep. |
 | Cause `environment` (services down, missing tool) | `ask_human`. You can't fix the machine. |
 | Result `refused` (a safety classifier declined the request; its category is in the step) | `ask_human`: say which task was declined and why, and recommend how to reword it. A retry or a stronger model of the same family is declined the same way. |
+| Result `not_reproduced` (a bug fix whose subagent ran the briefer's scenario on the untouched code and didn't see the bug; it changed nothing, and the error shows the command and what it printed) | Read the output and the code. If the bug is already gone, or the report was wrong, `skip` with that reason (or `ask_human` when only the user can tell). If the scenario was wrong or incomplete, `retry`: the briefer writes a new brief and scenario, and is told what the last one printed; add `instructions` with what you found. Never retry it unchanged with orders to "fix it anyway". |
+| Result `start_failed` (an Orca worker couldn't be started; the error says why) | A broken Orca or plan setting is the user's: `ask_human`. A one-off failure: `retry`. |
 | The task turns out to be unnecessary, or another task already did it | `skip` with the reason. Dependents proceed. |
 | A product question surfaced | `ask_human` with a crisp question and your recommended answer. |
 

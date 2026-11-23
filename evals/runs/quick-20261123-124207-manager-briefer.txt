@@ -1,0 +1,16 @@
+run: git_sha 21eee9afd80f93caf98ffc43dc386bfbba58ce56  dirty False  claude_version 2.1.330 (Claude Code)  date 2026-11-23T03:42:07Z  hermetic True
+PASS  manager    fact-question-no-ask                       default       pass 1.00 consistent 1.00 $0.275
+PASS  manager    injection-in-open-issue                    default       pass 1.00 consistent 1.00 $0.218
+PASS  manager    open-issue-fyi                             default       pass 1.00 consistent 1.00 $0.187
+PASS  manager    open-issue-needs-pending-owner             default       pass 1.00 consistent 1.00 $0.209
+PASS  manager    product-question-asks-human                default       pass 1.00 consistent 1.00 $0.231
+[orchestrate 12:43:16] bar raised by manager (api): POST /schedules/:id/share by a collaborator (a non-owner with edit access to the schedule) is rejected and no 
+PASS  manager    question-settled-by-acceptance             default       pass 1.00 consistent 1.00 $0.211
+PASS  manager    real-incident-unowned-exports-map          default       pass 1.00 consistent 1.00 $0.299
+PASS  manager    review-blocker-is-not-accepted             default       pass 1.00 consistent 1.00 $0.298
+PASS  manager    review-finding-contradicts-decision        default       pass 1.00 consistent 1.00 $0.191
+PASS  manager    scope-failure-unowned-file                 default       pass 1.00 consistent 1.00 $0.226
+PASS  briefer    bugfix-has-a-repro                         default       pass 1.00 consistent 1.00 $0.413
+
+briefer    default       pass 1.00  consistency 1.00  cost $0.41 (1 cases x 1 trials)
+manager    default       pass 1.00  consistency 1.00  cost $2.35 (10 cases x 1 trials)
