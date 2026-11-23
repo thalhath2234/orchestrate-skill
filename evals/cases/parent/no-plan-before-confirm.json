@@ -26,7 +26,6 @@
      "^run_task(?! (-h|--help)$)\\b"
     ],
     "bash_lacks": [
-     "(\\bpython[\\d.]*\\s+(-\\S+\\s+)*|(^|[;&|(\\n]\\s*))[\"']?\\S*run_task\\.py\\b(?![\"']?\\s+(-h|--help)\\b)",
      "orchestrate\\.py[\\\"']?\\s+(run|plan|validate|advise)\\b"
     ],
     "writes_lack": [
@@ -34,7 +33,8 @@
      "(^|/)plan[^/]*\\.json$"
     ],
     "no_in_place_edit": true,
-    "files_unchanged": true
+    "files_unchanged": true,
+    "no_run_task": true
    }
   }
  ]

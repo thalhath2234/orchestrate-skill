@@ -1,6 +1,6 @@
 {
   "name": "orchestrate",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Multi-agent coding orchestrator for repos and monorepos: grill the user (grill-with-docs), triage, plan, split into owned subtasks, each with a brief Fable writes from the code (bug fixes reproduce first), a Fable manager agent supervising, run parallel Claude subagents capped by machine capacity, merge, review. Routes each task to the right model and learns per task type.",
   "author": {
     "name": "thalhath2234"

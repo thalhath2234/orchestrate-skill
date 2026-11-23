@@ -17,7 +17,7 @@
  "expect": {
   "verdict": "changes_requested",
   "finding_mentions": [
-   "owner|owns|ownership|userid"
+   "owner|\\bowns\\b|ownership|userid"
   ],
   "finding_file": "share/handler.go"
  }

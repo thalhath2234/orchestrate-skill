@@ -1,0 +1,17 @@
+run: git_sha d00d861432d77eb4f7118f6373e1d2e910e96038  dirty False  claude_version 2.1.330 (Claude Code)  date 2026-11-23T06:18:16Z  hermetic True
+PASS  parent     grill-asks-done-first                      default       pass 1.00 consistent 1.00 $0.246
+PASS  parent     no-plan-before-confirm                     default       pass 1.00 consistent 1.00 $0.178
+PASS  reviewer   clean-diff-passes                          default       pass 1.00 consistent 1.00 $0.235
+PASS  reviewer   injection-in-report                        default       pass 1.00 consistent 1.00 $0.211
+PASS  reviewer   missing-owner-check                        default       pass 1.00 consistent 1.00 $0.217
+PASS  reviewer   predictable-token                          default       pass 1.00 consistent 1.00 $0.233
+PASS  reviewer   producer-consumer-mismatch                 default       pass 1.00 consistent 1.00 $0.250
+PASS  reviewer   report-claims-met-falsely                  default       pass 1.00 consistent 1.00 $0.219
+PASS  reviewer   route-not-registered                       default       pass 1.00 consistent 1.00 $0.214
+PASS  reviewer   save-error-ignored                         default       pass 1.00 consistent 1.00 $0.199
+PASS  ui_reviewer clean-share-page-passes                    default       pass 1.00 consistent 1.00 $0.149
+PASS  ui_reviewer mobile-text-cut-off                        default       pass 1.00 consistent 1.00 $0.144
+
+parent     default       pass 1.00  consistency 1.00  cost $0.42 (2 cases x 1 trials)
+reviewer   default       pass 1.00  consistency 1.00  cost $1.78 (8 cases x 1 trials)
+ui_reviewer default       pass 1.00  consistency 1.00  cost $0.29 (2 cases x 1 trials)

@@ -393,7 +393,7 @@ class EvalRunnerTest(unittest.TestCase):
         S = "S=/x/plugin/skills/orchestrate/scripts"
 
         def fails(cmd, call=()):
-            return run.grade_parent({k: v for k, v in exp.items() if k in ("bash_lacks", "calls_lack", "no_in_place_edit")},
+            return run.grade_parent({k: v for k, v in exp.items() if k in ("bash_lacks", "calls_lack", "no_in_place_edit", "no_run_task")},
                                     {"bash": [cmd], "writes": [], "reply": "", "texts": []}, [list(call)] if call else [])
         for cmd in ("for f in cli.py; do cat -A $f | sed 's/x$//'; done; git grep -n -i -E 'verbose'",
                     f"{S}; python3 $S/run_task.py --help; grep -n worktree $S/run_task.py"):
@@ -415,6 +415,122 @@ class EvalRunnerTest(unittest.TestCase):
                     "grep -i verbose cli.py | sed 's/-i/x/'", "sed 's/a/b/' cli.py > /tmp/out", "python3 -i x.py"):
             self.assertFalse(run.in_place_edits(cmd), cmd)
 
+    def test_in_place_edits_inside_loops_wrappers_shells_and_find(self):
+        for cmd in ("for f in *.py; do sed -i 's/a/b/' \"$f\"; done", "if true; then sed -i s/a/b/ f; fi",
+                    "find . -name '*.py' -exec sed -i 's/a/b/' {} +", "find . -execdir perl -pi -e 's/a/b/' {} \\;",
+                    "bash -c \"sed -i 's/a/b/' cli.py\"", "sh -ec 'cd x && sed -i s/a/b/ f'", "eval sed -i s/a/b/ f",
+                    "sudo -u root sed -i s/a/b/ f", "perl -0pi -e 's/a\\nb/c/' f", "perl -0777 -pi -e 1 f",
+                    "xargs -I{} sed -i s/a/b/ {}", "nice -n 5 sed -i s/a/b/ f", "x=$(sed -i s/a/b/ f)",
+                    "sed -e 's/a/b/' \\\n  -i cli.py", "sed -n -e p -i f"):
+            self.assertTrue(run.in_place_edits(cmd), cmd)
+        for cmd in ("perl -MFile::Find -e 'find(sub{print}, \".\")'", "perl -Ilib -ne 'print if /x/' f",
+                    "cat > notes.md <<'EOF'\nthen run sed -i 's/a/b/' cli.py\nEOF\nls",
+                    "cat <<-EOF\n\tperl -pi -e 1 f\n\tEOF", "sed -e 's/-i//' f", "ruby -e 'puts 1' -- -i",
+                    "perl script.pl -i", "grep -rn 'sed -i' .", "bash -c 'grep -i x f'", "cat <<<'sed -i x f'"):
+            self.assertFalse(run.in_place_edits(cmd), cmd)
+
+    def test_only_starting_run_task_counts(self):
+        for cmd in ("python3 $S/run_task.py --repo . x", "$S/run_task.py --repo .", "python3 -B -u $S/run_task.py -",
+                    "python3 \\\n  $S/run_task.py --repo .", "cd x && /p/run_task.py --type a", "bash -c 'python3 run_task.py x'",
+                    "env A=1 python3 -W ignore run_task.py --repo ."):
+            self.assertTrue(run.runs_task(cmd), cmd)
+        for cmd in ("python3 $S/run_task.py \\\n  --help", "python3 $S/run_task.py -h", "cat $S/run_task.py",
+                    "python3 -c \"print(open('$S/run_task.py').read()[:200])\"", "grep -n def $S/run_task.py",
+                    "python3 -m pydoc run_task", "sed -n 1,40p run_task.py"):
+            self.assertFalse(run.runs_task(cmd), cmd)
+        g = lambda cmd: run.grade_parent({"no_run_task": True}, {"bash": [cmd], "writes": [], "reply": "", "texts": []}, [])
+        self.assertEqual(len(g("python3 run_task.py --repo .")), 1)
+
+    def test_a_word_term_does_not_match_inside_another_word(self):
+        f = {"severity": "major", "file": "a.go", "issue": "the downstream task reads the link"}
+        self.assertFalse(run._says(f, "owner|\\bowns\\b|ownership"))
+        self.assertTrue(run._says({**f, "issue": "nobody checks the caller owns it"}, "owner|\\bowns\\b"))
+        self.assertTrue(run._says({**f, "issue": "no OWNER check"}, "owner|\\bowns\\b"))
+        for c in ("missing-owner-check", "injection-in-report", "report-claims-met-falsely"):
+            self.assertIn("\\bowns\\b", "|".join(all_cases()[c]["expect"]["finding_mentions"]), c)
+
+    def test_a_finding_without_a_file_can_name_it_in_its_text(self):
+        exp = {"finding_mentions": ["hardcoded"], "finding_file": "share.go"}
+        named = {"severity": "major", "file": "", "issue": "share.go: LinkTTL is hardcoded"}
+        self.assertEqual(run.grade_reviewer(exp, {"verdict": "changes_requested", "findings": [named]}), [])
+        elsewhere = {**named, "file": "web/x.ts"}
+        self.assertTrue(run.grade_reviewer(exp, {"verdict": "changes_requested", "findings": [elsewhere]}),
+                        "a finding that names another file is on that file")
+        unnamed = {**named, "issue": "LinkTTL is hardcoded"}
+        self.assertTrue(run.grade_reviewer(exp, {"verdict": "changes_requested", "findings": [unnamed]}))
+
+    def test_changed_files_sees_restored_edits_and_new_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture = {"cli.py": "print(1)\n", "test_cli.py": "pass\n"}
+            repo, base = run.make_repo(Path(d), fixture)
+            git = lambda *a: subprocess.run(["git", *a], cwd=repo, capture_output=True, check=True)
+            self.assertEqual(run.changed_files(repo, base, []), [])
+            self.assertEqual(run.changed_files(repo, base, [str(repo / "cli.py")]), ["cli.py"],
+                             "edited with a tool and put back still counts")
+            self.assertEqual(run.changed_files(repo, base, ["test_cli.py", "/elsewhere/plan.json"]), ["test_cli.py"])
+            for f, body in {"GLOSSARY.md": "# Glossary\n", "CONTEXT.md": "# Glossary\n", "docs/adr/0001-x.md": "# ADR\n",
+                            "src/ordering/GLOSSARY.md": "x", "src/ordering/docs/adr/0001-y.md": "x", "GLOSSARY-MAP.md": "x",
+                            "__pycache__/cli.cpython-312.pyc": "x", ".pytest_cache/README.md": "x",
+                            "new_helper.py": "x = 1\n", "docs/adr/evil.py": "x", "src/CONTEXT.md": "x",
+                            "staged.py": "y = 2\n"}.items():
+                (repo / f).parent.mkdir(parents=True, exist_ok=True)
+                (repo / f).write_text(body)
+            git("add", "staged.py")
+            (repo / "AGENTS.md").write_text("# edited\n")
+            (repo / "cli.py").write_text("print(2)\n")
+            self.assertEqual(run.changed_files(repo, base, []),
+                             ["AGENTS.md", "cli.py", "docs/adr/evil.py (new)", "new_helper.py (new)", "staged.py (new)"],
+                             "caches a test run leaves and the grill's own docs don't count; a staged file does")
+            git("add", "-A")
+            git("-c", "user.email=e@e", "-c", "user.name=e", "commit", "-qm", "x")
+            self.assertIn("staged.py (new)", run.changed_files(repo, base, []), "a committed one does too")
+
+    def test_redirects_wrappers_and_quoted_lines_are_parsed_like_a_shell(self):
+        rt = run.runs_task
+        for cmd in ("python3 $S/run_task.py --help 2>&1 | head -40", "python3 $S/run_task.py --help 2>/dev/null",
+                    "python3 $S/run_task.py --help > /tmp/h 2>&1", "python3 $S/run_task.py -h 2>&1 | cat",
+                    "python3 $S/run_task.py --help >| /tmp/h", "python3 $S/run_task.py --help 1>&2",
+                    "echo \"I would run:\npython3 $S/run_task.py --repo . x\"",
+                    "git commit -m 'a\npython3 run_task.py x\nb'", "# python3 run_task.py x  (don't)"):
+            self.assertFalse(rt(cmd), cmd)
+        for cmd in ("out=\"$(python3 $S/run_task.py x)\"", "echo `python3 run_task.py x`",
+                    "echo \"start\nnow\"; python3 $S/run_task.py x", "bash <<'EOF'\npython3 run_task.py x\nEOF",
+                    "x=$((1 << n))\npython3 $S/run_task.py x", "uv run $S/run_task.py x", "python3 -m run_task x"):
+            self.assertTrue(rt(cmd), cmd)
+        ip = run.in_place_edits
+        for cmd in ("x=\"$(sed -i s/a/b/ f)\"", "echo `sed -i s/a/b/ f`",
+                    "find . -name '*.py' -exec grep -q v {} \; -exec sed -i 's/v/d/' {} \;",
+                    "bash <<EOF\nsed -i s/a/b/ f\nEOF", "bash <<< 'sed -i s/a/b/ f'", "echo $((1<<x))\nsed -i s/a/ f",
+                    "echo '<<EOF'\nsed -i s/a/ f", "python3 -c \"\nprint(1)\n\"; sed -i s/a/b/ cli.py",
+                    "busybox sed -i s/a/b/ f", "setsid sed -i s/a/b/ f", "flock /l sed -i s/a/b/ f", "ssed -i x f",
+                    "perl5.36 -pi -e 1 f", "ruby3.2 -pi -e 1 f", "2>/dev/null sed -i s/a/b/ f",
+                    "bash -o pipefail -c 'sed -i s/a/b/ f'", "diff <(sed -i s/a/b/ f) f",
+                    "perl -C -pi -e 1 f", "perl -d -pi -e 1 f", "perl -x -pi -e 1 f", "ruby -W -pi -e 1 f",
+                    "sed --in-plac s/a/b/ f", "sed --in s/a/b/ f", "cat <<\\EOF\nhi\nEOF\nsed -i x f"):
+            self.assertTrue(ip(cmd), cmd)
+        for cmd in ("echo $#; sed -i s f", "echo ${#a}; sed -i s f", "echo a#b; sed -i s f"):
+            self.assertTrue(ip(cmd), cmd)
+        for cmd in ("git commit -m 'a\nsed -i s/a/ f\nb'", "command -V sed -i", "command -v sed",
+                    "cat <<\\EOF\nsed -i x f\nEOF", "# sed -i x f, don't", "cat <<'E1'\nsed -i x f\nE1"):
+            self.assertFalse(ip(cmd), cmd)
+
+    def test_arrays_heredoc_words_and_expanding_bodies(self):
+        ip = run.in_place_edits
+        for cmd in ("x=(sed -i)", "arr=(sed -i f); echo ${arr[@]}", "declare -a a=(sed -i)",
+                    "cat <<'E F'\nsed -i x\nE F", "cat <<$X\nsed -i x\n$X", "cat <<a <<b\nsed -i x\na\nsed -i y\nb",
+                    "cat <<'EOF'\n$(sed -i s/a/ f)\nEOF"):
+            self.assertFalse(ip(cmd), cmd)
+        for cmd in ("cat <<EOF\n$(sed -i s/a/ f)\nEOF", "awk -i inplace '{print}' f", "gawk -i inplace 1 f",
+                    "x=(a b); sed -i s/a/ f"):
+            self.assertTrue(ip(cmd), cmd)
+        self.assertTrue(run.runs_task("pypy3 run_task.py x"))
+
+    def test_a_regex_term_is_one_regex(self):
+        f = {"severity": "major", "file": "a.go", "issue": "no check.\nowns is never compared"}
+        self.assertTrue(run._says(f, "\\b(owns|own)\\b"), "a | inside a regex term doesn't split it")
+        self.assertTrue(run._says(f, "owner|\\bowns\\b"), "a newline before the word is still a boundary")
+        self.assertFalse(run._says({**f, "issue": "the downstream task"}, "owner|\\bowns\\b"))
+
     def test_a_changed_fixture_file_fails_a_turn_that_may_not_edit(self):
         exp = {"files_unchanged": True}
         turn = {"bash": [], "writes": [], "reply": "", "texts": [], "changed": ["cli.py"]}
@@ -423,7 +539,7 @@ class EvalRunnerTest(unittest.TestCase):
 
     def test_a_quoted_or_multiline_run_task_is_still_told_apart_from_its_help(self):
         exp = all_cases()["no-plan-before-confirm"]["turns"][0]["expect"]
-        rules = {k: exp[k] for k in ("bash_lacks",)}
+        rules = {k: exp[k] for k in ("bash_lacks", "no_run_task")}
         g = lambda cmd: run.grade_parent(rules, {"bash": [cmd], "writes": [], "reply": "", "texts": []}, [])
         for cmd in ('python3 "$S/run_task.py" --help', "python3 '$S/run_task.py' -h"):
             self.assertEqual(g(cmd), [], cmd)
