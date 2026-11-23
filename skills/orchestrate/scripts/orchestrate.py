@@ -1083,11 +1083,18 @@ _TOP_HEADING = re.compile(r"^( {0,3})#{1,2}(?=[ \t]|$)", re.M)
 _SETEXT = re.compile(r"^( {0,3})(=+|-{2,})[ \t]*$", re.M)
 
 
+def _brief_plain(text: str) -> str:
+    """No control characters and no tag of ours; line breaks are plain \\n. Enough for text that sits
+    in a code fence it can't close (a scenario), where markdown cleanup would change the command."""
+    t = re.sub(r"\r\n?|[\u2028\u2029\x85]", "\n", text or "")
+    t = _CTRL.sub("", _BIDI.sub(lambda m: f"[U+{ord(m.group()):04X}]", t))
+    return _TAG_LIKE.sub("", _BRIEF_TAG.sub("", t))
+
+
 def _brief_clean(text: str) -> str:
-    """Briefer text as the worker sees it: no control characters, no tag of ours, and no heading at
-    the level of the harness's own sections, so a brief can't pose as one of them."""
-    t = _CTRL.sub("", _BIDI.sub(lambda m: f"[U+{ord(m.group()):04X}]", text or ""))
-    t = _TAG_LIKE.sub("", _BRIEF_TAG.sub("", t))
+    """Briefer prose as the worker sees it: _brief_plain, and no heading at the level of the
+    harness's own sections, so a brief can't pose as one of them."""
+    t = _brief_plain(text)
     return _SETEXT.sub(lambda m: m.group(1) + "\\" + m.group(2), _TOP_HEADING.sub(lambda m: m.group(1) + "###", t))
 
 
@@ -1106,7 +1113,7 @@ def _written_brief(task: dict, written: dict) -> list[str]:
          f'</brief id="{bid}">', ""]
     repro = written.get("repro") if is_bugfix(task) else None
     if repro:
-        scenario = _brief_clean(str(repro.get("scenario") or "")).strip()
+        scenario = _brief_plain(str(repro.get("scenario") or "")).strip()
         symptom = " ".join(_brief_clean(str(repro.get("symptom") or "")).split())
         L += ["## The bug",
               f"Scenario: `{scenario}`" if "\n" not in scenario and "`" not in scenario
