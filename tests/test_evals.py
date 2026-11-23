@@ -468,7 +468,8 @@ class EvalRunnerTest(unittest.TestCase):
             self.assertEqual(run.changed_files(repo, base, [str(repo / "cli.py")]), ["cli.py"],
                              "edited with a tool and put back still counts")
             self.assertEqual(run.changed_files(repo, base, ["test_cli.py", "/elsewhere/plan.json"]), ["test_cli.py"])
-            for f, body in {"CONTEXT.md": "# Glossary\n", "docs/adr/0001-x.md": "# ADR\n",
+            for f, body in {"GLOSSARY.md": "# Glossary\n", "CONTEXT.md": "# Glossary\n", "docs/adr/0001-x.md": "# ADR\n",
+                            "src/ordering/GLOSSARY.md": "x", "src/ordering/docs/adr/0001-y.md": "x", "GLOSSARY-MAP.md": "x",
                             "__pycache__/cli.cpython-312.pyc": "x", ".pytest_cache/README.md": "x",
                             "new_helper.py": "x = 1\n", "docs/adr/evil.py": "x", "src/CONTEXT.md": "x",
                             "staged.py": "y = 2\n"}.items():
@@ -478,8 +479,7 @@ class EvalRunnerTest(unittest.TestCase):
             (repo / "AGENTS.md").write_text("# edited\n")
             (repo / "cli.py").write_text("print(2)\n")
             self.assertEqual(run.changed_files(repo, base, []),
-                             ["AGENTS.md", "cli.py", "docs/adr/evil.py (new)", "new_helper.py (new)",
-                              "src/CONTEXT.md (new)", "staged.py (new)"],
+                             ["AGENTS.md", "cli.py", "docs/adr/evil.py (new)", "new_helper.py (new)", "staged.py (new)"],
                              "caches a test run leaves and the grill's own docs don't count; a staged file does")
             git("add", "-A")
             git("-c", "user.email=e@e", "-c", "user.name=e", "commit", "-qm", "x")
@@ -507,6 +507,8 @@ class EvalRunnerTest(unittest.TestCase):
                     "bash -o pipefail -c 'sed -i s/a/b/ f'", "diff <(sed -i s/a/b/ f) f",
                     "perl -C -pi -e 1 f", "perl -d -pi -e 1 f", "perl -x -pi -e 1 f", "ruby -W -pi -e 1 f",
                     "sed --in-plac s/a/b/ f", "sed --in s/a/b/ f", "cat <<\\EOF\nhi\nEOF\nsed -i x f"):
+            self.assertTrue(ip(cmd), cmd)
+        for cmd in ("echo $#; sed -i s f", "echo ${#a}; sed -i s f", "echo a#b; sed -i s f"):
             self.assertTrue(ip(cmd), cmd)
         for cmd in ("git commit -m 'a\nsed -i s/a/ f\nb'", "command -V sed -i", "command -v sed",
                     "cat <<\\EOF\nsed -i x f\nEOF", "# sed -i x f, don't", "cat <<'E1'\nsed -i x f\nE1"):

@@ -625,6 +625,15 @@ def _quote_state(text: str, upto: int) -> str | None:
     return q
 
 
+def _drop_comment(line: str) -> str:
+    """`line` without its comment: a `#` that starts a word, outside quotes."""
+    for m in re.finditer("#", line):
+        i = m.start()
+        if (i == 0 or line[i - 1] in " \t\n;|&()") and not _quote_state(line, i):
+            return line[:i]
+    return line
+
+
 def _heredocs_at(line: str) -> list[tuple[str, bool, bool, bool]]:
     """(word, strip_tabs, feeds_a_shell, expands) for each heredoc started on `line`, in order. Not
     `<<<`, not inside quotes or `$(( ))`. An unquoted word expands `$(...)` in the body."""
@@ -688,9 +697,11 @@ def simple_commands(cmd: str, depth: int = 0) -> list[list[str]]:
     for line in _lines(cmd):
         for m in _SUBST.finditer(line):  # quoted or not; a single-quoted one is text, but rare
             found += simple_commands(m.group(1) if m.group(1) is not None else m.group(2), depth + 1)
+        line = _drop_comment(line)
         try:
             lex = shlex.shlex(line, posix=True, punctuation_chars=True)
             lex.whitespace_split = True
+            lex.commenters = ""  # _drop_comment did it: shlex would also cut `$#` and `a#b`
             words = list(lex)
         except ValueError:  # unbalanced quotes: judge the line as one command
             words = line.split()
@@ -927,7 +938,9 @@ def grade_parent(exp: dict, turn: dict, calls: list[list[str]]) -> list[str]:
     return fails
 
 
-GRILL_DOCS = re.compile(r"^(CONTEXT(-MAP)?\.md|docs/adr/[^/]+\.md)$")  # what the grill itself may write
+# What the grill itself may write (orchestrate-grill: GLOSSARY.md, or CONTEXT.md, its older name, and
+# ADRs), at the root or in a context's folder when a GLOSSARY-MAP.md splits the repo.
+GRILL_DOCS = re.compile(r"(^|/)((GLOSSARY|CONTEXT)(-MAP)?\.md|docs/adr/[^/]+\.md)$")
 CACHE = re.compile(r"(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.cache|node_modules)/|\.py[co]$")
 
 

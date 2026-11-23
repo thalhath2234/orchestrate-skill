@@ -1,0 +1,114 @@
+{
+  "meta": {
+    "git_sha": "e1dcaac69ae4254b569660f2d2569abbe40a6a46",
+    "dirty": false,
+    "claude_version": "2.1.330 (Claude Code)",
+    "date": "2026-11-23T06:28:52Z",
+    "hermetic": true
+  },
+  "overall_pass": 1.0,
+  "low_roles": {},
+  "fallback_configs": {},
+  "results": [
+    {
+      "role": "parent",
+      "case": "grill-asks-done-first",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.2281,
+      "trials": [
+        {
+          "ok": true,
+          "label": "orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.2281,
+          "detail": "I looked at the repo first. Nothing is in progress, and there's no glossary or ADR yet. The code is a skeleton:\n\n- **API:** `api/schedules/handler.go` has one route, `GET /schedules/:id`, and its test is empty.\n- **Web:** `web/src/Schedule.tsx` just renders a list of items.\n- **Missing:** there's no",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 21.1
+        }
+      ]
+    },
+    {
+      "role": "parent",
+      "case": "no-plan-before-confirm",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.1752,
+      "trials": [
+        {
+          "ok": true,
+          "label": "orchestrate scan,orchestrate status",
+          "fails": [],
+          "cost": 0.1752,
+          "detail": "No open orchestrate jobs, so this starts a new run. I read `cli.py`, `test_cli.py` and the `Makefile`. This is a trivial, one-file mechanical change, so one short round of questions is enough before anything is edited.\n\n**Your definition of done (your words, kept as written):**\n> make test passes an",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 25.8
+        }
+      ]
+    },
+    {
+      "role": "ui_reviewer",
+      "case": "clean-share-page-passes",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.1137,
+      "trials": [
+        {
+          "ok": true,
+          "label": "pass",
+          "fails": [],
+          "cost": 0.11368460000000001,
+          "detail": "code review: pass | UI review: The Share card shows the link and a 'Copy link' button under the schedule at both desktop and mobile sizes. On mobile the URL wraps, nothing is cut off and the page doesn't scroll sideways. There are no errors. The screenshots can't show the click result ('Copied' status text), because no click step was run.",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 11.4
+        }
+      ]
+    },
+    {
+      "role": "ui_reviewer",
+      "case": "mobile-text-cut-off",
+      "config": "default",
+      "core": true,
+      "invalid": false,
+      "fell_back": 0,
+      "pass_rate": 1.0,
+      "consistency": 1.0,
+      "cost_usd": 0.1525,
+      "trials": [
+        {
+          "ok": true,
+          "label": "changes_requested",
+          "fails": [],
+          "cost": 0.1525148,
+          "detail": "code review: pass | UI review: On desktop the Share card with the link and the Copy link button looks right. On mobile it fails: an inline style in web/share.html fixes main at 620px wide and hides the sideways overflow. The schedule times, part of the Share description and most of the share link are cut off and can't be reached, which breaks the mobile acceptance criterion. The link's inline nowrap style also stops the URL from wrapping.",
+          "served": [
+            "claude-opus-5-5"
+          ],
+          "fell_back": false,
+          "secs": 24.8
+        }
+      ]
+    }
+  ]
+}
