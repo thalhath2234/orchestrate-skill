@@ -462,18 +462,72 @@ class EvalRunnerTest(unittest.TestCase):
     def test_changed_files_sees_restored_edits_and_new_files(self):
         with tempfile.TemporaryDirectory() as d:
             fixture = {"cli.py": "print(1)\n", "test_cli.py": "pass\n"}
-            repo, _ = run.make_repo(Path(d), fixture)
-            self.assertEqual(run.changed_files(repo, fixture, []), [])
-            self.assertEqual(run.changed_files(repo, fixture, [str(repo / "cli.py")]), ["cli.py"],
+            repo, base = run.make_repo(Path(d), fixture)
+            git = lambda *a: subprocess.run(["git", *a], cwd=repo, capture_output=True, check=True)
+            self.assertEqual(run.changed_files(repo, base, []), [])
+            self.assertEqual(run.changed_files(repo, base, [str(repo / "cli.py")]), ["cli.py"],
                              "edited with a tool and put back still counts")
-            self.assertEqual(run.changed_files(repo, fixture, ["test_cli.py", "/elsewhere/plan.json"]), ["test_cli.py"])
-            (repo / "new_helper.py").write_text("x = 1\n")
-            (repo / "CONTEXT.md").write_text("# Glossary\n")
-            (repo / "docs" / "adr").mkdir(parents=True)
-            (repo / "docs" / "adr" / "0001-x.md").write_text("# ADR\n")
+            self.assertEqual(run.changed_files(repo, base, ["test_cli.py", "/elsewhere/plan.json"]), ["test_cli.py"])
+            for f, body in {"CONTEXT.md": "# Glossary\n", "docs/adr/0001-x.md": "# ADR\n",
+                            "__pycache__/cli.cpython-312.pyc": "x", ".pytest_cache/README.md": "x",
+                            "new_helper.py": "x = 1\n", "docs/adr/evil.py": "x", "src/CONTEXT.md": "x",
+                            "staged.py": "y = 2\n"}.items():
+                (repo / f).parent.mkdir(parents=True, exist_ok=True)
+                (repo / f).write_text(body)
+            git("add", "staged.py")
+            (repo / "AGENTS.md").write_text("# edited\n")
             (repo / "cli.py").write_text("print(2)\n")
-            self.assertEqual(sorted(run.changed_files(repo, fixture, [])), ["cli.py", "new_helper.py (new)"],
-                             "the grill's glossary and ADRs are allowed")
+            self.assertEqual(run.changed_files(repo, base, []),
+                             ["AGENTS.md", "cli.py", "docs/adr/evil.py (new)", "new_helper.py (new)",
+                              "src/CONTEXT.md (new)", "staged.py (new)"],
+                             "caches a test run leaves and the grill's own docs don't count; a staged file does")
+            git("add", "-A")
+            git("-c", "user.email=e@e", "-c", "user.name=e", "commit", "-qm", "x")
+            self.assertIn("staged.py (new)", run.changed_files(repo, base, []), "a committed one does too")
+
+    def test_redirects_wrappers_and_quoted_lines_are_parsed_like_a_shell(self):
+        rt = run.runs_task
+        for cmd in ("python3 $S/run_task.py --help 2>&1 | head -40", "python3 $S/run_task.py --help 2>/dev/null",
+                    "python3 $S/run_task.py --help > /tmp/h 2>&1", "python3 $S/run_task.py -h 2>&1 | cat",
+                    "python3 $S/run_task.py --help >| /tmp/h", "python3 $S/run_task.py --help 1>&2",
+                    "echo \"I would run:\npython3 $S/run_task.py --repo . x\"",
+                    "git commit -m 'a\npython3 run_task.py x\nb'", "# python3 run_task.py x  (don't)"):
+            self.assertFalse(rt(cmd), cmd)
+        for cmd in ("out=\"$(python3 $S/run_task.py x)\"", "echo `python3 run_task.py x`",
+                    "echo \"start\nnow\"; python3 $S/run_task.py x", "bash <<'EOF'\npython3 run_task.py x\nEOF",
+                    "x=$((1 << n))\npython3 $S/run_task.py x", "uv run $S/run_task.py x", "python3 -m run_task x"):
+            self.assertTrue(rt(cmd), cmd)
+        ip = run.in_place_edits
+        for cmd in ("x=\"$(sed -i s/a/b/ f)\"", "echo `sed -i s/a/b/ f`",
+                    "find . -name '*.py' -exec grep -q v {} \; -exec sed -i 's/v/d/' {} \;",
+                    "bash <<EOF\nsed -i s/a/b/ f\nEOF", "bash <<< 'sed -i s/a/b/ f'", "echo $((1<<x))\nsed -i s/a/ f",
+                    "echo '<<EOF'\nsed -i s/a/ f", "python3 -c \"\nprint(1)\n\"; sed -i s/a/b/ cli.py",
+                    "busybox sed -i s/a/b/ f", "setsid sed -i s/a/b/ f", "flock /l sed -i s/a/b/ f", "ssed -i x f",
+                    "perl5.36 -pi -e 1 f", "ruby3.2 -pi -e 1 f", "2>/dev/null sed -i s/a/b/ f",
+                    "bash -o pipefail -c 'sed -i s/a/b/ f'", "diff <(sed -i s/a/b/ f) f",
+                    "perl -C -pi -e 1 f", "perl -d -pi -e 1 f", "perl -x -pi -e 1 f", "ruby -W -pi -e 1 f",
+                    "sed --in-plac s/a/b/ f", "sed --in s/a/b/ f", "cat <<\\EOF\nhi\nEOF\nsed -i x f"):
+            self.assertTrue(ip(cmd), cmd)
+        for cmd in ("git commit -m 'a\nsed -i s/a/ f\nb'", "command -V sed -i", "command -v sed",
+                    "cat <<\\EOF\nsed -i x f\nEOF", "# sed -i x f, don't", "cat <<'E1'\nsed -i x f\nE1"):
+            self.assertFalse(ip(cmd), cmd)
+
+    def test_arrays_heredoc_words_and_expanding_bodies(self):
+        ip = run.in_place_edits
+        for cmd in ("x=(sed -i)", "arr=(sed -i f); echo ${arr[@]}", "declare -a a=(sed -i)",
+                    "cat <<'E F'\nsed -i x\nE F", "cat <<$X\nsed -i x\n$X", "cat <<a <<b\nsed -i x\na\nsed -i y\nb",
+                    "cat <<'EOF'\n$(sed -i s/a/ f)\nEOF"):
+            self.assertFalse(ip(cmd), cmd)
+        for cmd in ("cat <<EOF\n$(sed -i s/a/ f)\nEOF", "awk -i inplace '{print}' f", "gawk -i inplace 1 f",
+                    "x=(a b); sed -i s/a/ f"):
+            self.assertTrue(ip(cmd), cmd)
+        self.assertTrue(run.runs_task("pypy3 run_task.py x"))
+
+    def test_a_regex_term_is_one_regex(self):
+        f = {"severity": "major", "file": "a.go", "issue": "no check.\nowns is never compared"}
+        self.assertTrue(run._says(f, "\\b(owns|own)\\b"), "a | inside a regex term doesn't split it")
+        self.assertTrue(run._says(f, "owner|\\bowns\\b"), "a newline before the word is still a boundary")
+        self.assertFalse(run._says({**f, "issue": "the downstream task"}, "owner|\\bowns\\b"))
 
     def test_a_changed_fixture_file_fails_a_turn_that_may_not_edit(self):
         exp = {"files_unchanged": True}

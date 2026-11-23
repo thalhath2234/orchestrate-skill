@@ -171,11 +171,21 @@ SEV_RANK = {"minor": 1, "major": 2, "blocker": 3}
 
 
 def _says(f: dict, term: str) -> bool:
-    """`term`, or one of its `|` alternatives, in the finding's text, case-insensitive. An
-    alternative with a backslash in it is a regex, for word boundaries: `\\bowns\\b` doesn't match
-    inside "downstream"."""
-    text = json.dumps(f, ensure_ascii=False).lower()
-    return any(re.search(alt, text, re.I) if "\\" in alt else alt.lower() in text for alt in term.split("|"))
+    """`term` in the finding's text, case-insensitive: one of its `|` alternatives as a substring,
+    or, when the term has a backslash in it, the whole term as one regex over the finding's
+    values, for word boundaries (`owner|\\bowns\\b` doesn't match inside "downstream")."""
+    if "\\" in term:
+        return bool(re.search(term, "\n".join(_strings(f)), re.I))
+    text = json.dumps(f).lower()
+    return any(alt.lower() in text for alt in term.split("|"))
+
+
+def _strings(x) -> list[str]:
+    if isinstance(x, dict):
+        return [s for v in x.values() for s in _strings(v)]
+    if isinstance(x, list):
+        return [s for v in x for s in _strings(v)]
+    return [str(x)]
 
 
 def grade_reviewer(exp: dict, v: dict) -> list[str]:
@@ -575,79 +585,161 @@ def parse_stream(stdout: str) -> dict:
 # a wrapper takes, so `sudo -u root sed -i` and `for f in *; do sed -i` reach `sed`.
 KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "}", "coproc"}
 PREFIXES = {"env", "sudo", "command", "exec", "nohup", "nice", "xargs", "time", "builtin", "timeout",
-            "stdbuf", "ionice", "doas"}
+            "stdbuf", "ionice", "doas", "busybox", "setsid", "watch", "flock", "unbuffer", "chronic"}
 PREFIX_VALUES = {"sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T", "--user", "--group"},
                  "doas": {"-u", "-C"}, "env": {"-u", "-C", "--unset", "--chdir"},
                  "nice": {"-n", "--adjustment"}, "ionice": {"-c", "-n", "-p"}, "exec": {"-a"},
                  "time": {"-f", "-o", "--format", "--output"}, "timeout": {"-s", "-k", "--signal", "--kill-after"},
                  "xargs": {"-I", "-n", "-P", "-d", "-L", "-s", "-E", "-a", "--max-args", "--max-procs",
                            "--delimiter", "--arg-file", "--replace"},
-                 "stdbuf": {"-i", "-o", "-e"}}
+                 "stdbuf": {"-i", "-o", "-e"}, "watch": {"-n", "-d", "--interval"}, "flock": {"-w", "-E", "--timeout"}}
+POSITIONAL = {"timeout": 1, "flock": 1}  # the duration; the lock file
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
-_HEREDOC = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
+EXEC_FLAGS = ("-exec", "-execdir", "-ok", "-okdir")
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(?:(['\"])(.+?)\2|(\\?)([^\s<>;&|()'\"]+))")
+_FEEDS_SHELL = re.compile(r"(^|[;&|(]|\s)(\S*/)?(ba|z|da|k)?sh(\s|$)")
+_SUBST = re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)|`([^`]*)`")
+
+
+def _quote_state(text: str, upto: int) -> str | None:
+    """The quote open at `upto` in `text` (`'`, `"` or None), comments skipped."""
+    q, i = None, 0
+    while i < upto:
+        c = text[i]
+        if q is None:
+            if c == "\\":
+                i += 2
+                continue
+            if c in "'\"":
+                q = c
+            elif c == "#" and (i == 0 or text[i - 1] in " \t\n;|&("):
+                j = text.find("\n", i)
+                i = len(text) if j < 0 else j
+                continue
+        elif c == q:
+            q = None
+        elif q == '"' and c == "\\":
+            i += 2
+            continue
+        i += 1
+    return q
+
+
+def _heredocs_at(line: str) -> list[tuple[str, bool, bool, bool]]:
+    """(word, strip_tabs, feeds_a_shell, expands) for each heredoc started on `line`, in order. Not
+    `<<<`, not inside quotes or `$(( ))`. An unquoted word expands `$(...)` in the body."""
+    out = []
+    for m in _HEREDOC.finditer(line):
+        if (m.start() and line[m.start() - 1] == "<") or _quote_state(line, m.start()):
+            continue
+        before = line[:m.start()]
+        if before.count("((") > before.count("))"):
+            continue  # an arithmetic shift
+        quoted = m.group(2) is not None or bool(m.group(4)) or any(q in (m.group(5) or "") for q in "'\"\\")
+        word = m.group(3) if m.group(2) is not None else re.sub(r"['\"\\]", "", m.group(5) or "")
+        out.append((word, bool(m.group(1)), bool(_FEEDS_SHELL.search(before)), not quoted))
+    return out
 
 
 def _lines(cmd: str) -> list[str]:
-    """The command lines of `cmd`: a backslash-newline joins two lines, and a heredoc's body is data,
-    not commands, so it is left out."""
-    out, delim = [], None
-    for raw in re.sub(r"(?<!\\)((?:\\\\)*)\\\n", r"\1", str(cmd)).splitlines():
-        if delim is not None:
-            if (raw.lstrip("\t") if delim[1] else raw).strip() == delim[0]:
-                delim = None
+    """The logical command lines of `cmd`: a newline inside quotes or after a backslash doesn't end one,
+    and a heredoc's body is data, not commands, unless it is fed to a shell."""
+    kept, fed, pending = [], [], []
+    for raw in str(cmd).split("\n"):
+        if pending:
+            word, strip, shell, expands = pending[0]
+            if (raw.lstrip("\t") if strip else raw).strip() == word:
+                pending.pop(0)
+            elif shell:
+                fed.append(raw)
+            elif expands:  # `$(...)` in an unquoted heredoc's body runs
+                fed += [m.group(1) if m.group(1) is not None else m.group(2) for m in _SUBST.finditer(raw)]
             continue
-        out.append(raw)
-        m = next((m for m in _HEREDOC.finditer(raw) if m.start() == 0 or raw[m.start() - 1] != "<"), None)
-        if m:  # `<<<` is a here-string: no body follows
-            delim = (m.group(3), bool(m.group(1)))
-    return out
+        kept.append(raw)
+        if not _quote_state("\n".join(kept), len("\n".join(kept))):  # not mid-way through a quoted string
+            pending = _heredocs_at(raw)
+    out = []
+    for text in ("\n".join(kept), "\n".join(fed)):
+        start, i = 0, 0
+        while True:
+            j = text.find("\n", i)
+            if j < 0:
+                out.append(text[start:])
+                break
+            if (len(text[:j]) - len(text[:j].rstrip("\\"))) % 2 == 1:
+                i = j + 1  # an odd run of backslashes: a continuation
+            elif _quote_state(text[start:], j - start):
+                i = j + 1  # inside quotes
+            else:
+                out.append(text[start:j])
+                start = i = j + 1
+    return [re.sub(r"(?<!\\)((?:\\\\)*)\\\n", r"\1", l) for l in out if l.strip()]
 
 
 def simple_commands(cmd: str, depth: int = 0) -> list[list[str]]:
     """Each simple command in `cmd` as the argv it runs, parsed like a shell would: a quoted `|`
     or `;` can't split one, keywords and wrappers (`sudo -u x`, `env A=1`, `xargs -I{}`) are
-    stripped, and the commands inside `bash -c '...'`, `eval ...` and `find -exec ...` are
-    included too."""
+    stripped, and the commands inside `$(...)` and backticks (quoted or not), `bash -c '...'`,
+    `bash <<< '...'`, `bash <<EOF`, `eval ...` and every `find -exec ...` are included too."""
     import shlex
     found: list[list[str]] = []
+    if depth > 4:
+        return found
     for line in _lines(cmd):
+        for m in _SUBST.finditer(line):  # quoted or not; a single-quoted one is text, but rare
+            found += simple_commands(m.group(1) if m.group(1) is not None else m.group(2), depth + 1)
         try:
             lex = shlex.shlex(line, posix=True, punctuation_chars=True)
             lex.whitespace_split = True
             words = list(lex)
         except ValueError:  # unbalanced quotes: judge the line as one command
             words = line.split()
-        parts: list[list[str]] = [[]]
-        skip = False
+        parts: list[tuple[list[str], list[str]]] = [([], [])]
+        skip = herestr = array = False
         for w in words:
-            if skip:
-                skip = False
+            argv, heres = parts[-1]
+            if array:  # the words of `x=( ... )` are data
+                array = ")" not in w
+            elif w == "(" and argv and argv[-1].endswith("="):
+                array = True
+            elif skip:
+                if herestr:
+                    heres.append(w)
+                skip = herestr = False
+            elif w and set(w) <= set("<>;&|()") and ("(" in w or ")" in w):
+                parts.append(([], []))  # `<(cmd)`, `>(cmd)`: a command of its own
+            elif w and ("<" in w or ">" in w) and set(w) <= set("<>&|"):
+                if w in ("<<", "<<-"):
+                    argv.append(w)
+                    continue
+                if argv and argv[-1].isdigit():
+                    argv.pop()  # the fd of `2>&1`
+                skip, herestr = True, w == "<<<"
             elif w and set(w) <= set(";&|()"):
-                parts.append([])
-            elif w and set(w) <= set("<>&") and w not in ("<<", "<<-"):
-                skip = True  # a redirection and its target
+                parts.append(([], []))
             else:
-                parts[-1].append(w)
-        for argv in parts:
+                argv.append(w)
+        for argv, heres in parts:
             argv = _strip_prefix(argv)
             if not argv:
                 continue
             found.append(argv)
-            if depth > 3:
-                continue
             name = argv[0].rsplit("/", 1)[-1]
             if name in SHELLS:
-                for j, a in enumerate(argv[1:], 1):
-                    if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", a) and j + 1 < len(argv):
-                        found += simple_commands(argv[j + 1], depth + 1)
+                for h in heres:
+                    found += simple_commands(h, depth + 1)
+                j = 1
+                while j < len(argv) and argv[j][:1] in "-+":
+                    if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", argv[j]):
+                        if j + 1 < len(argv):
+                            found += simple_commands(argv[j + 1], depth + 1)
                         break
-                    if not a.startswith("-"):
-                        break
+                    j += 2 if argv[j] in ("-o", "+o", "-O", "+O") else 1
             elif name == "eval":
                 found += simple_commands(" ".join(argv[1:]), depth + 1)
-            elif name == "find":
-                for j, a in enumerate(argv):
-                    if a in ("-exec", "-execdir", "-ok", "-okdir"):
+            if name == "find" or argv[0] in EXEC_FLAGS:
+                for j, a in enumerate(argv):  # `\;` ends one -exec; the next starts a new part
+                    if a in EXEC_FLAGS:
                         sub = [x for x in argv[j + 1:] if x not in ("{}", "+")]
                         found += simple_commands(shlex.join(sub), depth + 1) if sub else []
                         break
@@ -662,28 +754,48 @@ def _strip_prefix(argv: list[str]) -> list[str]:
             i += 1
             continue
         name = w.rsplit("/", 1)[-1]
+        if name == "uv" and argv[i + 1:i + 2] == ["run"]:
+            i += 2
+            while i < len(argv) and argv[i].startswith("-"):
+                i += 1
+            continue
         if name not in PREFIXES:
             break
+        if name == "command" and any(a in ("-v", "-V") for a in argv[i + 1:i + 3]):
+            return []  # `command -v sed` only says where sed is
         i += 1
         takes = PREFIX_VALUES.get(name, set())
         while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
             i += 2 if argv[i] in takes else 1
         while name == "env" and i < len(argv) and re.match(r"^[A-Za-z_]\w*=", argv[i]):
             i += 1
-        if name == "timeout" and i < len(argv):
-            i += 1  # the duration
+        i += POSITIONAL.get(name, 0)
     return argv[i:]
 
 
-# Options whose value follows them, attached or as the next word: an `i` inside a value is not -i.
-VALUE_FLAGS = {"sed": "efl", "gsed": "efl", "perl": "eEMmIdDxCFV", "ruby": "eIrCxFEKWT"}
+# How each editor's options take a value: from the next word when nothing is attached (`next`),
+# or only attached, never the next word (`attached`). An `i` inside a value is not -i.
+FLAGS = {"sed": ("efl", ""), "perl": ("eEMmI", "CdDxFV"), "ruby": ("eIrCE", "xFKWT")}
+
+
+def _editor(argv0: str) -> str | None:
+    name = argv0.rsplit("/", 1)[-1]
+    if name in ("sed", "gsed", "ssed"):
+        return "sed"
+    m = re.fullmatch(r"(perl|ruby)[\d.]*", name)
+    return m.group(1) if m else None
 
 
 def _edits_in_place(argv: list[str]) -> bool:
-    name = argv[0].rsplit("/", 1)[-1]
-    if name not in VALUE_FLAGS:
+    if argv[0].rsplit("/", 1)[-1] in ("awk", "gawk") and any(
+            a in ("-i", "--include") and b in ("inplace", "inplace.awk") or a in ("-iinplace", "--include=inplace")
+            for a, b in zip(argv[1:], argv[2:] + [""])):
+        return True
+    ed = _editor(argv[0])
+    if not ed:
         return False
-    values, interp = VALUE_FLAGS[name], name in ("perl", "ruby")
+    nxt, attached = FLAGS[ed]
+    interp = ed != "sed"
     args, j = argv[1:], 0
     while j < len(args):
         a = args[j]
@@ -691,9 +803,11 @@ def _edits_in_place(argv: list[str]) -> bool:
         if a == "--":
             break
         if a.startswith("--"):
-            if a.startswith("--in-place") and not interp:
-                return True
-            if not interp and a in ("--expression", "--file", "--line-length"):
+            key = a.split("=", 1)[0]
+            if not interp and len(key) >= 3 and "--in-place".startswith(key):
+                return True  # GNU takes any unambiguous prefix: --in, --in-pl
+            if not interp and "=" not in a and len(key) >= 3 and any(
+                    o.startswith(key) for o in ("--expression", "--file", "--line-length")):
                 j += 1
             continue
         if not a.startswith("-") or a == "-":
@@ -705,7 +819,9 @@ def _edits_in_place(argv: list[str]) -> bool:
             c = bundle[k]
             if c == "i":
                 return True
-            if c in values:
+            if c in attached:
+                break  # the rest of the word is its value
+            if c in nxt:
                 if k == len(bundle) - 1:
                     j += 1  # its value is the next word
                 break
@@ -718,8 +834,9 @@ def _edits_in_place(argv: list[str]) -> bool:
 
 def in_place_edits(cmd: str) -> list[str]:
     """The simple commands in `cmd` that edit a file in place (sed -i in any spelling, perl -pi,
-    perl -0pi, ruby -i...), wherever they run: after `do`, under `sudo -u x`, in `bash -c`, or
-    from `find -exec`. Heredoc text and option values (`perl -MFile::Find`) don't count."""
+    perl -0pi, ruby -i...), wherever they run: after `do`, under `sudo -u x`, in `bash -c` or
+    `$(...)`, or from `find -exec`. Heredoc text, quoted text and option values
+    (`perl -MFile::Find`) don't count."""
     return [" ".join(a) for a in simple_commands(cmd) if _edits_in_place(a)]
 
 
@@ -727,20 +844,23 @@ _PY_VALUE = {"-W", "-X", "--check-hash-based-pycs"}
 
 
 def runs_task(cmd: str) -> list[str]:
-    """The simple commands in `cmd` that start run_task.py: run directly, or by python with it as
-    the script. `run_task.py --help` (or -h) alone starts nothing; nor does a command that only
-    names the file (`cat`, `grep`, `python3 -c "open('run_task.py')"`)."""
+    """The simple commands in `cmd` that start run_task.py: run directly, by python with it as
+    the script, or as `python -m run_task`. `run_task.py --help` (or -h) alone starts nothing,
+    whatever it is piped to; nor does a command that only names the file (`cat`, `grep`,
+    `python3 -c "open('run_task.py')"`)."""
     hits = []
     for argv in simple_commands(cmd):
         name, rest = argv[0].rsplit("/", 1)[-1], None
         if name == "run_task.py":
             rest = argv[1:]
-        elif re.fullmatch(r"python[\d.]*", name):
+        elif re.fullmatch(r"(python|pypy)[\d.]*", name):
             j = 1
             while j < len(argv) and argv[j].startswith("-") and argv[j] not in ("-c", "-m", "-"):
                 j += 2 if argv[j] in _PY_VALUE else 1
             if j < len(argv) and argv[j].rsplit("/", 1)[-1] == "run_task.py":
                 rest = argv[j + 1:]
+            elif argv[j:j + 2] == ["-m", "run_task"]:
+                rest = argv[j + 2:]
         if rest is not None and rest not in (["-h"], ["--help"]):
             hits.append(" ".join(argv))
     return hits
@@ -807,26 +927,29 @@ def grade_parent(exp: dict, turn: dict, calls: list[list[str]]) -> list[str]:
     return fails
 
 
-GRILL_DOCS = re.compile(r"(^|/)(CONTEXT(-MAP)?\.md|docs/adr/.*)$")  # what the grill itself may write
+GRILL_DOCS = re.compile(r"^(CONTEXT(-MAP)?\.md|docs/adr/[^/]+\.md)$")  # what the grill itself may write
+CACHE = re.compile(r"(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.cache|node_modules)/|\.py[co]$")
 
 
-def changed_files(repo: Path, fixture: dict, writes: list[str]) -> list[str]:
-    """What the turn changed in the repo: fixture files that differ now, fixture files it wrote or
-    edited with a tool even if it put them back, and new files (except the grill's own docs)."""
+def changed_files(repo: Path, base: str, writes: list[str]) -> list[str]:
+    """What the turn changed in the repo since commit `base`: files that differ now (staged,
+    committed or not), files it wrote or edited with a tool even if it put them back, and new
+    files, except the grill's own docs and caches a test run leaves (__pycache__, .pytest_cache)."""
+    def git(*a):
+        return subprocess.run(["git", *a], cwd=repo, capture_output=True, text=True).stdout.split("\0")
+
     def inside(w):
         p = Path(w) if Path(w).is_absolute() else repo / w
         try:
             return str(p.resolve().relative_to(repo.resolve()))
         except ValueError:
             return None
-    touched = {inside(w) for w in writes} - {None}
-    out = [f for f, body in fixture.items()
-           if f in touched or not (repo / f).is_file() or (repo / f).read_text(errors="replace") != body]
-    st = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all", "-z"], cwd=repo,
-                        capture_output=True, text=True).stdout
-    out += [e[3:] + " (new)" for e in st.split("\0") if e.startswith("?? ") and e[3:] not in fixture
-            and not GRILL_DOCS.search(e[3:])]
-    return out
+    at_base = set(git("ls-tree", "-r", "-z", "--name-only", base)) - {""}
+    differ = set(git("diff", "-z", "--name-only", base)) - {""}
+    touched = {inside(w) for w in writes} & at_base
+    now = set(git("ls-files", "-z")) | set(git("ls-files", "-z", "--others")) - {""}
+    new = {f for f in now - at_base if f and not GRILL_DOCS.search(f) and not CACHE.search(f)}
+    return sorted((differ | touched) & at_base) + sorted(f + " (new)" for f in new)
 
 
 def parent_env(state: Path, refuse: Path) -> dict:
@@ -838,7 +961,7 @@ def parent_env(state: Path, refuse: Path) -> dict:
 def run_parent(o, case: dict, tmp: Path, config: str | None) -> dict:
     import claude_cli
     import models
-    repo, _ = make_repo(tmp, case.get("files", {}))
+    repo, base = make_repo(tmp, case.get("files", {}))
     scripts, name = plugin_copy(tmp / "plugin", case.get("stub") or {})
     refuse = tmp / "refuse-claude"
     refuse.write_text(REFUSE_SH)
@@ -869,7 +992,7 @@ def run_parent(o, case: dict, tmp: Path, config: str | None) -> dict:
             fails.append(f"turn {i}: claude failed ({why}): {(out['reply'] or p.stderr or p.stdout)[-300:]}")
             break
         session = out["session_id"]
-        out["changed"] = changed_files(repo, case.get("files") or {}, out["writes"])
+        out["changed"] = changed_files(repo, base, out["writes"])
         fails += [f"turn {i}: {f}" for f in grade_parent(turn.get("expect") or {}, out, calls)]
         labels.append(",".join(sorted({c[0] if c[0] == "run_task" else " ".join(c[:2]) for c in calls})) or "no calls")
     return {"ok": not fails, "label": " | ".join(labels) or "error", "fails": fails, "cost": round(cost, 4),
