@@ -393,7 +393,7 @@ class EvalRunnerTest(unittest.TestCase):
         S = "S=/x/plugin/skills/orchestrate/scripts"
 
         def fails(cmd, call=()):
-            return run.grade_parent({k: v for k, v in exp.items() if k in ("bash_lacks", "calls_lack", "no_in_place_edit")},
+            return run.grade_parent({k: v for k, v in exp.items() if k in ("bash_lacks", "calls_lack", "no_in_place_edit", "no_run_task")},
                                     {"bash": [cmd], "writes": [], "reply": "", "texts": []}, [list(call)] if call else [])
         for cmd in ("for f in cli.py; do cat -A $f | sed 's/x$//'; done; git grep -n -i -E 'verbose'",
                     f"{S}; python3 $S/run_task.py --help; grep -n worktree $S/run_task.py"):
@@ -415,6 +415,66 @@ class EvalRunnerTest(unittest.TestCase):
                     "grep -i verbose cli.py | sed 's/-i/x/'", "sed 's/a/b/' cli.py > /tmp/out", "python3 -i x.py"):
             self.assertFalse(run.in_place_edits(cmd), cmd)
 
+    def test_in_place_edits_inside_loops_wrappers_shells_and_find(self):
+        for cmd in ("for f in *.py; do sed -i 's/a/b/' \"$f\"; done", "if true; then sed -i s/a/b/ f; fi",
+                    "find . -name '*.py' -exec sed -i 's/a/b/' {} +", "find . -execdir perl -pi -e 's/a/b/' {} \\;",
+                    "bash -c \"sed -i 's/a/b/' cli.py\"", "sh -ec 'cd x && sed -i s/a/b/ f'", "eval sed -i s/a/b/ f",
+                    "sudo -u root sed -i s/a/b/ f", "perl -0pi -e 's/a\\nb/c/' f", "perl -0777 -pi -e 1 f",
+                    "xargs -I{} sed -i s/a/b/ {}", "nice -n 5 sed -i s/a/b/ f", "x=$(sed -i s/a/b/ f)",
+                    "sed -e 's/a/b/' \\\n  -i cli.py", "sed -n -e p -i f"):
+            self.assertTrue(run.in_place_edits(cmd), cmd)
+        for cmd in ("perl -MFile::Find -e 'find(sub{print}, \".\")'", "perl -Ilib -ne 'print if /x/' f",
+                    "cat > notes.md <<'EOF'\nthen run sed -i 's/a/b/' cli.py\nEOF\nls",
+                    "cat <<-EOF\n\tperl -pi -e 1 f\n\tEOF", "sed -e 's/-i//' f", "ruby -e 'puts 1' -- -i",
+                    "perl script.pl -i", "grep -rn 'sed -i' .", "bash -c 'grep -i x f'", "cat <<<'sed -i x f'"):
+            self.assertFalse(run.in_place_edits(cmd), cmd)
+
+    def test_only_starting_run_task_counts(self):
+        for cmd in ("python3 $S/run_task.py --repo . x", "$S/run_task.py --repo .", "python3 -B -u $S/run_task.py -",
+                    "python3 \\\n  $S/run_task.py --repo .", "cd x && /p/run_task.py --type a", "bash -c 'python3 run_task.py x'",
+                    "env A=1 python3 -W ignore run_task.py --repo ."):
+            self.assertTrue(run.runs_task(cmd), cmd)
+        for cmd in ("python3 $S/run_task.py \\\n  --help", "python3 $S/run_task.py -h", "cat $S/run_task.py",
+                    "python3 -c \"print(open('$S/run_task.py').read()[:200])\"", "grep -n def $S/run_task.py",
+                    "python3 -m pydoc run_task", "sed -n 1,40p run_task.py"):
+            self.assertFalse(run.runs_task(cmd), cmd)
+        g = lambda cmd: run.grade_parent({"no_run_task": True}, {"bash": [cmd], "writes": [], "reply": "", "texts": []}, [])
+        self.assertEqual(len(g("python3 run_task.py --repo .")), 1)
+
+    def test_a_word_term_does_not_match_inside_another_word(self):
+        f = {"severity": "major", "file": "a.go", "issue": "the downstream task reads the link"}
+        self.assertFalse(run._says(f, "owner|\\bowns\\b|ownership"))
+        self.assertTrue(run._says({**f, "issue": "nobody checks the caller owns it"}, "owner|\\bowns\\b"))
+        self.assertTrue(run._says({**f, "issue": "no OWNER check"}, "owner|\\bowns\\b"))
+        for c in ("missing-owner-check", "injection-in-report", "report-claims-met-falsely"):
+            self.assertIn("\\bowns\\b", "|".join(all_cases()[c]["expect"]["finding_mentions"]), c)
+
+    def test_a_finding_without_a_file_can_name_it_in_its_text(self):
+        exp = {"finding_mentions": ["hardcoded"], "finding_file": "share.go"}
+        named = {"severity": "major", "file": "", "issue": "share.go: LinkTTL is hardcoded"}
+        self.assertEqual(run.grade_reviewer(exp, {"verdict": "changes_requested", "findings": [named]}), [])
+        elsewhere = {**named, "file": "web/x.ts"}
+        self.assertTrue(run.grade_reviewer(exp, {"verdict": "changes_requested", "findings": [elsewhere]}),
+                        "a finding that names another file is on that file")
+        unnamed = {**named, "issue": "LinkTTL is hardcoded"}
+        self.assertTrue(run.grade_reviewer(exp, {"verdict": "changes_requested", "findings": [unnamed]}))
+
+    def test_changed_files_sees_restored_edits_and_new_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture = {"cli.py": "print(1)\n", "test_cli.py": "pass\n"}
+            repo, _ = run.make_repo(Path(d), fixture)
+            self.assertEqual(run.changed_files(repo, fixture, []), [])
+            self.assertEqual(run.changed_files(repo, fixture, [str(repo / "cli.py")]), ["cli.py"],
+                             "edited with a tool and put back still counts")
+            self.assertEqual(run.changed_files(repo, fixture, ["test_cli.py", "/elsewhere/plan.json"]), ["test_cli.py"])
+            (repo / "new_helper.py").write_text("x = 1\n")
+            (repo / "CONTEXT.md").write_text("# Glossary\n")
+            (repo / "docs" / "adr").mkdir(parents=True)
+            (repo / "docs" / "adr" / "0001-x.md").write_text("# ADR\n")
+            (repo / "cli.py").write_text("print(2)\n")
+            self.assertEqual(sorted(run.changed_files(repo, fixture, [])), ["cli.py", "new_helper.py (new)"],
+                             "the grill's glossary and ADRs are allowed")
+
     def test_a_changed_fixture_file_fails_a_turn_that_may_not_edit(self):
         exp = {"files_unchanged": True}
         turn = {"bash": [], "writes": [], "reply": "", "texts": [], "changed": ["cli.py"]}
@@ -423,7 +483,7 @@ class EvalRunnerTest(unittest.TestCase):
 
     def test_a_quoted_or_multiline_run_task_is_still_told_apart_from_its_help(self):
         exp = all_cases()["no-plan-before-confirm"]["turns"][0]["expect"]
-        rules = {k: exp[k] for k in ("bash_lacks",)}
+        rules = {k: exp[k] for k in ("bash_lacks", "no_run_task")}
         g = lambda cmd: run.grade_parent(rules, {"bash": [cmd], "writes": [], "reply": "", "texts": []}, [])
         for cmd in ('python3 "$S/run_task.py" --help', "python3 '$S/run_task.py' -h"):
             self.assertEqual(g(cmd), [], cmd)
